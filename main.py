@@ -94,7 +94,11 @@ def now_iso() -> str:
 
 
 def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+        check_same_thread=False
+    )
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -157,6 +161,25 @@ def init_db() -> None:
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS dialog_sessions (
+    user_id INTEGER PRIMARY KEY,
+    enabled INTEGER DEFAULT 0,
+    personality TEXT DEFAULT 'observer',
+    last_activity TEXT
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS dialog_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL
+    )
+    """)
+
     conn.commit()
     conn.close()
 
@@ -177,6 +200,278 @@ def set_setting(key: str, value: str) -> None:
     conn.commit()
     conn.close()
 
+def get_dialog_session(user_id: int) -> dict:
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT enabled, personality, last_activity
+        FROM dialog_sessions
+        WHERE user_id=?
+        """,
+        (user_id,),
+    ).fetchone()
+
+    if not row:
+        conn.execute(
+            """
+            INSERT INTO dialog_sessions(user_id)
+            VALUES(?)
+            """,
+            (user_id,),
+        )
+        conn.commit()
+
+        row = conn.execute(
+            """
+            SELECT enabled, personality, last_activity
+            FROM dialog_sessions
+            WHERE user_id=?
+            """,
+            (user_id,),
+        ).fetchone()
+
+    conn.close()
+
+    return {
+        "enabled": row["enabled"],
+        "personality": row["personality"],
+        "last_activity": row["last_activity"],
+    }
+
+
+def set_dialog_enabled(user_id: int, enabled: bool) -> None:
+    conn = db()
+
+    conn.execute(
+        """
+        INSERT INTO dialog_sessions(user_id, enabled, last_activity)
+        VALUES(?, ?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET
+            enabled=excluded.enabled,
+            last_activity=excluded.last_activity
+        """,
+        (
+            user_id,
+            1 if enabled else 0,
+            now_iso(),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def set_personality(user_id: int, personality: str) -> None:
+    conn = db()
+
+    conn.execute(
+        """
+        INSERT INTO dialog_sessions(user_id, personality)
+        VALUES(?, ?)
+        ON CONFLICT(user_id)
+        DO UPDATE SET personality=excluded.personality
+        """,
+        (
+            user_id,
+            personality,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def save_dialog_message(user_id: int, role: str, content: str) -> None:
+    conn = db()
+
+    conn.execute(
+        """
+        INSERT INTO dialog_messages(
+            user_id,
+            role,
+            content,
+            created_at
+        )
+        VALUES(?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            role,
+            content,
+            now_iso(),
+        ),
+    )
+
+    conn.execute(
+        """
+        UPDATE dialog_sessions
+        SET last_activity=?
+        WHERE user_id=?
+        """,
+        (
+            now_iso(),
+            user_id,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_dialog_context(user_id: int, limit: int = 10) -> list[dict]:
+    conn = db()
+
+    rows = conn.execute(
+        """
+        SELECT role, content
+        FROM dialog_messages
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (
+            user_id,
+            limit,
+        ),
+    ).fetchall()
+
+    conn.close()
+
+    rows = list(reversed(rows))
+
+    return [
+        {
+            "role": row["role"],
+            "content": row["content"],
+        }
+        for row in rows
+    ]
+
+
+def clear_dialog_context(user_id: int) -> None:
+    conn = db()
+
+    conn.execute(
+        """
+        DELETE FROM dialog_messages
+        WHERE user_id=?
+        """,
+        (user_id,),
+    )
+
+    conn.commit()
+    conn.close()
+
+def main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="💬 Диалог", callback_data="void:dialog"),
+            InlineKeyboardButton(text="🎭 Характер", callback_data="void:persona"),
+        ],
+        [
+            InlineKeyboardButton(text="📊 Статус", callback_data="void:status"),
+        ],
+    ])
+
+
+def dialog_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🟢 Включить", callback_data="void:dialog:on"),
+            InlineKeyboardButton(text="🔴 Выключить", callback_data="void:dialog:off"),
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="void:menu"),
+        ],
+    ])
+
+
+def persona_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Наблюдатель", callback_data="void:persona:observer")],
+        [InlineKeyboardButton(text="📊 Аналитик", callback_data="void:persona:analyst")],
+        [InlineKeyboardButton(text="🎭 Философ", callback_data="void:persona:philosopher")],
+        [InlineKeyboardButton(text="😏 Циник", callback_data="void:persona:cynic")],
+        [InlineKeyboardButton(text="😌 Спокойный", callback_data="void:persona:calm")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="void:menu")],
+    ])
+
+@router.callback_query(F.data == "void:menu")
+async def void_menu_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "VOID online.\n\nВыбери режим:",
+        reply_markup=main_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "void:dialog")
+async def void_dialog_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "💬 Диалоговый режим",
+        reply_markup=dialog_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "void:dialog:on")
+async def void_dialog_on_callback(callback: CallbackQuery):
+    set_dialog_enabled(callback.from_user.id, True)
+
+    await callback.message.edit_text(
+        "🟢 Диалоговый режим включён.",
+        reply_markup=main_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "void:dialog:off")
+async def void_dialog_off_callback(callback: CallbackQuery):
+    set_dialog_enabled(callback.from_user.id, False)
+    clear_dialog_context(callback.from_user.id)
+
+    await callback.message.edit_text(
+        "🔴 Диалоговый режим выключен.",
+        reply_markup=main_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "void:persona")
+async def void_persona_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🎭 Выбери характер VOID:",
+        reply_markup=persona_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("void:persona:"))
+async def void_persona_set_callback(callback: CallbackQuery):
+    personality = callback.data.split(":")[-1]
+    set_personality(callback.from_user.id, personality)
+
+    await callback.message.edit_text(
+        f"🎭 Характер VOID изменён: {personality}",
+        reply_markup=main_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "void:status")
+async def void_status_callback(callback: CallbackQuery):
+    session = get_dialog_session(callback.from_user.id)
+    
+    
+
+    await callback.message.edit_text(
+        f"📊 Статус VOID\n\n"
+        f"Диалог: {'ON' if session['enabled'] else 'OFF'}\n"
+        f"Характер: {session['personality']}",
+        reply_markup=main_keyboard(),
+    )
+    await callback.answer()
 
 def is_admin(message: Message) -> bool:
     return bool(message.from_user and message.from_user.id == ADMIN_ID)
@@ -353,11 +648,14 @@ def openai_client() -> OpenAI:
 
 def call_ai(instructions: str, input_text: str) -> str:
     client = openai_client()
+
     response = client.responses.create(
         model=OPENAI_MODEL,
         instructions=instructions,
         input=input_text,
+        max_output_tokens=200,
     )
+
     return response.output_text.strip()
 
 
@@ -622,29 +920,79 @@ async def auto_loop(bot: Bot) -> None:
 @router.message(CommandStart())
 async def start(message: Message):
     if not is_admin(message):
+        
         await message.answer("VOID online. Публичный режим будет позже.")
         return
+        
+        await message.answer(
+        
 
-    await message.answer(
-        "VOID ONLINE.\n\n"
-        "/news — найти новости и сделать черновики\n"
-        "/manual твоя мысль — сигнал из мысли\n"
-        "/midnight текст — ночной сигнал\n"
-        "/observation текст — наблюдение\n"
-        "/future текст — future file\n"
-        "/digest — дайджест дня\n\n"
-        "/drafts — черновики\n"
-        "/preview ID — посмотреть\n"
-        "/publish ID — опубликовать\n"
-        "/auto_on — сам ищет, проверяет и публикует\n"
-        "/auto_off — выключить автопубликацию"
+        "VOID online.\n\nВыбери режим:",
+        reply_markup=main_keyboard(),
     )
-
-
+        
 @router.message(Command("help"))
 async def help_command(message: Message):
     await start(message)
 
+@router.message(Command("dialog"))
+async def dialog_command(message: Message):
+    session = get_dialog_session(message.from_user.id)
+
+    if session["enabled"]:
+        set_dialog_enabled(message.from_user.id, False)
+        clear_dialog_context(message.from_user.id)
+        await message.answer("🔴 Диалоговый режим выключен.")
+    else:
+        set_dialog_enabled(message.from_user.id, True)
+        await message.answer("🟢 Диалоговый режим включен.")
+
+
+@router.message(Command("status"))
+async def status_command(message: Message):
+    session = get_dialog_session(message.from_user.id)
+
+    await message.answer(
+        f"Диалог: {'ON' if session['enabled'] else 'OFF'}\n"
+        f"Характер: {session['personality']}"
+    )
+
+
+@router.message(Command("persona"))
+async def persona_command(message: Message):
+    await message.answer(
+        "Доступные характеры:\n\n"
+        "observer\n"
+        "analyst\n"
+        "philosopher\n"
+        "cynic\n"
+        "calm\n\n"
+        "Пример:\n"
+        "/persona analyst"
+    )
+
+
+@router.message(F.text.startswith("/persona "))
+async def persona_set_command(message: Message):
+    personality = message.text.split(maxsplit=1)[1].strip().lower()
+
+    allowed = {
+        "observer",
+        "analyst",
+        "philosopher",
+        "cynic",
+        "calm",
+    }
+
+    if personality not in allowed:
+        await message.answer("Неизвестный характер.")
+        return
+
+    set_personality(message.from_user.id, personality)
+
+    await message.answer(
+        f"🎭 Характер VOID изменён: {personality}"
+    )
 
 @router.message(Command("news"))
 @router.message(Command("scan"))
@@ -880,33 +1228,76 @@ async def auto_status_command(message: Message):
 @router.callback_query(F.data.startswith("catch:"))
 async def catch_callback(callback: CallbackQuery):
     draft_id = int(callback.data.split(":", 1)[1])
-    conn = db()
-    conn.execute(
-        "INSERT INTO catches(draft_id, user_id, username, created_at) VALUES (?, ?, ?, ?)",
-        (
-            draft_id,
-            callback.from_user.id,
-            callback.from_user.username,
-            now_iso(),
-        ),
-    )
-    conn.commit()
-    conn.close()
-    await callback.answer("Поймал.")
+    conn = None
+
+    try:
+        conn = db()
+
+        conn.execute(
+            "INSERT INTO catches(draft_id, user_id, username, created_at) VALUES (?, ?, ?, ?)",
+            (
+                draft_id,
+                callback.from_user.id,
+                callback.from_user.username,
+                now_iso(),
+            ),
+        )
+
+        conn.commit()
+        await callback.answer("Поймал.")
+
+    except sqlite3.IntegrityError:
+        await callback.answer("Уже поймал этот сигнал.", show_alert=True)
+
+    finally:
+        if conn:
+            conn.close()
 
 
-@router.message(F.text)
+@router.message()
 async def free_text_handler(message: Message):
-    if not is_admin(message):
-        await message.answer(admin_required())
-        return
+    print("STEP 1")
 
-    text = (message.text or "").strip()
-    if text.startswith("/"):
-        await message.answer("Команда не распознана. /help — список команд.")
-        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    text = message.text or ""
 
-    await manual_like(message, "manual", text)
+    print("STEP 2")
+    print("CHAT_ID", chat_id)
+    print("USER_ID", user_id)
+
+    session = get_dialog_session(user_id)
+
+    print("STEP 3")
+
+    if not session or not session.get("enabled"):
+        return
+    prompt = """
+    Ты VOID Entity.
+
+    Отвечай кратко.
+    Отвечай на русском.
+    Не используй markdown.
+    """
+
+    try:
+        print("AI START")
+
+        reply = await asyncio.to_thread(
+            call_ai,
+            prompt,
+            text
+        )
+
+        print("AI END")
+
+    except Exception as e:
+        print("DIALOG AI ERROR:", repr(e))
+        reply = f"AI ERROR: {e}"
+
+    await message.answer(reply)
+
+    # await message.answer(f"Получил: {text}")
 
 
 async def main():
@@ -919,10 +1310,15 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    global auto_task
-    auto_task = asyncio.create_task(auto_loop(bot))
+    # global auto_task
+    # auto_task = asyncio.create_task(auto_loop(bot))
 
-    await dp.start_polling(bot)
+    print("POLLING START", flush=True)
+
+    await dp.start_polling(
+    bot,
+    allowed_updates=["message", "callback_query"]
+)
 
 
 if __name__ == "__main__":

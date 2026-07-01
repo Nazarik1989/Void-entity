@@ -99,6 +99,7 @@ POST: готовый пост
         model=settings.openai_model,
         instructions=instructions,
         input=str(payload),
+        max_output_tokens=3000,
     )
     return r.output_text
 

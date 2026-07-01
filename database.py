@@ -10,7 +10,11 @@ def now_iso() -> str:
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(settings.db_path)
+    conn = sqlite3.connect(
+        settings.db_path,
+        timeout=30,
+        check_same_thread=False
+    )
     conn.row_factory = sqlite3.Row
     return conn
 
