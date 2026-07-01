@@ -84,9 +84,27 @@ MODE_RUBRICS = {
     "manual": "SIGNAL",
     "midnight": "MIDNIGHT",
     "observation": "OBSERVATION",
+    "culture": "CULTURE OBSERVATION",
     "future": "FUTURE FILE",
     "digest": "VOID DIGEST",
 }
+
+
+def build_rubric_header(mode: str, frequency: str = "HUMAN") -> str:
+    base = MODE_RUBRICS.get(mode, "SIGNAL")
+    if frequency and str(frequency).upper() not in {"HUMAN", "SIGNAL", "DIGEST"}:
+        return f"{base} / {frequency.upper()}"
+    return base
+
+
+def inject_rubric_header(mode: str, frequency: str, post: str) -> str:
+    header = build_rubric_header(mode, frequency)
+    stripped = (post or "").strip()
+    if not stripped:
+        return header
+    if stripped.startswith(header):
+        return stripped
+    return f"{header}\n\n{stripped}"
 
 
 def now_iso() -> str:
@@ -363,6 +381,84 @@ def clear_dialog_context(user_id: int) -> None:
     conn.commit()
     conn.close()
 
+
+def build_memory_note(user_text: str, assistant_reply: str) -> str | None:
+    text = (user_text or "").strip()
+    if not text:
+        return None
+
+    cleaned = re.sub(r"[^\w\s]+", " ", text, flags=re.UNICODE)
+    words = [w for w in cleaned.split() if len(w) > 2]
+    stopwords = {
+        "это", "что", "как", "почему", "когда", "где", "мне", "меня", "я", "ты", "ты", "мы",
+        "вам", "тебе", "у", "в", "на", "из", "за", "по", "для", "но", "и", "или", "а", "то",
+        "если", "так", "можно", "хочу", "нужно", "сейчас", "про", "с", "со", "не", "ну",
+    }
+    topic_words = [w.lower() for w in words if w.lower() not in stopwords]
+    if not topic_words:
+        return None
+
+    topic = " ".join(topic_words[:6]).strip()
+    if not topic:
+        return None
+
+    return f"Пользователь обсуждает: {topic}"
+
+
+def get_dialog_memory(user_id: int) -> str | None:
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT content
+        FROM dialog_messages
+        WHERE user_id=? AND role='memory'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (user_id,),
+    ).fetchone()
+    conn.close()
+
+    return row["content"] if row else None
+
+
+def get_personality_style(personality: str) -> str:
+    styles = {
+        "observer": "Наблюдатель: коротко, спокойно, с сухой иронией, без лишних эмоций.",
+        "analyst": "Аналитик: структурно, по фактам, с кратким выводом и ясной логикой.",
+        "philosopher": "Философ: глубже, с метафорой, но без занудства.",
+        "cynic": "Циник: язвительно, остро, но умно, без тупой агрессии.",
+        "calm": "Спокойный: мягко, ровно, без давления и лишней драматизации.",
+    }
+    return styles.get(personality, styles["observer"])
+
+
+def build_dialog_prompt(user_text: str, personality: str, history: list[dict], memory_note: str | None = None) -> str:
+    history_block = ""
+    if history:
+        turns = []
+        for turn in history:
+            role = "Пользователь" if turn.get("role") == "user" else "VOID"
+            turns.append(f"{role}: {turn.get('content', '').strip()}")
+        history_block = "\n".join(turns)
+        history_block = f"\n\nКонтекст предыдущих сообщений:\n{history_block}\n"
+
+    memory_block = ""
+    if memory_note:
+        memory_block = f"\n\nКраткая память:\n{memory_note}\n"
+
+    personality_style = get_personality_style(personality)
+
+    return f"""
+    Ты VOID Entity.
+    Ты — наблюдательный, сухой, чуть ироничный собеседник.
+    Отвечай кратко, по-русски, без markdown.
+    {personality_style}
+    {memory_block}{history_block}
+    Текущее сообщение пользователя: {user_text}
+    """.strip()
+
+
 def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -395,6 +491,17 @@ def persona_keyboard():
         [InlineKeyboardButton(text="😏 Циник", callback_data="void:persona:cynic")],
         [InlineKeyboardButton(text="😌 Спокойный", callback_data="void:persona:calm")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="void:menu")],
+    ])
+
+
+def quick_actions_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📰 Новости", callback_data="void:quick:news")],
+        [InlineKeyboardButton(text="🎵 Музыка", callback_data="void:quick:music")],
+        [InlineKeyboardButton(text="🔮 Будущее", callback_data="void:quick:future")],
+        [InlineKeyboardButton(text="💬 Диалог", callback_data="void:dialog")],
+        [InlineKeyboardButton(text="🎭 Характер", callback_data="void:persona")],
+        [InlineKeyboardButton(text="📊 Статус", callback_data="void:status")],
     ])
 
 @router.callback_query(F.data == "void:menu")
@@ -499,6 +606,50 @@ def score_item(title: str, summary: str = "") -> tuple[str, int]:
         best = "AI"
 
     return best, min(score, 20)
+
+
+def pick_post_mode_and_frequency(title: str, summary: str = "") -> tuple[str, str]:
+    text = f"{title} {summary}".lower()
+    frequency = "HUMAN"
+
+    if any(token in text for token in ["ai", "artificial intelligence", "openai", "llm", "model", "agent", "automation"]):
+        frequency = "AI"
+    elif any(token in text for token in ["privacy", "security", "tracking", "regulation", "policy", "surveillance", "data"]):
+        frequency = "CONTROL"
+    elif any(token in text for token in ["attention", "social media", "algorithm", "scroll", "feed", "platform", "instagram", "tiktok", "youtube"]):
+        frequency = "ATTENTION"
+    elif any(token in text for token in ["future", "startup", "interface", "device", "wearable", "space", "chip", "battery", "research"]):
+        frequency = "FUTURE"
+    elif any(token in text for token in ["people", "human", "behavior", "work", "job", "health", "loneliness", "mental", "culture", "music", "song", "album", "artist", "festival", "streaming"]):
+        frequency = "HUMAN"
+
+    if any(token in text for token in ["night", "midnight", "sleep", "dream", "loneliness", "isolation", "dark"]):
+        return "midnight", frequency
+
+    if any(token in text for token in ["music", "song", "album", "artist", "festival", "streaming", "playlist", "dj", "sound"]):
+        if any(token in text for token in ["culture", "behavior", "attention", "platform", "algorithm", "social media", "feed", "scroll"]):
+            return "observation", frequency
+        if any(token in text for token in ["night", "midnight", "dream", "loneliness", "late", "after hours"]):
+            return "midnight", frequency
+        return "news", frequency
+
+    if any(token in text for token in ["privacy", "security", "tracking", "regulation", "policy", "surveillance", "data"]):
+        return "news", frequency
+
+    if any(token in text for token in ["behavior", "habit", "attention", "platform", "scroll", "feed", "social media", "culture", "people"]):
+        return "culture", frequency
+
+    if any(token in text for token in ["tech", "ai", "model", "startup", "research", "device", "chip", "battery", "future", "policy", "regulation", "security", "privacy"]):
+        return "news", frequency
+
+    if any(token in text for token in ["digest", "week", "daily", "day", "roundup", "summary", "latest"]):
+        return "digest", frequency
+
+    topic, _ = score_item(title, summary)
+    if topic in {"AI", "ATTENTION", "CONTROL", "HUMAN", "FUTURE"}:
+        return "news", frequency
+
+    return "news", "HUMAN"
 
 
 def insert_candidate(item: dict[str, Any]) -> int | None:
@@ -618,14 +769,16 @@ def fetch_news() -> list[dict[str, Any]]:
             if score <= 0:
                 continue
 
+            mode, mapped_frequency = pick_post_mode_and_frequency(title, summary)
             items.append(
                 {
                     "title": title,
                     "summary": summary,
                     "url": url,
                     "source_name": source["name"],
-                    "frequency": frequency,
+                    "frequency": mapped_frequency or frequency,
                     "score": score,
+                    "mode": mode,
                 }
             )
 
@@ -633,7 +786,7 @@ def fetch_news() -> list[dict[str, Any]]:
     return items
 
 
-def openai_client() -> OpenAI:
+def openai_client() -> Any:
     if OpenAI is None:
         raise RuntimeError("OpenAI SDK не установлен")
     if not OPENAI_API_KEY:
@@ -710,8 +863,29 @@ def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
         "manual": "Сделай пост из мысли автора. Не превращай в мотивационную цитату. Разверни мысль в наблюдение.",
         "midnight": "Сделай ночной пост: темнее, личнее, атмосфернее, но без позы и дешёвой драмы.",
         "observation": "Сделай наблюдение: короткий анализ поведения людей, технологий или культуры.",
+        "culture": "Сделай культурное наблюдение: про привычки, медиа, музыку, поведение и то, как люди живут рядом с технологиями.",
         "future": "Сделай FUTURE FILE: чуть аналитичнее, про будущий сдвиг, но человеческим языком.",
         "digest": "Сделай дайджест дня: 3–5 сигналов, общий вывод, немного иронии.",
+    }
+
+    mode_style = {
+        "news": "Стиль: прямой, чуть резче, с ясной точкой входа.",
+        "manual": "Стиль: личный, уверенный, но без пафоса.",
+        "midnight": "Стиль: тише, плотнее, атмосфернее, с ощущением ночи и внутренней усталости.",
+        "observation": "Стиль: коротко, точно, как наблюдение над привычкой или системой.",
+        "culture": "Стиль: как культурный комментарий, чуть ближе к человеческому поведению и атмосфере.",
+        "future": "Стиль: чуть шире, с ощущением сдвига, но без хайпа.",
+        "digest": "Стиль: сборный, быстрый, как сводка из нескольких сигналов.",
+    }
+
+    structure = {
+        "news": "1. Заголовок рубрики: {rubric} / {frequency} если частота уместна, иначе просто {rubric}\n2. Факт / мысль / наблюдение.\n3. Что это говорит о человеке в цифровой среде.\n4. VOID COMMENT: коротко, иронично, не душно.\n5. Источник, если источник есть.",
+        "manual": "1. Заголовок рубрики: {rubric}\n2. Мысль автора в собственной форме.\n3. Наблюдение о том, что это значит для человека.\n4. VOID COMMENT: коротко, без пафоса.\n5. Источник, если источник есть.",
+        "midnight": "1. Заголовок рубрики: {rubric}\n2. Ночная, чуть более тёмная мысль.\n3. Ощущение, которое возникает в человеке рядом с этой темой.\n4. VOID COMMENT: короткий, холодный, точный.\n5. Источник, если источник есть.",
+        "observation": "1. Заголовок рубрики: {rubric}\n2. Короткое наблюдение над явлением.\n3. Что это говорит о привычке, платформе или поведении.\n4. VOID COMMENT: сухо, без лишней драматизации.\n5. Источник, если источник есть.",
+        "culture": "1. Заголовок рубрики: {rubric}\n2. Культурное наблюдение над явлением.\n3. Что это говорит о людях, привычке, музыке, медиа или атмосфере.\n4. VOID COMMENT: чуть ближе к человеку, без пафоса.\n5. Источник, если источник есть.",
+        "future": "1. Заголовок рубрики: {rubric}\n2. Сдвиг, который уже заметен.\n3. Как это меняет поведение или среду.\n4. VOID COMMENT: чуть аналитичнее, но живо.\n5. Источник, если источник есть.",
+        "digest": "1. Заголовок рубрики: {rubric}\n2. 3–5 сигналов в одном посте.\n3. Общий вывод по теме.\n4. VOID COMMENT: ироничный, краткий, связующий.\n5. Источник, если источник есть.",
     }
 
     return f"""
@@ -727,7 +901,9 @@ def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
 Частота: {frequency}
 
 Задача режима:
-{mode_rules.get(mode, mode_rules["manual"])}
+{mode_rules.get(mode, mode_rules['manual'])}
+
+{mode_style.get(mode, mode_style['news'])}
 
 Запрещено:
 - "в современном мире"
@@ -739,11 +915,7 @@ def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
 - высокомерие к людям
 
 Структура:
-1. Заголовок рубрики: {rubric} / {frequency} если частота уместна, иначе просто {rubric}
-2. Факт / мысль / наблюдение.
-3. Что это говорит о человеке в цифровой среде.
-4. VOID COMMENT: коротко, иронично, не душно.
-5. Источник, если источник есть.
+{structure.get(mode, structure['news']).format(rubric=rubric, frequency=frequency)}
 
 Длина:
 - обычный пост: 700–1300 символов
@@ -784,6 +956,8 @@ def generate_post_sync(mode: str, content: str, frequency: str = "HUMAN", source
                 input_text,
             )
             title, post = parse_ai_output(raw)
+
+        post = inject_rubric_header(mode, frequency, post)
 
         if source_url and source_url.startswith("http") and "Источник:" not in post:
             post = f"{post.rstrip()}\n\nИсточник: {source_name}\n{source_url}"
@@ -863,7 +1037,7 @@ async def make_news_drafts(limit: int = 5) -> tuple[int, int]:
             f"Ссылка: {item.get('url', '')}"
         )
         await generate_and_save(
-            "news",
+            item.get("mode", "news"),
             content,
             item.get("frequency", "HUMAN"),
             item.get("source_name", ""),
@@ -887,7 +1061,7 @@ async def autopost_once(bot: Bot) -> str:
             f"Ссылка: {item.get('url', '')}"
         )
         draft_id = await generate_and_save(
-            "news",
+            item.get("mode", "news"),
             content,
             item.get("frequency", "HUMAN"),
             item.get("source_name", ""),
@@ -920,13 +1094,13 @@ async def auto_loop(bot: Bot) -> None:
 @router.message(CommandStart())
 async def start(message: Message):
     if not is_admin(message):
-        
-        await message.answer("VOID online. Публичный режим будет позже.")
-        return
-        
         await message.answer(
-        
-
+            "VOID online. Публичный режим будет позже.",
+            reply_markup=main_keyboard(),
+        )
+        return
+    
+    await message.answer(
         "VOID online.\n\nВыбери режим:",
         reply_markup=main_keyboard(),
     )
@@ -946,6 +1120,12 @@ async def dialog_command(message: Message):
     else:
         set_dialog_enabled(message.from_user.id, True)
         await message.answer("🟢 Диалоговый режим включен.")
+
+
+@router.message(Command("reset"))
+async def reset_command(message: Message):
+    clear_dialog_context(message.from_user.id)
+    await message.answer("🧹 Контекст диалога очищен. Можно начинать заново.")
 
 
 @router.message(Command("status"))
@@ -1254,50 +1434,78 @@ async def catch_callback(callback: CallbackQuery):
             conn.close()
 
 
+@router.callback_query(F.data == "void:quick:news")
+async def void_quick_news_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "📰 Ищу новости... Скоро будет чёрновик.\n\n"
+        "Используй /news чтобы проверить результат.",
+        reply_markup=quick_actions_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "void:quick:music")
+async def void_quick_music_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🎵 Культурный режим активирован.\n\n"
+        "Отправляй мне новости о музыке, артистах или платформах — "
+        "и я дам культурный взгляд на тему.",
+        reply_markup=quick_actions_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "void:quick:future")
+async def void_quick_future_callback(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🔮 FUTURE FILE режим активирован.\n\n"
+        "Отправляй мне тему о будущем, технологиях или трендах — "
+        "и я проанализирую грядущий сдвиг.",
+        reply_markup=quick_actions_keyboard(),
+    )
+    await callback.answer()
+
+
 @router.message()
 async def free_text_handler(message: Message):
-    print("STEP 1")
 
     chat_id = message.chat.id
     user_id = message.from_user.id
-    text = message.text or ""
-
-    print("STEP 2")
-    print("CHAT_ID", chat_id)
-    print("USER_ID", user_id)
+    text = (message.text or "").strip()
 
     session = get_dialog_session(user_id)
 
-    print("STEP 3")
-
     if not session or not session.get("enabled"):
         return
-    prompt = """
-    Ты VOID Entity.
 
-    Отвечай кратко.
-    Отвечай на русском.
-    Не используй markdown.
-    """
+    history = get_dialog_context(user_id, limit=8)
+    personality = session.get("personality", "observer")
+
+    if not text:
+        return
+
+    memory_note = get_dialog_memory(user_id)
+    prompt = build_dialog_prompt(text, personality, history, memory_note)
 
     try:
-        print("AI START")
-
         reply = await asyncio.to_thread(
             call_ai,
             prompt,
-            text
+            text,
         )
-
-        print("AI END")
-
+        reply = (reply or "").strip() or "Я не успел сформулировать ответ. Попробуй ещё раз."
     except Exception as e:
         print("DIALOG AI ERROR:", repr(e))
         reply = f"AI ERROR: {e}"
 
-    await message.answer(reply)
+    save_dialog_message(user_id, "user", text)
+    save_dialog_message(user_id, "assistant", reply)
 
-    # await message.answer(f"Получил: {text}")
+    new_memory = build_memory_note(text, reply)
+    if new_memory:
+        save_dialog_message(user_id, "memory", new_memory)
+
+    await message.answer(reply)
 
 
 async def main():
