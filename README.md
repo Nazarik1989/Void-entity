@@ -20,6 +20,8 @@ CHANNEL_ID=@username_твоего_канала
 ADMIN_ID=твой_telegram_user_id
 OPENAI_API_KEY=опционально
 OPENAI_MODEL=openai/gpt-5.4
+OPENAI_POST_MODEL=openai/gpt-5.4-mini
+OPENAI_DIALOG_MODEL=openai/gpt-5.4
 OPENAI_IMAGE_MODEL=gpt-image-1
 OPENAI_IMAGE_SIZE=1024x1024
 OPENAI_IMAGE_QUALITY=medium
@@ -103,6 +105,8 @@ OpenAI ...
 ## AI-режим
 
 Если `OPENAI_API_KEY` задан, бот будет использовать OpenAI Responses API для генерации постов и Images API для 1-2 релевантных картинок к опубликованному посту.
+
+`OPENAI_POST_MODEL` используется для ручного постинга и автопостинга. `OPENAI_DIALOG_MODEL` используется для диалогового режима.
 
 Если ключ не задан, бот всё равно работает: он использует fallback-редактор с шаблонной VOID-оптикой и сухим юмором.
 

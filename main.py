@@ -31,6 +31,8 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-5.4")
+OPENAI_POST_MODEL = os.getenv("OPENAI_POST_MODEL", "openai/gpt-5.4-mini")
+OPENAI_DIALOG_MODEL = os.getenv("OPENAI_DIALOG_MODEL", os.getenv("OPENAI_MODEL", "openai/gpt-5.4"))
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
@@ -803,11 +805,16 @@ def openai_client() -> Any:
     return OpenAI(**kwargs)
 
 
-def call_ai(instructions: str, input_text: str, max_output_tokens: int = 200) -> str:
+def call_ai(
+    instructions: str,
+    input_text: str,
+    max_output_tokens: int = 200,
+    model: str | None = None,
+) -> str:
     client = openai_client()
 
     response = client.responses.create(
-        model=OPENAI_MODEL,
+        model=model or OPENAI_MODEL,
         instructions=instructions,
         input=input_text,
         max_output_tokens=max_output_tokens,
@@ -856,7 +863,7 @@ Rules:
     )
 
     try:
-        raw = call_ai(instructions, input_text, max_output_tokens=500)
+        raw = call_ai(instructions, input_text, max_output_tokens=500, model=OPENAI_POST_MODEL)
         prompts = []
         for line in raw.splitlines():
             match = re.match(r"\s*IMAGE\s*:\s*(.+)", line, flags=re.I)
@@ -1035,13 +1042,14 @@ def generate_post_sync(mode: str, content: str, frequency: str = "HUMAN", source
     )
 
     try:
-        raw = call_ai(prompt, input_text)
+        raw = call_ai(prompt, input_text, model=OPENAI_POST_MODEL)
         title, post = parse_ai_output(raw)
 
         if too_much_english(post):
             raw = call_ai(
                 prompt + "\n\nПредыдущий вариант оставил слишком много английского. Перепиши полностью по-русски.",
                 input_text,
+                model=OPENAI_POST_MODEL,
             )
             title, post = parse_ai_output(raw)
 
@@ -1614,6 +1622,7 @@ async def free_text_handler(message: Message):
             call_ai,
             prompt,
             text,
+            model=OPENAI_DIALOG_MODEL,
         )
         reply = (reply or "").strip() or "Я не успел сформулировать ответ. Попробуй ещё раз."
     except Exception as e:

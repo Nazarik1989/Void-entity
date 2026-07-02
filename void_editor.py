@@ -96,7 +96,7 @@ POST: готовый пост
     }
 
     r = _client().responses.create(
-        model=settings.openai_model,
+        model=settings.openai_post_model,
         instructions=instructions,
         input=str(payload),
         max_output_tokens=3000,

@@ -13,6 +13,8 @@ class Settings:
     db_path: str = "void.db"
     openai_api_key: str | None = None
     openai_model: str = "openai/gpt-5.4"
+    openai_post_model: str = "openai/gpt-5.4-mini"
+    openai_dialog_model: str = "openai/gpt-5.4"
     openai_image_model: str = "gpt-image-1"
     openai_image_size: str = "1024x1024"
     openai_image_quality: str = "medium"
@@ -42,6 +44,8 @@ def get_settings() -> Settings:
         db_path=os.getenv("DB_PATH", "void.db"),
         openai_api_key=os.getenv("OPENAI_API_KEY") or None,
         openai_model=os.getenv("OPENAI_MODEL", "openai/gpt-5.4"),
+        openai_post_model=os.getenv("OPENAI_POST_MODEL", "openai/gpt-5.4-mini"),
+        openai_dialog_model=os.getenv("OPENAI_DIALOG_MODEL", os.getenv("OPENAI_MODEL", "openai/gpt-5.4")),
         openai_image_model=os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1"),
         openai_image_size=os.getenv("OPENAI_IMAGE_SIZE", "1024x1024"),
         openai_image_quality=os.getenv("OPENAI_IMAGE_QUALITY", "medium"),
