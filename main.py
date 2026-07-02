@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import re
 import sqlite3
@@ -12,7 +13,7 @@ from typing import Any
 import feedparser
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from dotenv import load_dotenv
 
 try:
@@ -29,7 +30,10 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-5.4")
+OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
+OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
 
 DB_PATH = "void.db"
 
@@ -799,17 +803,101 @@ def openai_client() -> Any:
     return OpenAI(**kwargs)
 
 
-def call_ai(instructions: str, input_text: str) -> str:
+def call_ai(instructions: str, input_text: str, max_output_tokens: int = 200) -> str:
     client = openai_client()
 
     response = client.responses.create(
         model=OPENAI_MODEL,
         instructions=instructions,
         input=input_text,
-        max_output_tokens=200,
+        max_output_tokens=max_output_tokens,
     )
 
     return response.output_text.strip()
+
+
+def image_count_for_draft(mode: str, post: str) -> int:
+    text = post or ""
+    if mode == "digest":
+        return 2
+    if len(text) > 1100 and len(re.findall(r"\n\s*\d+[\.\)]", text)) >= 2:
+        return 2
+    return 1
+
+
+def build_image_prompts_sync(draft: dict | sqlite3.Row) -> list[str]:
+    mode = draft["mode"] or "news"
+    title = draft["title"] or "VOID signal"
+    post = draft["post"] or ""
+    source_name = draft["source_name"] or ""
+    count = image_count_for_draft(mode, post)
+
+    instructions = """
+You are an art director for a Telegram channel called VOID.
+Create visual prompts for image generation that match the post exactly.
+Return only lines in this format:
+IMAGE: prompt
+
+Rules:
+- Return 1 or 2 IMAGE lines, no extra text.
+- The image must be relevant to the post's concrete topic.
+- Avoid text, logos, UI screenshots, brand marks, and fake article pages.
+- Avoid depicting a real named person unless the post is specifically about that person.
+- Style: editorial conceptual illustration, cinematic but clean, dark neutral background, high contrast, subtle technological atmosphere.
+- No gore, no explicit content.
+""".strip()
+
+    input_text = (
+        f"NEEDED_IMAGES: {count}\n"
+        f"MODE: {mode}\n"
+        f"TITLE: {title}\n"
+        f"SOURCE_NAME: {source_name}\n"
+        f"POST:\n{post[:1400]}"
+    )
+
+    try:
+        raw = call_ai(instructions, input_text, max_output_tokens=500)
+        prompts = []
+        for line in raw.splitlines():
+            match = re.match(r"\s*IMAGE\s*:\s*(.+)", line, flags=re.I)
+            if match:
+                prompts.append(match.group(1).strip())
+        prompts = [p for p in prompts if p][:count]
+        if prompts:
+            return prompts
+    except Exception as e:
+        print(f"image prompt error: {type(e).__name__}: {e}", flush=True)
+
+    fallback = (
+        f"Editorial conceptual illustration for a Telegram post titled '{title}'. "
+        f"Represent the concrete topic of the post, source context: {source_name}. "
+        "No text, no logos, no UI screenshots, dark neutral background, high contrast, clean cinematic composition."
+    )
+    return [fallback] * count
+
+
+def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
+    client = openai_client()
+    images: list[bytes] = []
+
+    for prompt in build_image_prompts_sync(draft):
+        response = client.images.generate(
+            model=OPENAI_IMAGE_MODEL,
+            prompt=prompt,
+            size=OPENAI_IMAGE_SIZE,
+            quality=OPENAI_IMAGE_QUALITY,
+            n=1,
+        )
+        if not response.data:
+            continue
+
+        b64_json = getattr(response.data[0], "b64_json", None)
+        if not b64_json:
+            continue
+
+        images.append(base64.b64decode(b64_json))
+
+    return images[:2]
 
 
 def too_much_english(text: str) -> bool:
@@ -998,6 +1086,35 @@ def catch_keyboard(draft_id: int) -> InlineKeyboardMarkup:
     )
 
 
+async def publish_draft_images(bot: Bot, draft: dict | sqlite3.Row) -> tuple[int, str | None]:
+    try:
+        images = await asyncio.to_thread(generate_post_images_sync, draft)
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}"
+
+    if not images:
+        return 0, None
+
+    try:
+        if len(images) == 1:
+            await bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=BufferedInputFile(images[0], filename=f"void-{draft['id']}-1.png"),
+            )
+        else:
+            media = [
+                InputMediaPhoto(
+                    media=BufferedInputFile(image, filename=f"void-{draft['id']}-{index}.png")
+                )
+                for index, image in enumerate(images, start=1)
+            ]
+            await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+    except Exception as e:
+        return 0, f"{type(e).__name__}: {e}"
+
+    return len(images), None
+
+
 async def publish_draft(bot: Bot, draft_id: int) -> str:
     if not CHANNEL_ID:
         return "CHANNEL_ID не задан. Добавь канал в Secrets."
@@ -1016,8 +1133,13 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
         reply_markup=catch_keyboard(draft_id),
         disable_web_page_preview=False,
     )
+    image_count, image_error = await publish_draft_images(bot, draft)
     mark_published(draft_id, draft["source_url"] or "")
-    return f"Опубликовано: #{draft_id}"
+    if image_count:
+        return f"Опубликовано: #{draft_id}. Картинок: {image_count}"
+    if image_error:
+        return f"Опубликовано: #{draft_id}. Картинки не приложились: {image_error}"
+    return f"Опубликовано: #{draft_id}. Картинок: 0"
 
 
 async def make_news_drafts(limit: int = 5) -> tuple[int, int]:
@@ -1518,8 +1640,8 @@ async def main():
     dp = Dispatcher()
     dp.include_router(router)
 
-    # global auto_task
-    # auto_task = asyncio.create_task(auto_loop(bot))
+    global auto_task
+    auto_task = asyncio.create_task(auto_loop(bot))
 
     print("POLLING START", flush=True)
 
