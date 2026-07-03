@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import os
 import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urljoin
+from urllib.request import Request, urlopen
 
 import feedparser
 from aiogram import Bot, Dispatcher, F, Router
@@ -907,6 +910,45 @@ def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
     return images[:2]
 
 
+def find_source_image_url(source_url: str) -> str | None:
+    if not source_url or not source_url.startswith("http"):
+        return None
+
+    try:
+        request = Request(
+            source_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (compatible; VOIDBot/1.0; "
+                    "+https://t.me/voidsignv1s)"
+                )
+            },
+        )
+        with urlopen(request, timeout=10) as response:
+            page = response.read(700_000).decode("utf-8", errors="ignore")
+    except Exception as e:
+        print(f"source image lookup error: {type(e).__name__}: {e}", flush=True)
+        return None
+
+    patterns = [
+        r'<meta[^>]+property=["\']og:image(?::secure_url)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+name=["\']twitter:image(?::src)?["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image(?::secure_url)?["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']twitter:image(?::src)?["\']',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, page, flags=re.I)
+        if not match:
+            continue
+        image_url = html.unescape(match.group(1).strip())
+        image_url = urljoin(source_url, image_url)
+        if image_url.startswith("http"):
+            return image_url
+
+    return None
+
+
 def too_much_english(text: str) -> bool:
     words = re.findall(r"\b[A-Za-z][A-Za-z\-]{3,}\b", text or "")
     allowed = {
@@ -1107,13 +1149,24 @@ def catch_keyboard(draft_id: int) -> InlineKeyboardMarkup:
 
 
 async def publish_draft_images(bot: Bot, draft: dict | sqlite3.Row) -> tuple[int, str | None]:
+    image_error: str | None = None
+
     try:
         images = await asyncio.to_thread(generate_post_images_sync, draft)
     except Exception as e:
-        return 0, f"{type(e).__name__}: {e}"
+        images = []
+        image_error = f"{type(e).__name__}: {e}"
 
     if not images:
-        return 0, None
+        source_image_url = await asyncio.to_thread(find_source_image_url, draft["source_url"] or "")
+        if source_image_url:
+            try:
+                await bot.send_photo(chat_id=CHANNEL_ID, photo=source_image_url)
+                return 1, None
+            except Exception as e:
+                fallback_error = f"{type(e).__name__}: {e}"
+                return 0, f"{image_error}; source image fallback: {fallback_error}" if image_error else fallback_error
+        return 0, image_error
 
     try:
         if len(images) == 1:
