@@ -909,9 +909,21 @@ def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
 
 def too_much_english(text: str) -> bool:
     words = re.findall(r"\b[A-Za-z][A-Za-z\-]{3,}\b", text or "")
-    allowed = {"void", "ai", "llm", "api", "rss", "openai", "url", "mit", "wired"}
+    allowed = {
+        "void", "ai", "llm", "api", "rss", "openai", "url", "mit", "wired",
+        "anthropic", "claude", "meta", "tesla", "model", "cursor", "spacex",
+        "ars", "technica", "technology", "review", "verge",
+    }
     bad = [w for w in words if w.lower() not in allowed]
-    return len(bad) >= 8
+    if len(bad) < 18:
+        return False
+
+    russian_words = re.findall(r"\b[А-Яа-яЁё][А-Яа-яЁё\-]{2,}\b", text or "")
+    if russian_words:
+        english_share = len(bad) / (len(bad) + len(russian_words))
+        return english_share >= 0.22
+
+    return True
 
 
 def quality_check(post: str) -> tuple[bool, str]:
