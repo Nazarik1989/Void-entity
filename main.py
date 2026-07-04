@@ -19,7 +19,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from dotenv import load_dotenv
 
-from void_core import MODE_RUBRICS, VOID_CORE_PROMPT, platform_context
+from void_core import CONTENT_PLAN, MODE_RUBRICS, VOID_CORE_PROMPT, platform_context
 
 try:
     from openai import OpenAI
@@ -1152,8 +1152,11 @@ def generate_post_sync(mode: str, content: str, frequency: str = "HUMAN", source
 
         post = inject_rubric_header(mode, frequency, post)
 
-        if source_url and source_url.startswith("http") and "Источник:" not in post:
-            post = f"{post.rstrip()}\n\nИсточник: {source_name}\n{source_url}"
+        if source_name and "????????:" not in post and "????????????????:" not in post:
+            source_line = f"????????: {source_name}"
+            if source_url and source_url.startswith("http"):
+                source_line = f"{source_line}\n{source_url}"
+            post = f"{post.rstrip()}\n\n{source_line}"
 
     except Exception as e:
         title, post = fallback_post(mode, content, source_name, source_url, frequency)
@@ -1316,12 +1319,56 @@ async def autopost_once(bot: Bot) -> str:
     return "Автопостинг: сигналы были, но quality gate всё зарезал. Редкий случай, когда цензура оказалась полезной."
 
 
+def next_content_plan_slot() -> tuple[int, dict[str, str]]:
+    current = int(get_setting("auto_content_index", "0") or "0")
+    slot = CONTENT_PLAN[current % len(CONTENT_PLAN)]
+    set_setting("auto_content_index", str(current + 1))
+    return current, slot
+
+
+async def autopost_void_signal_once(bot: Bot) -> str:
+    index, slot = await asyncio.to_thread(next_content_plan_slot)
+    mode = slot["mode"]
+    frequency = slot["frequency"]
+    content = (
+        f"CONTENT_PLAN_INDEX: {index}\n"
+        f"RUBRIC: {slot['name']}\n"
+        f"PLATFORM: Telegram\n"
+        f"BRIEF:\n{slot['brief']}\n\n"
+        "Make an original VOID post. Do not mention that this came from a plan. "
+        "Do not imitate news. No external source is required."
+    )
+
+    draft_id = await generate_and_save(
+        mode,
+        content,
+        frequency,
+        "VOID internal signal",
+        f"manual://auto/{mode}/{now_iso()}",
+    )
+    draft = get_draft(draft_id)
+    ok, reason = quality_check(draft["post"] if draft else "")
+    if not ok:
+        return f"VOID-план: черновик #{draft_id} не опубликован: {reason}"
+
+    result = await publish_draft(bot, draft_id)
+    return f"VOID-план: {result}"
+
+
+async def autopost_scheduled_once(bot: Bot) -> str:
+    cycle = int(get_setting("auto_publish_cycle", "0") or "0")
+    set_setting("auto_publish_cycle", str(cycle + 1))
+    if cycle % 3 == 2:
+        return await autopost_once(bot)
+    return await autopost_void_signal_once(bot)
+
+
 async def auto_loop(bot: Bot) -> None:
     while True:
         try:
             enabled = get_setting("auto_publish", "0") == "1"
             if enabled:
-                result = await autopost_once(bot)
+                result = await autopost_scheduled_once(bot)
                 print(result, flush=True)
         except Exception as e:
             print(f"auto_loop error: {type(e).__name__}: {e}", flush=True)
@@ -1646,6 +1693,17 @@ async def autopost_now_command(message: Message, bot: Bot):
 
     await message.answer("Запускаю автопостинг один раз. VOID надевает редакторские перчатки.")
     result = await autopost_once(bot)
+    await message.answer(result)
+
+
+@router.message(Command("void_now"))
+async def void_now_command(message: Message, bot: Bot):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer("Запускаю не новость, а VOID-сигнал из контент-плана.")
+    result = await autopost_void_signal_once(bot)
     await message.answer(result)
 
 

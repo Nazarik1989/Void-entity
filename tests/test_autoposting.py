@@ -5,6 +5,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from main import build_rubric_header, inject_rubric_header, too_much_english, trim_post
+from void_core import CONTENT_PLAN
 
 
 class AutopostingRubricTests(unittest.TestCase):
@@ -15,6 +16,12 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertEqual(build_rubric_header("frequency", "HUMAN"), "FREQUENCY")
         self.assertEqual(build_rubric_header("archive", "DIGEST"), "SIGNAL ARCHIVE")
         self.assertEqual(build_rubric_header("vault", "HUMAN"), "THE VAULT")
+
+    def test_content_plan_has_non_news_modes(self) -> None:
+        modes = {slot["mode"] for slot in CONTENT_PLAN}
+        self.assertIn("frequency", modes)
+        self.assertIn("observation", modes)
+        self.assertIn("vault", modes)
 
     def test_inject_rubric_header_into_post(self) -> None:
         post = inject_rubric_header("news", "AI", "Текст поста")

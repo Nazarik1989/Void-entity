@@ -73,6 +73,64 @@ PLATFORM_CHANNELS = {
 }
 
 
+CONTENT_PLAN = [
+    {
+        "mode": "signal",
+        "frequency": "HUMAN",
+        "name": "Human Signal",
+        "brief": (
+            "A short original VOID signal about a human trying to stay honest, "
+            "attentive, and alive inside digital noise. No news hook."
+        ),
+    },
+    {
+        "mode": "observation",
+        "frequency": "ATTENTION",
+        "name": "Attention Observation",
+        "brief": (
+            "A cultural observation about feeds, habits, platforms, screens, "
+            "attention, fatigue, or the small rituals people stop noticing."
+        ),
+    },
+    {
+        "mode": "frequency",
+        "frequency": "HUMAN",
+        "name": "Frequency",
+        "brief": (
+            "An atmospheric post about music, night cities, headphones, sound, "
+            "memory, mood, or the state a track can leave in a person."
+        ),
+    },
+    {
+        "mode": "future",
+        "frequency": "FUTURE",
+        "name": "Future File",
+        "brief": (
+            "A non-hype note about a possible future shift: interfaces, work, "
+            "tools, cities, creators, or how technology changes behavior."
+        ),
+    },
+    {
+        "mode": "midnight",
+        "frequency": "HUMAN",
+        "name": "Midnight",
+        "brief": (
+            "A quieter night signal: loneliness, focus, memory, silence, late work, "
+            "or the feeling of being awake while the system keeps running."
+        ),
+    },
+    {
+        "mode": "vault",
+        "frequency": "HUMAN",
+        "name": "The Vault",
+        "brief": (
+            "A deeper thought for VOID memory. Something worth saving, not a lesson. "
+            "It should help people remember what they already knew but stopped noticing."
+        ),
+    },
+]
+
+
 def platform_context(platform: str = "telegram") -> str:
     channel = PLATFORM_CHANNELS.get(platform, PLATFORM_CHANNELS["telegram"])
     return (
