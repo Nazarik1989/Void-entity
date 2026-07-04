@@ -849,6 +849,25 @@ def trim_post(post: str, limit: int = 3200) -> str:
     return body
 
 
+def display_source_name(source_name: str) -> str:
+    if (source_name or "").strip().lower() == "void internal signal":
+        return "VOID"
+    return (source_name or "").strip()
+
+
+def clean_source_lines(post: str) -> str:
+    lines = (post or "").splitlines()
+    cleaned: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if re.match(r"^\?{3,}\s*:\s*", stripped):
+            continue
+        if stripped.startswith("????????:") or stripped.startswith("????????????????:"):
+            continue
+        cleaned.append(line)
+    return "\n".join(cleaned).strip()
+
+
 def image_count_for_draft(mode: str, post: str) -> int:
     text = post or ""
     if mode == "digest":
@@ -1152,8 +1171,10 @@ def generate_post_sync(mode: str, content: str, frequency: str = "HUMAN", source
 
         post = inject_rubric_header(mode, frequency, post)
 
-        if source_name and "????????:" not in post and "????????????????:" not in post:
-            source_line = f"????????: {source_name}"
+        post = clean_source_lines(post)
+        source_display = display_source_name(source_name)
+        if source_display and "Источник:" not in post and "РСЃС‚РѕС‡РЅРёРє:" not in post:
+            source_line = f"Источник: {source_display}"
             if source_url and source_url.startswith("http"):
                 source_line = f"{source_line}\n{source_url}"
             post = f"{post.rstrip()}\n\n{source_line}"
@@ -1343,7 +1364,7 @@ async def autopost_void_signal_once(bot: Bot) -> str:
         mode,
         content,
         frequency,
-        "VOID internal signal",
+        "VOID",
         f"manual://auto/{mode}/{now_iso()}",
     )
     draft = get_draft(draft_id)

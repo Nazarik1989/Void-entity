@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from main import build_rubric_header, inject_rubric_header, too_much_english, trim_post
+from main import build_rubric_header, clean_source_lines, display_source_name, inject_rubric_header, too_much_english, trim_post
 from void_core import CONTENT_PLAN
 
 
@@ -44,6 +44,12 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertLessEqual(len(trimmed), 500)
         self.assertIn("Источник: VOID", trimmed)
         self.assertIn("https://example.com/source", trimmed)
+
+
+    def test_clean_source_lines_removes_question_mark_source(self) -> None:
+        post = "SIGNAL\n\nText\n\n???????: VOID internal signal"
+        self.assertEqual(clean_source_lines(post), "SIGNAL\n\nText")
+        self.assertEqual(display_source_name("VOID internal signal"), "VOID")
 
 
 if __name__ == "__main__":
