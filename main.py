@@ -19,6 +19,8 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from dotenv import load_dotenv
 
+from void_core import MODE_RUBRICS, VOID_CORE_PROMPT, platform_context
+
 try:
     from openai import OpenAI
 except Exception:
@@ -87,17 +89,6 @@ VOID_TOPICS = {
         "space", "battery", "chip", "compute", "research",
     ],
 }
-
-MODE_RUBRICS = {
-    "news": "SIGNAL",
-    "manual": "SIGNAL",
-    "midnight": "MIDNIGHT",
-    "observation": "OBSERVATION",
-    "culture": "CULTURE OBSERVATION",
-    "future": "FUTURE FILE",
-    "digest": "VOID DIGEST",
-}
-
 
 def build_rubric_header(mode: str, frequency: str = "HUMAN") -> str:
     base = MODE_RUBRICS.get(mode, "SIGNAL")
@@ -459,6 +450,10 @@ def build_dialog_prompt(user_text: str, personality: str, history: list[dict], m
     personality_style = get_personality_style(personality)
 
     return f"""
+{VOID_CORE_PROMPT}
+
+{platform_context("telegram")}
+
     Ты VOID Entity.
     Ты — наблюдательный, сухой, чуть ироничный собеседник.
     Отвечай кратко, по-русски, без markdown.
@@ -640,19 +635,22 @@ def pick_post_mode_and_frequency(title: str, summary: str = "") -> tuple[str, st
             return "observation", frequency
         if any(token in text for token in ["night", "midnight", "dream", "loneliness", "late", "after hours"]):
             return "midnight", frequency
-        return "news", frequency
+        return "frequency", frequency
 
     if any(token in text for token in ["privacy", "security", "tracking", "regulation", "policy", "surveillance", "data"]):
         return "news", frequency
 
     if any(token in text for token in ["behavior", "habit", "attention", "platform", "scroll", "feed", "social media", "culture", "people"]):
-        return "culture", frequency
+        return "observation", frequency
 
-    if any(token in text for token in ["tech", "ai", "model", "startup", "research", "device", "chip", "battery", "future", "policy", "regulation", "security", "privacy"]):
+    if any(token in text for token in ["future", "research", "device", "chip", "battery", "interface", "space", "wearable"]):
+        return "future", frequency
+
+    if any(token in text for token in ["tech", "ai", "model", "startup", "policy", "regulation", "security", "privacy"]):
         return "news", frequency
 
     if any(token in text for token in ["digest", "week", "daily", "day", "roundup", "summary", "latest"]):
-        return "digest", frequency
+        return "archive", frequency
 
     topic, _ = score_item(title, summary)
     if topic in {"AI", "ATTENTION", "CONTROL", "HUMAN", "FUTURE"}:
@@ -826,6 +824,31 @@ def call_ai(
     return response.output_text.strip()
 
 
+def trim_post(post: str, limit: int = 3200) -> str:
+    text = (post or "").strip()
+    if len(text) <= limit:
+        return text
+
+    source_match = re.search(r"\n\nИсточник:\s*.+", text, flags=re.S)
+    source_block = source_match.group(0).strip() if source_match else ""
+    body_limit = limit - len(source_block) - (2 if source_block else 0)
+    body = text[: max(0, body_limit)].rstrip()
+
+    cut_points = [
+        body.rfind("\n\n"),
+        body.rfind(". "),
+        body.rfind("! "),
+        body.rfind("? "),
+    ]
+    cut_at = max(cut_points)
+    if cut_at > body_limit * 0.65:
+        body = body[: cut_at + 1].rstrip()
+
+    if source_block and source_block not in body:
+        return f"{body}\n\n{source_block}".strip()
+    return body
+
+
 def image_count_for_draft(mode: str, post: str) -> int:
     text = post or ""
     if mode == "digest":
@@ -971,7 +994,7 @@ def too_much_english(text: str) -> bool:
 def quality_check(post: str) -> tuple[bool, str]:
     if len(post.strip()) < 250:
         return False, "слишком коротко"
-    if len(post) > 1800:
+    if len(post) > 3600:
         return False, "слишком длинно"
     if too_much_english(post):
         return False, "слишком много английского"
@@ -1017,6 +1040,11 @@ def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
         "digest": "Сделай дайджест дня: 3–5 сигналов, общий вывод, немного иронии.",
     }
 
+    mode_rules.setdefault("signal", mode_rules["manual"])
+    mode_rules.setdefault("frequency", "Сделай FREQUENCY: пост про музыку, настроение, культурную волну или состояние, которое технология/среда создаёт в человеке.")
+    mode_rules.setdefault("archive", "Сделай SIGNAL ARCHIVE: собери несколько сигналов в одну связную запись с выводом, без новостной суеты.")
+    mode_rules.setdefault("vault", "Сделай THE VAULT: более глубокую заметку для памяти VOID. Это не новость, а мысль, которую стоит сохранить.")
+
     mode_style = {
         "news": "Стиль: прямой, чуть резче, с ясной точкой входа.",
         "manual": "Стиль: личный, уверенный, но без пафоса.",
@@ -1026,6 +1054,11 @@ def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
         "future": "Стиль: чуть шире, с ощущением сдвига, но без хайпа.",
         "digest": "Стиль: сборный, быстрый, как сводка из нескольких сигналов.",
     }
+
+    mode_style.setdefault("signal", mode_style["manual"])
+    mode_style.setdefault("frequency", "Стиль: атмосферно, музыкально, короткими кадрами; не рецензия, а состояние.")
+    mode_style.setdefault("archive", "Стиль: спокойная сводка памяти; несколько сигналов, один вывод.")
+    mode_style.setdefault("vault", "Стиль: глубже и тише; запись, которую хочется сохранить.")
 
     structure = {
         "news": "1. Заголовок рубрики: {rubric} / {frequency} если частота уместна, иначе просто {rubric}\n2. Факт / мысль / наблюдение.\n3. Что это говорит о человеке в цифровой среде.\n4. VOID COMMENT: коротко, иронично, не душно.\n5. Источник, если источник есть.",
@@ -1037,7 +1070,16 @@ def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
         "digest": "1. Заголовок рубрики: {rubric}\n2. 3–5 сигналов в одном посте.\n3. Общий вывод по теме.\n4. VOID COMMENT: ироничный, краткий, связующий.\n5. Источник, если источник есть.",
     }
 
+    structure.setdefault("signal", structure["manual"])
+    structure.setdefault("frequency", "1. ???????: {rubric}\n2. ?????????, ????, ????? ??? ?????????? ?????.\n3. ??? ??? ?????? ? ????????? ? ?????????.\n4. VOID COMMENT: ???????, ??? ????????? ??????.")
+    structure.setdefault("archive", "1. ???????: {rubric}\n2. 3-5 ????????? ????????.\n3. ????? ?????: ??? ????? ???? ????????? ??????.\n4. VOID COMMENT: ????? ???????? ??? ??????.")
+    structure.setdefault("vault", "1. ???????: {rubric}\n2. ??????? ?????.\n3. ?????? ??? ????? ??? ???????? ? ???????? ?????.\n4. ??? ????? ?????????.\n5. VOID COMMENT: ??? ??????, ?? ? ?????.")
+
     return f"""
+{VOID_CORE_PROMPT}
+
+{platform_context("telegram")}
+
 Ты — редактор Telegram-канала VOID.
 
 Пиши СТРОГО НА РУССКОМ.
@@ -1096,13 +1138,14 @@ def generate_post_sync(mode: str, content: str, frequency: str = "HUMAN", source
     )
 
     try:
-        raw = call_ai(prompt, input_text, model=OPENAI_POST_MODEL)
+        raw = call_ai(prompt, input_text, max_output_tokens=1200, model=OPENAI_POST_MODEL)
         title, post = parse_ai_output(raw)
 
         if too_much_english(post):
             raw = call_ai(
                 prompt + "\n\nПредыдущий вариант оставил слишком много английского. Перепиши полностью по-русски.",
                 input_text,
+                max_output_tokens=1200,
                 model=OPENAI_POST_MODEL,
             )
             title, post = parse_ai_output(raw)
@@ -1119,7 +1162,7 @@ def generate_post_sync(mode: str, content: str, frequency: str = "HUMAN", source
     return {
         "mode": mode,
         "title": title,
-        "post": post[:1800],
+        "post": trim_post(post),
         "source_name": source_name,
         "source_url": source_url,
         "frequency": frequency,
@@ -1204,7 +1247,7 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
         chat_id=CHANNEL_ID,
         text=draft["post"],
         reply_markup=catch_keyboard(draft_id),
-        disable_web_page_preview=False,
+        disable_web_page_preview=True,
     )
     image_count, image_error = await publish_draft_images(bot, draft)
     mark_published(draft_id, draft["source_url"] or "")
@@ -1458,6 +1501,15 @@ async def manual_command(message: Message):
     await manual_like(message, "manual", parts[1])
 
 
+@router.message(Command("signal"))
+async def signal_command(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй: /signal мысль или сигнал")
+        return
+    await manual_like(message, "signal", parts[1])
+
+
 @router.message(Command("midnight"))
 async def midnight_command(message: Message):
     parts = (message.text or "").split(maxsplit=1)
@@ -1465,6 +1517,15 @@ async def midnight_command(message: Message):
         await message.answer("Используй: /midnight ночная мысль")
         return
     await manual_like(message, "midnight", parts[1])
+
+
+@router.message(Command("frequency"))
+async def frequency_command(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй: /frequency музыка, настроение или культурная волна")
+        return
+    await manual_like(message, "frequency", parts[1])
 
 
 @router.message(Command("observation"))
@@ -1483,6 +1544,24 @@ async def future_command(message: Message):
         await message.answer("Используй: /future тема будущего")
         return
     await manual_like(message, "future", parts[1])
+
+
+@router.message(Command("archive"))
+async def archive_command(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй: /archive несколько сигналов или итог наблюдений")
+        return
+    await manual_like(message, "archive", parts[1])
+
+
+@router.message(Command("vault"))
+async def vault_command(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("Используй: /vault важная мысль для памяти VOID")
+        return
+    await manual_like(message, "vault", parts[1])
 
 
 @router.message(Command("digest"))
