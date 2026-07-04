@@ -25,6 +25,9 @@ OPENAI_DIALOG_MODEL=openai/gpt-5.4
 OPENAI_IMAGE_MODEL=gpt-image-1
 OPENAI_IMAGE_SIZE=1024x1024
 OPENAI_IMAGE_QUALITY=medium
+NAZ_CHANNEL_ID=@naz_ai_channel_username
+NAZ_BOT_TOKEN=
+CROSSPOST_DAILY_LIMIT=2
 ```
 
 4. Установи зависимости:
@@ -59,6 +62,9 @@ Replit также прочитает `.replit`, где указано `run = "py
 /drafts — показать черновики
 /preview ID — показать полный черновик
 /publish ID — опубликовать черновик в канал
+/cross_status — статус кросс-постинга за сегодня
+/cross_to_naz ID — адаптировать VOID-черновик и отправить в Naz AI Bot
+/cross_from_naz текст — адаптировать пост Naz AI Bot и опубликовать в VOID
 /stats — статистика
 ```
 
@@ -107,6 +113,17 @@ OpenAI ...
 Если `OPENAI_API_KEY` задан, бот будет использовать OpenAI Responses API для генерации постов и Images API для 1-2 релевантных картинок к опубликованному посту.
 
 `OPENAI_POST_MODEL` используется для ручного постинга и автопостинга. `OPENAI_DIALOG_MODEL` используется для диалогового режима.
+
+## Cross-posting
+
+VOID and Naz AI Bot can exchange adapted posts instead of mirroring the same text.
+
+- `/cross_to_naz ID` takes a VOID draft, rewrites it in the practical Naz AI Bot voice, and posts it to `NAZ_CHANNEL_ID`.
+- `/cross_from_naz text` takes a Naz AI Bot post, rewrites it as a VOID signal, saves a draft, and publishes it to VOID.
+- `/cross_status` shows today's counters.
+- `CROSSPOST_DAILY_LIMIT` defaults to `2` per direction per Moscow day.
+
+If `NAZ_BOT_TOKEN` is empty, the main bot token is used. In that case the main bot must be an admin in both channels.
 
 Если ключ не задан, бот всё равно работает: он использует fallback-редактор с шаблонной VOID-оптикой и сухим юмором.
 

@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import feedparser
 from aiogram import Bot, Dispatcher, F, Router
@@ -41,6 +42,10 @@ OPENAI_DIALOG_MODEL = os.getenv("OPENAI_DIALOG_MODEL", os.getenv("OPENAI_MODEL",
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
+
+NAZ_CHANNEL_ID = os.getenv("NAZ_CHANNEL_ID", "")
+NAZ_BOT_TOKEN = os.getenv("NAZ_BOT_TOKEN", "")
+CROSSPOST_DAILY_LIMIT = int(os.getenv("CROSSPOST_DAILY_LIMIT", "2") or "2")
 
 DB_PATH = "void.db"
 
@@ -217,6 +222,37 @@ def set_setting(key: str, value: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def moscow_day() -> str:
+    return datetime.now(ZoneInfo("Europe/Moscow")).date().isoformat()
+
+
+def crosspost_counter_key(direction: str) -> str:
+    return f"crosspost:{direction}:{moscow_day()}"
+
+
+def crosspost_count(direction: str) -> int:
+    return int(get_setting(crosspost_counter_key(direction), "0") or "0")
+
+
+def can_crosspost(direction: str) -> bool:
+    return crosspost_count(direction) < CROSSPOST_DAILY_LIMIT
+
+
+def mark_crosspost(direction: str) -> None:
+    key = crosspost_counter_key(direction)
+    set_setting(key, str(int(get_setting(key, "0") or "0") + 1))
+
+
+def crosspost_status_text() -> str:
+    return (
+        "Cross-post today:\n"
+        f"VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}\n"
+        f"Naz AI Bot -> VOID: {crosspost_count('naz_to_void')}/{CROSSPOST_DAILY_LIMIT}\n"
+        f"NAZ_CHANNEL_ID: {'set' if NAZ_CHANNEL_ID else 'not set'}"
+    )
+
 
 def get_dialog_session(user_id: int) -> dict:
     conn = db()
@@ -991,6 +1027,62 @@ def find_source_image_url(source_url: str) -> str | None:
     return None
 
 
+def build_crosspost_to_naz_sync(draft: dict | sqlite3.Row) -> str:
+    instructions = f"""
+You adapt a VOID post for the Naz AI Bot Telegram channel.
+
+VOID source voice:
+{VOID_CORE_PROMPT}
+
+Naz AI Bot voice:
+- practical AI ecosystem, tools, automation, content systems, useful experiments;
+- clear, friendly, not mystical;
+- show why this VOID signal matters for people building with AI;
+- do not mirror the post word-for-word;
+- mention VOID as a related signal/source;
+- Russian only.
+
+Return only the final Telegram post. No markdown fences.
+""".strip()
+
+    input_text = (
+        f"TITLE: {draft['title']}\n"
+        f"RUBRIC: {draft['mode']} / {draft['frequency']}\n"
+        f"VOID_POST:\n{draft['post']}"
+    )
+    return trim_post(call_ai(instructions, input_text, max_output_tokens=900, model=OPENAI_POST_MODEL), limit=3000)
+
+
+def build_crosspost_from_naz_sync(source_text: str) -> dict[str, str]:
+    instructions = f"""
+You adapt a Naz AI Bot post for the VOID Signals Telegram channel.
+
+VOID core:
+{VOID_CORE_PROMPT}
+
+Task:
+- Do not repost literally.
+- Translate practical AI/tool content into a VOID observation about the human in a digital world.
+- Keep it calm, precise, slightly ironic.
+- Russian only.
+- Add the rubric header yourself only if it naturally fits.
+
+Return strictly:
+TITLE: short Russian title
+MODE: one of signal, observation, future, vault
+POST: final VOID post
+""".strip()
+
+    raw = call_ai(instructions, f"NAZ_AI_BOT_POST:\n{source_text}", max_output_tokens=1100, model=OPENAI_POST_MODEL)
+    title, post = parse_ai_output(raw)
+    mode_match = re.search(r"MODE\s*:\s*(signal|observation|future|vault)", raw, flags=re.I)
+    mode = mode_match.group(1).lower() if mode_match else "observation"
+    post = clean_source_lines(post)
+    if "Источник:" not in post:
+        post = f"{post.rstrip()}\n\nИсточник: Naz AI Bot"
+    return {"title": title, "mode": mode, "post": trim_post(post, limit=3200)}
+
+
 def too_much_english(text: str) -> bool:
     words = re.findall(r"\b[A-Za-z][A-Za-z\-]{3,}\b", text or "")
     allowed = {
@@ -1280,6 +1372,29 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
     if image_error:
         return f"Опубликовано: #{draft_id}. Картинки не приложились: {image_error}"
     return f"Опубликовано: #{draft_id}. Картинок: 0"
+
+
+async def send_to_naz_channel(bot: Bot, text: str) -> None:
+    if not NAZ_CHANNEL_ID:
+        raise ValueError("NAZ_CHANNEL_ID is not set")
+
+    if NAZ_BOT_TOKEN and NAZ_BOT_TOKEN != BOT_TOKEN:
+        naz_bot = Bot(token=NAZ_BOT_TOKEN)
+        try:
+            await naz_bot.send_message(
+                chat_id=NAZ_CHANNEL_ID,
+                text=text,
+                disable_web_page_preview=True,
+            )
+        finally:
+            await naz_bot.session.close()
+        return
+
+    await bot.send_message(
+        chat_id=NAZ_CHANNEL_ID,
+        text=text,
+        disable_web_page_preview=True,
+    )
 
 
 async def make_news_drafts(limit: int = 5) -> tuple[int, int]:
@@ -1703,6 +1818,87 @@ async def publish_command(message: Message, bot: Bot):
         return
 
     result = await publish_draft(bot, int(parts[1]))
+    await message.answer(result)
+
+
+@router.message(Command("cross_status"))
+async def cross_status_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer(crosspost_status_text())
+
+
+@router.message(Command("cross_to_naz"))
+async def cross_to_naz_command(message: Message, bot: Bot):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    if not NAZ_CHANNEL_ID:
+        await message.answer("NAZ_CHANNEL_ID не задан. Добавь канал Naz AI Bot в .env/Secrets.")
+        return
+
+    if not can_crosspost("void_to_naz"):
+        await message.answer(f"Лимит VOID -> Naz AI Bot на сегодня уже выбран: {CROSSPOST_DAILY_LIMIT}.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Используй: /cross_to_naz ID")
+        return
+
+    draft = get_draft(int(parts[1]))
+    if not draft:
+        await message.answer("Черновик не найден.")
+        return
+
+    await message.answer("Адаптирую VOID-сигнал под Naz AI Bot и отправляю.")
+    adapted = await asyncio.to_thread(build_crosspost_to_naz_sync, draft)
+    await send_to_naz_channel(bot, adapted)
+    mark_crosspost("void_to_naz")
+    await message.answer(f"Готово. VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}")
+
+
+@router.message(Command("cross_from_naz"))
+async def cross_from_naz_command(message: Message, bot: Bot):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    if not can_crosspost("naz_to_void"):
+        await message.answer(f"Лимит Naz AI Bot -> VOID на сегодня уже выбран: {CROSSPOST_DAILY_LIMIT}.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+    source_text = parts[1].strip() if len(parts) >= 2 else ""
+    if not source_text and message.reply_to_message:
+        source_text = (
+            message.reply_to_message.text
+            or message.reply_to_message.caption
+            or ""
+        ).strip()
+
+    if len(source_text) < 20:
+        await message.answer("Используй: /cross_from_naz текст поста Naz AI Bot")
+        return
+
+    await message.answer("Перевожу пост Naz AI Bot в голос VOID и публикую.")
+    adapted = await asyncio.to_thread(build_crosspost_from_naz_sync, source_text)
+    draft_id = save_draft(
+        adapted["mode"],
+        adapted["title"],
+        adapted["post"],
+        "Naz AI Bot",
+        f"manual://cross/naz/{now_iso()}",
+        "crosspost",
+        publish_score=8,
+    )
+    result = await publish_draft(bot, draft_id)
+    if result.startswith("Опубликовано:"):
+        mark_crosspost("naz_to_void")
+        result = f"{result}\nNaz AI Bot -> VOID: {crosspost_count('naz_to_void')}/{CROSSPOST_DAILY_LIMIT}"
     await message.answer(result)
 
 
