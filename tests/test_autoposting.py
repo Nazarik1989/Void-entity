@@ -4,7 +4,15 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from main import build_rubric_header, clean_source_lines, display_source_name, inject_rubric_header, too_much_english, trim_post
+from main import (
+    build_rubric_header,
+    clean_source_lines,
+    display_source_name,
+    inject_rubric_header,
+    too_much_english,
+    trim_post,
+    validate_void_fragment_for_naz,
+)
 from void_core import CONTENT_PLAN
 
 
@@ -50,6 +58,19 @@ class AutopostingRubricTests(unittest.TestCase):
         post = "SIGNAL\n\nText\n\n???????: VOID internal signal"
         self.assertEqual(clean_source_lines(post), "SIGNAL\n\nText")
         self.assertEqual(display_source_name("VOID internal signal"), "VOID")
+
+    def test_void_fragment_for_naz_blocks_secrets(self) -> None:
+        ok, reason = validate_void_fragment_for_naz("Вот BOT_TOKEN=123 и ssh root@147.45.154.248")
+        self.assertFalse(ok)
+        self.assertTrue(reason)
+
+    def test_void_fragment_for_naz_allows_public_signal(self) -> None:
+        ok, reason = validate_void_fragment_for_naz(
+            "AI не ломается в момент ошибки. Он ломается раньше: когда человек решает, "
+            "что проверка результата уже не нужна."
+        )
+        self.assertTrue(ok)
+        self.assertEqual(reason, "")
 
 
 if __name__ == "__main__":

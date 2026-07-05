@@ -1028,8 +1028,47 @@ def find_source_image_url(source_url: str) -> str | None:
 
 
 def build_crosspost_to_naz_sync(draft: dict | sqlite3.Row) -> str:
+    return build_void_fragment_for_naz_sync(draft["post"])
+
+
+def validate_void_fragment_for_naz(text: str) -> tuple[bool, str]:
+    fragment = text or ""
+    checks = [
+        (r"(?i)\b(bot_token|openai_api_key|api[_-]?key|secret|password|passwd|token)\b", "похоже на токен, ключ или пароль"),
+        (r"(?i)\b(sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9_]{12,}|xox[baprs]-[A-Za-z0-9-]{12,})\b", "похоже на секретный токен"),
+        (r"(?i)\bssh\b|root@\d{1,3}(?:\.\d{1,3}){3}", "похоже на SSH/IP-доступ"),
+        (r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "содержит IP-адрес"),
+        (r"(?i)\b(localhost|127\.0\.0\.1|10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3})\b", "содержит внутренний адрес"),
+        (r"(?i)https?://(?:localhost|127\.0\.0\.1|10\.|192\.168\.|172\.(?:1[6-9]|2\d|3[01])\.)", "содержит внутренний URL"),
+        (r"(?i)\b/client[s]?/|\bcustomer\b|клиентск|приватн|личн(?:ая|ые|ую)? переписк", "похоже на приватные или клиентские детали"),
+    ]
+    for pattern, reason in checks:
+        if re.search(pattern, fragment):
+            return False, reason
+    return True, ""
+
+
+def extract_void_fragment_payload(message: Message) -> str:
+    parts = (message.text or "").split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) >= 2 else ""
+    if payload:
+        return payload
+    if message.reply_to_message:
+        return (
+            message.reply_to_message.text
+            or message.reply_to_message.caption
+            or ""
+        ).strip()
+    return ""
+
+
+def build_void_fragment_for_naz_sync(fragment: str) -> str:
+    ok, reason = validate_void_fragment_for_naz(fragment)
+    if not ok:
+        raise ValueError(reason)
+
     instructions = f"""
-You adapt a VOID post for the Naz AI Bot Telegram channel.
+You adapt a VOID fragment for the Naz AI Bot Telegram channel.
 
 VOID source voice:
 {VOID_CORE_PROMPT}
@@ -1037,19 +1076,19 @@ VOID source voice:
 Naz AI Bot voice:
 - practical AI ecosystem, tools, automation, content systems, useful experiments;
 - clear, friendly, not mystical;
-- show why this VOID signal matters for people building with AI;
+- show where this VOID signal has practical meaning;
+- explain the trap or use case for AI, bots, content, development, projects, or a person building systems;
 - do not mirror the post word-for-word;
-- mention VOID as a related signal/source;
+- choose one format naturally: "VOID сказал", "Перевод с VOID на человеческий", or "Спор двух ботов";
+- vary the opening phrase;
+- mention VOID as the source of the signal;
+- stop if the input contains secrets, tokens, passwords, private URLs, SSH/IP access, client details, or private chats;
 - Russian only.
 
 Return only the final Telegram post. No markdown fences.
 """.strip()
 
-    input_text = (
-        f"TITLE: {draft['title']}\n"
-        f"RUBRIC: {draft['mode']} / {draft['frequency']}\n"
-        f"VOID_POST:\n{draft['post']}"
-    )
+    input_text = f"VOID_FRAGMENT:\n{fragment.strip()}"
     return trim_post(call_ai(instructions, input_text, max_output_tokens=900, model=OPENAI_POST_MODEL), limit=3000)
 
 
@@ -1830,6 +1869,58 @@ async def cross_status_command(message: Message):
     await message.answer(crosspost_status_text())
 
 
+@router.message(Command("void"))
+async def void_crosspost_draft_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    fragment = extract_void_fragment_payload(message)
+    if len(fragment) < 20:
+        await message.answer("Используй: /void текст поста VOID или ответь /void на сообщение VOID.")
+        return
+
+    ok, reason = validate_void_fragment_for_naz(fragment)
+    if not ok:
+        await message.answer(f"Остановил черновик: {reason}. Сначала очисти входной текст.")
+        return
+
+    await message.answer("Собираю Naz-черновик из VOID-фрагмента.")
+    adapted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
+    await message.answer(adapted)
+
+
+@router.message(Command("publish_void"))
+async def publish_void_crosspost_command(message: Message, bot: Bot):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    if not NAZ_CHANNEL_ID:
+        await message.answer("NAZ_CHANNEL_ID не задан. Добавь канал Naz AI Bot в .env/Secrets.")
+        return
+
+    if not can_crosspost("void_to_naz"):
+        await message.answer(f"Лимит VOID -> Naz AI Bot на сегодня уже выбран: {CROSSPOST_DAILY_LIMIT}.")
+        return
+
+    fragment = extract_void_fragment_payload(message)
+    if len(fragment) < 20:
+        await message.answer("Используй: /publish_void текст поста VOID или ответь /publish_void на сообщение VOID.")
+        return
+
+    ok, reason = validate_void_fragment_for_naz(fragment)
+    if not ok:
+        await message.answer(f"Автопубликация остановлена: {reason}. Сначала очисти входной текст.")
+        return
+
+    await message.answer("Готовлю Naz-кросспост и публикую.")
+    adapted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
+    await send_to_naz_channel(bot, adapted)
+    mark_crosspost("void_to_naz")
+    await message.answer(f"Опубликовано в Naz AI Bot. VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}")
+
+
 @router.message(Command("cross_to_naz"))
 async def cross_to_naz_command(message: Message, bot: Bot):
     if not is_admin(message):
@@ -1855,7 +1946,11 @@ async def cross_to_naz_command(message: Message, bot: Bot):
         return
 
     await message.answer("Адаптирую VOID-сигнал под Naz AI Bot и отправляю.")
-    adapted = await asyncio.to_thread(build_crosspost_to_naz_sync, draft)
+    try:
+        adapted = await asyncio.to_thread(build_crosspost_to_naz_sync, draft)
+    except ValueError as e:
+        await message.answer(f"Автопубликация остановлена: {e}. Сначала очисти черновик.")
+        return
     await send_to_naz_channel(bot, adapted)
     mark_crosspost("void_to_naz")
     await message.answer(f"Готово. VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}")
