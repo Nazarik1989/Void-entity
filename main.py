@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
@@ -57,6 +57,11 @@ CROSSPOST_EXCHANGE_AUTO_PUBLISH = os.getenv("CROSSPOST_EXCHANGE_AUTO_PUBLISH", "
 CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exchange").strip())
 CROSSPOST_EXCHANGE_INTERVAL_SECONDS = max(60, int(os.getenv("CROSSPOST_EXCHANGE_INTERVAL_SECONDS", "300") or "300"))
 CROSSPOST_EXCHANGE_MAX_PER_RUN = max(1, min(int(os.getenv("CROSSPOST_EXCHANGE_MAX_PER_RUN", "1") or "1"), 5))
+
+VK_USER_ACCESS_TOKEN = os.getenv("VK_USER_ACCESS_TOKEN", "")
+VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
+VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199")
+VK_DRY_RUN = os.getenv("VK_DRY_RUN", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 DB_PATH = "void.db"
 
@@ -1554,6 +1559,48 @@ def catch_keyboard(draft_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def vk_owner_id_from_group_id(group_id: str) -> int:
+    if not group_id.strip():
+        raise RuntimeError("VK_GROUP_ID is empty")
+    return -abs(int(group_id))
+
+
+def post_to_vk_wall(text: str, *, force: bool = False) -> dict[str, Any]:
+    if not text.strip():
+        raise RuntimeError("VK post text is empty")
+
+    owner_id = vk_owner_id_from_group_id(VK_GROUP_ID)
+    params = {
+        "owner_id": str(owner_id),
+        "from_group": "1",
+        "message": text.strip(),
+        "access_token": VK_USER_ACCESS_TOKEN,
+        "v": VK_API_VERSION,
+    }
+
+    if VK_DRY_RUN and not force:
+        safe = {**params, "access_token": "***"}
+        return {"ok": True, "dry_run": True, "post_id": None, "response": {"dry_run": safe}}
+
+    if not VK_USER_ACCESS_TOKEN:
+        raise RuntimeError("VK_USER_ACCESS_TOKEN is empty")
+
+    data = urlencode(params).encode("utf-8")
+    request = Request("https://api.vk.com/method/wall.post", data=data, method="POST")
+    with urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if "error" in payload:
+        raise RuntimeError(f"VK API error: {payload['error']}")
+
+    return {
+        "ok": True,
+        "dry_run": False,
+        "post_id": payload.get("response", {}).get("post_id"),
+        "response": payload,
+    }
+
+
 async def publish_draft_images(bot: Bot, draft: dict | sqlite3.Row) -> tuple[int, str | None]:
     image_error: str | None = None
 
@@ -2060,6 +2107,51 @@ async def publish_command(message: Message, bot: Bot):
 
     result = await publish_draft(bot, int(parts[1]))
     await message.answer(result)
+
+
+@router.message(Command("vk_status"))
+async def vk_status_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer(
+        "VK publisher\n\n"
+        f"VK_GROUP_ID: {'задан' if VK_GROUP_ID else 'не задан'}\n"
+        f"VK_USER_ACCESS_TOKEN: {'задан' if VK_USER_ACCESS_TOKEN else 'не задан'}\n"
+        f"VK_API_VERSION: {VK_API_VERSION}\n"
+        f"VK_DRY_RUN: {VK_DRY_RUN}\n\n"
+        "Проверка: /vk_test текст\n"
+        "Реальная публикация: /vk_test --yes текст"
+    )
+
+
+@router.message(Command("vk_test"))
+async def vk_test_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    payload = (message.text or "").split(maxsplit=1)
+    text = payload[1].strip() if len(payload) > 1 else ""
+    force = False
+    if text.startswith("--yes "):
+        force = True
+        text = text.removeprefix("--yes ").strip()
+
+    if len(text) < 3:
+        await message.answer("Используй: /vk_test текст\nРеально опубликовать: /vk_test --yes текст")
+        return
+
+    try:
+        result = await asyncio.to_thread(post_to_vk_wall, text, force=force)
+    except Exception as e:
+        await message.answer(f"VK publish failed: {type(e).__name__}: {e}")
+        return
+
+    status = "dry-run" if result.get("dry_run") else "published"
+    post_id = result.get("post_id")
+    await message.answer(f"VK {status}. post_id={post_id}")
 
 
 @router.message(Command("cross_status"))
