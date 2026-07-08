@@ -22,7 +22,7 @@ import feedparser
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
 from void_core import CONTENT_PLAN, MODE_RUBRICS, VOID_CORE_PROMPT, platform_context
@@ -511,15 +511,56 @@ def build_dialog_prompt(user_text: str, personality: str, history: list[dict], m
     """.strip()
 
 
+BTN_GUIDE = "🧭 Как общаться"
+BTN_PERSONA = "🎭 Характер"
+BTN_TOPICS = "🛰 Темы"
+BTN_STATUS = "📊 Статус"
+BTN_RESET = "🧹 Очистить контекст"
+BTN_BACK = "⬅️ Назад"
+
+
+def reply_main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_GUIDE), KeyboardButton(text=BTN_PERSONA)],
+            [KeyboardButton(text=BTN_TOPICS), KeyboardButton(text=BTN_STATUS)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def reply_guide_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_RESET)],
+            [KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def reply_topics_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📰 Новости"), KeyboardButton(text="🎵 Музыка")],
+            [KeyboardButton(text="🔮 Будущее"), KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🧭 Как общаться", callback_data="void:guide"),
-            InlineKeyboardButton(text="🎭 Характер", callback_data="void:persona"),
+            InlineKeyboardButton(text=BTN_GUIDE, callback_data="void:guide"),
+            InlineKeyboardButton(text=BTN_PERSONA, callback_data="void:persona"),
         ],
         [
-            InlineKeyboardButton(text="🛰 Темы", callback_data="void:quick"),
-            InlineKeyboardButton(text="📊 Статус", callback_data="void:status"),
+            InlineKeyboardButton(text=BTN_TOPICS, callback_data="void:quick"),
+            InlineKeyboardButton(text=BTN_STATUS, callback_data="void:status"),
         ],
     ])
 
@@ -527,10 +568,10 @@ def main_keyboard():
 def guide_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🧹 Очистить контекст", callback_data="void:reset"),
+            InlineKeyboardButton(text=BTN_RESET, callback_data="void:reset"),
         ],
         [
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="void:menu"),
+            InlineKeyboardButton(text=BTN_BACK, callback_data="void:menu"),
         ],
     ])
 
@@ -553,7 +594,7 @@ def quick_actions_keyboard():
         [InlineKeyboardButton(text="🔮 Будущее", callback_data="void:quick:future")],
         [InlineKeyboardButton(text="🧭 Как общаться", callback_data="void:guide")],
         [InlineKeyboardButton(text="🎭 Характер", callback_data="void:persona")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="void:menu")],
+        [InlineKeyboardButton(text=BTN_BACK, callback_data="void:menu")],
     ])
 
 
@@ -1728,7 +1769,7 @@ async def start(message: Message):
     set_dialog_enabled(message.from_user.id, True)
     await message.answer(
         welcome_text(),
-        reply_markup=main_keyboard(),
+        reply_markup=reply_main_keyboard(),
     )
         
 @router.message(Command("help"))
@@ -1738,13 +1779,13 @@ async def help_command(message: Message):
 @router.message(Command("dialog"))
 async def dialog_command(message: Message):
     set_dialog_enabled(message.from_user.id, True)
-    await message.answer("Диалог всегда включён. Просто напиши мне текст.", reply_markup=main_keyboard())
+    await message.answer("Диалог всегда включён. Просто напиши мне текст.", reply_markup=reply_main_keyboard())
 
 
 @router.message(Command("reset"))
 async def reset_command(message: Message):
     clear_dialog_context(message.from_user.id)
-    await message.answer("🧹 Контекст диалога очищен. Можно начинать заново.", reply_markup=main_keyboard())
+    await message.answer("🧹 Контекст диалога очищен. Можно начинать заново.", reply_markup=reply_main_keyboard())
 
 
 @router.message(Command("status"))
@@ -1755,7 +1796,7 @@ async def status_command(message: Message):
         f"Диалог: всегда ON\n"
         f"Характер: {session['personality']}\n\n"
         f"{crosspost_status_text()}",
-        reply_markup=main_keyboard(),
+        reply_markup=reply_main_keyboard(),
     )
 
 
@@ -2271,12 +2312,73 @@ async def void_quick_future_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+async def handle_reply_button(message: Message, text: str) -> bool:
+    if text == BTN_BACK:
+        await message.answer(welcome_text(), reply_markup=reply_main_keyboard())
+        return True
+
+    if text == BTN_GUIDE:
+        await message.answer(guide_text(), reply_markup=reply_guide_keyboard())
+        return True
+
+    if text == BTN_RESET:
+        clear_dialog_context(message.from_user.id)
+        await message.answer("🧹 Контекст очищен. Можно начинать с новой мысли.", reply_markup=reply_main_keyboard())
+        return True
+
+    if text == BTN_PERSONA:
+        await message.answer("🎭 Выбери характер VOID:", reply_markup=persona_keyboard())
+        return True
+
+    if text == BTN_TOPICS:
+        await message.answer("🛰 Выбери направление или просто пришли свою тему.", reply_markup=reply_topics_keyboard())
+        return True
+
+    if text == BTN_STATUS:
+        session = get_dialog_session(message.from_user.id)
+        status = (
+            "📊 Статус VOID\n\n"
+            f"Диалог: всегда ON\n"
+            f"Характер: {session['personality']}"
+        )
+        if is_admin(message):
+            status += f"\n\nКросспостинг:\n{crosspost_status_text()}"
+        await message.answer(status, reply_markup=reply_main_keyboard())
+        return True
+
+    if text == "📰 Новости":
+        await message.answer(
+            "📰 Пришли ссылку, заголовок или короткий пересказ новости. Я вытащу из неё сигнал.",
+            reply_markup=reply_topics_keyboard(),
+        )
+        return True
+
+    if text == "🎵 Музыка":
+        await message.answer(
+            "🎵 Пришли новость про музыку, артистов или платформы. Я посмотрю на культурный сдвиг.",
+            reply_markup=reply_topics_keyboard(),
+        )
+        return True
+
+    if text == "🔮 Будущее":
+        await message.answer(
+            "🔮 Пришли тему про технологии, тренды или странное будущее. Я найду, куда движется сигнал.",
+            reply_markup=reply_topics_keyboard(),
+        )
+        return True
+
+    return False
+
+
 @router.message()
 async def free_text_handler(message: Message):
 
     chat_id = message.chat.id
     user_id = message.from_user.id
     text = (message.text or "").strip()
+
+    if await handle_reply_button(message, text):
+        return
 
     session = get_dialog_session(user_id)
 
@@ -2308,7 +2410,7 @@ async def free_text_handler(message: Message):
     if new_memory:
         save_dialog_message(user_id, "memory", new_memory)
 
-    await message.answer(reply)
+    await message.answer(reply, reply_markup=reply_main_keyboard())
 
 
 async def run_bot_once():
