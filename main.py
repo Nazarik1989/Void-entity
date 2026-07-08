@@ -4,11 +4,15 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
+import json
 import os
 import re
+import socket
 import sqlite3
+import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -16,6 +20,7 @@ from zoneinfo import ZoneInfo
 
 import feedparser
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
 from dotenv import load_dotenv
@@ -42,15 +47,22 @@ OPENAI_DIALOG_MODEL = os.getenv("OPENAI_DIALOG_MODEL", os.getenv("OPENAI_MODEL",
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
+TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 
 NAZ_CHANNEL_ID = os.getenv("NAZ_CHANNEL_ID", "")
 NAZ_BOT_TOKEN = os.getenv("NAZ_BOT_TOKEN", "")
 CROSSPOST_DAILY_LIMIT = int(os.getenv("CROSSPOST_DAILY_LIMIT", "2") or "2")
+CROSSPOST_EXCHANGE_ENABLED = os.getenv("CROSSPOST_EXCHANGE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+CROSSPOST_EXCHANGE_AUTO_PUBLISH = os.getenv("CROSSPOST_EXCHANGE_AUTO_PUBLISH", "true").strip().lower() not in {"0", "false", "no", "off"}
+CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exchange").strip())
+CROSSPOST_EXCHANGE_INTERVAL_SECONDS = max(60, int(os.getenv("CROSSPOST_EXCHANGE_INTERVAL_SECONDS", "300") or "300"))
+CROSSPOST_EXCHANGE_MAX_PER_RUN = max(1, min(int(os.getenv("CROSSPOST_EXCHANGE_MAX_PER_RUN", "1") or "1"), 5))
 
 DB_PATH = "void.db"
 
 router = Router()
 auto_task: asyncio.Task | None = None
+exchange_task: asyncio.Task | None = None
 
 
 RSS_SOURCES = [
@@ -502,20 +514,20 @@ def build_dialog_prompt(user_text: str, personality: str, history: list[dict], m
 def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="💬 Диалог", callback_data="void:dialog"),
+            InlineKeyboardButton(text="🧭 Как общаться", callback_data="void:guide"),
             InlineKeyboardButton(text="🎭 Характер", callback_data="void:persona"),
         ],
         [
+            InlineKeyboardButton(text="🛰 Темы", callback_data="void:quick"),
             InlineKeyboardButton(text="📊 Статус", callback_data="void:status"),
         ],
     ])
 
 
-def dialog_keyboard():
+def guide_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🟢 Включить", callback_data="void:dialog:on"),
-            InlineKeyboardButton(text="🔴 Выключить", callback_data="void:dialog:off"),
+            InlineKeyboardButton(text="🧹 Очистить контекст", callback_data="void:reset"),
         ],
         [
             InlineKeyboardButton(text="⬅️ Назад", callback_data="void:menu"),
@@ -539,25 +551,48 @@ def quick_actions_keyboard():
         [InlineKeyboardButton(text="📰 Новости", callback_data="void:quick:news")],
         [InlineKeyboardButton(text="🎵 Музыка", callback_data="void:quick:music")],
         [InlineKeyboardButton(text="🔮 Будущее", callback_data="void:quick:future")],
-        [InlineKeyboardButton(text="💬 Диалог", callback_data="void:dialog")],
+        [InlineKeyboardButton(text="🧭 Как общаться", callback_data="void:guide")],
         [InlineKeyboardButton(text="🎭 Характер", callback_data="void:persona")],
-        [InlineKeyboardButton(text="📊 Статус", callback_data="void:status")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="void:menu")],
     ])
+
+
+def welcome_text() -> str:
+    return (
+        "VOID online.\n\n"
+        "Я не командная строка. Просто напиши мысль, вопрос, ссылку, новость или странное наблюдение.\n\n"
+        "Я отвечу коротко, по делу и чуть сбоку: где тут сигнал, что в этом человеческого и почему это вообще цепляет.\n\n"
+        "Кнопки ниже — это навигация, если хочется настроить тон или понять, с чего начать."
+    )
+
+
+def guide_text() -> str:
+    return (
+        "🧭 Как со мной общаться\n\n"
+        "Можно писать обычным текстом, без команд.\n\n"
+        "Примеры:\n"
+        "• почему люди устают от AI-новостей\n"
+        "• вот ссылка, найди в ней сигнал\n"
+        "• сделай мысль жёстче и короче\n"
+        "• что в этой новости говорит о будущем\n\n"
+        "Я помню ближайший контекст диалога. Если разговор уехал, очисти контекст кнопкой ниже."
+    )
 
 @router.callback_query(F.data == "void:menu")
 async def void_menu_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "VOID online.\n\nВыбери режим:",
+        welcome_text(),
         reply_markup=main_keyboard(),
     )
     await callback.answer()
 
 
+@router.callback_query(F.data == "void:guide")
 @router.callback_query(F.data == "void:dialog")
-async def void_dialog_callback(callback: CallbackQuery):
+async def void_guide_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "💬 Диалоговый режим",
-        reply_markup=dialog_keyboard(),
+        guide_text(),
+        reply_markup=guide_keyboard(),
     )
     await callback.answer()
 
@@ -567,7 +602,7 @@ async def void_dialog_on_callback(callback: CallbackQuery):
     set_dialog_enabled(callback.from_user.id, True)
 
     await callback.message.edit_text(
-        "🟢 Диалоговый режим включён.",
+        "Диалог теперь всегда включён. Просто пиши текст.",
         reply_markup=main_keyboard(),
     )
     await callback.answer()
@@ -575,11 +610,18 @@ async def void_dialog_on_callback(callback: CallbackQuery):
 
 @router.callback_query(F.data == "void:dialog:off")
 async def void_dialog_off_callback(callback: CallbackQuery):
-    set_dialog_enabled(callback.from_user.id, False)
-    clear_dialog_context(callback.from_user.id)
-
     await callback.message.edit_text(
-        "🔴 Диалоговый режим выключен.",
+        "Я больше не выключаю диалог. Если нужно начать заново, очисти контекст.",
+        reply_markup=guide_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "void:reset")
+async def void_reset_callback(callback: CallbackQuery):
+    clear_dialog_context(callback.from_user.id)
+    await callback.message.edit_text(
+        "🧹 Контекст очищен. Можно начинать с новой мысли.",
         reply_markup=main_keyboard(),
     )
     await callback.answer()
@@ -609,13 +651,16 @@ async def void_persona_set_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "void:status")
 async def void_status_callback(callback: CallbackQuery):
     session = get_dialog_session(callback.from_user.id)
-    
-    
+    text = (
+        f"📊 Статус VOID\n\n"
+        f"Диалог: всегда ON\n"
+        f"Характер: {session['personality']}"
+    )
+    if callback.from_user and callback.from_user.id == ADMIN_ID:
+        text += f"\n\nКросспостинг:\n{crosspost_status_text()}"
 
     await callback.message.edit_text(
-        f"📊 Статус VOID\n\n"
-        f"Диалог: {'ON' if session['enabled'] else 'OFF'}\n"
-        f"Характер: {session['personality']}",
+        text,
         reply_markup=main_keyboard(),
     )
     await callback.answer()
@@ -1082,6 +1127,8 @@ Naz AI Bot voice:
 - choose one format naturally: "VOID сказал", "Перевод с VOID на человеческий", or "Спор двух ботов";
 - vary the opening phrase;
 - mention VOID as the source of the signal;
+- write the Naz comment in first person: "я вижу", "я бы добавил", "для меня тут важно";
+- never write "Naz thinks", "Naz считает", "комментарий Naz", or describe Naz in third person;
 - stop if the input contains secrets, tokens, passwords, private URLs, SSH/IP access, client details, or private chats;
 - Russian only.
 
@@ -1103,6 +1150,8 @@ Task:
 - Do not repost literally.
 - Translate practical AI/tool content into a VOID observation about the human in a digital world.
 - Keep it calm, precise, slightly ironic.
+- Comment in first person as VOID: "я вижу", "для меня это сигнал", "я бы оставил здесь одну мысль".
+- Do not write "VOID thinks", "VOID считает", "комментарий VOID", or describe VOID in third person.
 - Russian only.
 - Add the rubric header yourself only if it naturally fits.
 
@@ -1120,6 +1169,124 @@ POST: final VOID post
     if "Источник:" not in post:
         post = f"{post.rstrip()}\n\nИсточник: Naz AI Bot"
     return {"title": title, "mode": mode, "post": trim_post(post, limit=3200)}
+
+
+def exchange_dir(direction: str, box: str = "inbox") -> Path:
+    return CROSSPOST_EXCHANGE_DIR / direction / box
+
+
+def ensure_exchange_dirs() -> None:
+    for direction in ("void_to_naz", "naz_to_void"):
+        for box in ("inbox", "processed", "failed"):
+            exchange_dir(direction, box).mkdir(parents=True, exist_ok=True)
+
+
+def exchange_payload_id(source: str, text: str) -> str:
+    raw = f"{source}|{now_iso()}|{text[:500]}"
+    import hashlib
+
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def write_exchange_payload(direction: str, payload: dict[str, str]) -> Path | None:
+    if not CROSSPOST_EXCHANGE_ENABLED:
+        return None
+    ensure_exchange_dirs()
+    payload_id = payload.get("id") or exchange_payload_id(payload.get("source", "void"), payload.get("text", ""))
+    payload["id"] = payload_id
+    payload["created_at"] = payload.get("created_at") or now_iso()
+    target = exchange_dir(direction, "inbox") / f"{payload_id}.json"
+    temp = target.with_suffix(".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, target)
+    print(f"exchange queued: {direction} {target}", flush=True)
+    return target
+
+
+def move_exchange_file(path: Path, direction: str, box: str) -> None:
+    target_dir = exchange_dir(direction, box)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / path.name
+    if target.exists():
+        target = target_dir / f"{path.stem}-{int(datetime.now().timestamp())}{path.suffix}"
+    os.replace(path, target)
+
+
+def queue_void_post_for_naz(draft: dict | sqlite3.Row) -> None:
+    if not CROSSPOST_EXCHANGE_ENABLED:
+        return
+    source_name = str(draft["source_name"] or "")
+    source_url = str(draft["source_url"] or "")
+    frequency = str(draft["frequency"] or "")
+    if source_name == "Naz AI Bot" or frequency == "crosspost" or source_url.startswith("manual://cross/naz/"):
+        return
+    post = str(draft["post"] or "").strip()
+    if len(post) < 40:
+        return
+    write_exchange_payload(
+        "void_to_naz",
+        {
+            "source": "void_entity",
+            "source_event": "published_draft",
+            "topic": str(draft["title"] or ""),
+            "text": post[:6000],
+            "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
+        },
+    )
+
+
+async def process_naz_to_void_exchange(bot: Bot) -> None:
+    if not CROSSPOST_EXCHANGE_ENABLED:
+        return
+    ensure_exchange_dirs()
+    for path in sorted(exchange_dir("naz_to_void", "inbox").glob("*.json"))[:CROSSPOST_EXCHANGE_MAX_PER_RUN]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("source") == "void_entity":
+                move_exchange_file(path, "naz_to_void", "processed")
+                continue
+            if not can_crosspost("naz_to_void"):
+                print("exchange naz_to_void skipped: daily limit", flush=True)
+                return
+            source_text = str(payload.get("text") or payload.get("post") or "").strip()
+            if len(source_text) < 40:
+                raise ValueError("empty or too short Naz payload")
+
+            adapted = await asyncio.to_thread(build_crosspost_from_naz_sync, source_text)
+            draft_id = save_draft(
+                adapted["mode"],
+                adapted["title"],
+                adapted["post"],
+                "Naz AI Bot",
+                f"exchange://naz/{payload.get('id', path.stem)}",
+                "crosspost",
+                publish_score=8,
+            )
+            if payload.get("publish_mode", "auto") == "auto" and CROSSPOST_EXCHANGE_AUTO_PUBLISH:
+                result = await publish_draft(bot, draft_id)
+                if result.startswith("Опубликовано:"):
+                    mark_crosspost("naz_to_void")
+                    print(f"exchange published naz_to_void: {result}", flush=True)
+                else:
+                    raise ValueError(result)
+            else:
+                print(f"exchange draft naz_to_void: #{draft_id}", flush=True)
+            move_exchange_file(path, "naz_to_void", "processed")
+        except Exception as e:
+            print(f"exchange naz_to_void failed: {path.name}: {type(e).__name__}: {e}", flush=True)
+            try:
+                move_exchange_file(path, "naz_to_void", "failed")
+            except Exception as move_error:
+                print(f"exchange failed move failed: {type(move_error).__name__}: {move_error}", flush=True)
+
+
+async def exchange_loop(bot: Bot) -> None:
+    while True:
+        try:
+            await process_naz_to_void_exchange(bot)
+        except Exception as e:
+            print(f"exchange_loop error: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(CROSSPOST_EXCHANGE_INTERVAL_SECONDS)
 
 
 def too_much_english(text: str) -> bool:
@@ -1406,6 +1573,7 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
     )
     image_count, image_error = await publish_draft_images(bot, draft)
     mark_published(draft_id, draft["source_url"] or "")
+    queue_void_post_for_naz(draft)
     if image_count:
         return f"Опубликовано: #{draft_id}. Картинок: {image_count}"
     if image_error:
@@ -1543,8 +1711,12 @@ async def auto_loop(bot: Bot) -> None:
         try:
             enabled = get_setting("auto_publish", "0") == "1"
             if enabled:
-                result = await autopost_scheduled_once(bot)
-                print(result, flush=True)
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                last_ts = int(get_setting("auto_publish_last_ts", "0") or "0")
+                if now_ts - last_ts >= 60 * 60 * 3:
+                    set_setting("auto_publish_last_ts", str(now_ts))
+                    result = await autopost_scheduled_once(bot)
+                    print(result, flush=True)
         except Exception as e:
             print(f"auto_loop error: {type(e).__name__}: {e}", flush=True)
 
@@ -1553,15 +1725,9 @@ async def auto_loop(bot: Bot) -> None:
 
 @router.message(CommandStart())
 async def start(message: Message):
-    if not is_admin(message):
-        await message.answer(
-            "VOID online. Публичный режим будет позже.",
-            reply_markup=main_keyboard(),
-        )
-        return
-    
+    set_dialog_enabled(message.from_user.id, True)
     await message.answer(
-        "VOID online.\n\nВыбери режим:",
+        welcome_text(),
         reply_markup=main_keyboard(),
     )
         
@@ -1571,21 +1737,14 @@ async def help_command(message: Message):
 
 @router.message(Command("dialog"))
 async def dialog_command(message: Message):
-    session = get_dialog_session(message.from_user.id)
-
-    if session["enabled"]:
-        set_dialog_enabled(message.from_user.id, False)
-        clear_dialog_context(message.from_user.id)
-        await message.answer("🔴 Диалоговый режим выключен.")
-    else:
-        set_dialog_enabled(message.from_user.id, True)
-        await message.answer("🟢 Диалоговый режим включен.")
+    set_dialog_enabled(message.from_user.id, True)
+    await message.answer("Диалог всегда включён. Просто напиши мне текст.", reply_markup=main_keyboard())
 
 
 @router.message(Command("reset"))
 async def reset_command(message: Message):
     clear_dialog_context(message.from_user.id)
-    await message.answer("🧹 Контекст диалога очищен. Можно начинать заново.")
+    await message.answer("🧹 Контекст диалога очищен. Можно начинать заново.", reply_markup=main_keyboard())
 
 
 @router.message(Command("status"))
@@ -1593,8 +1752,10 @@ async def status_command(message: Message):
     session = get_dialog_session(message.from_user.id)
 
     await message.answer(
-        f"Диалог: {'ON' if session['enabled'] else 'OFF'}\n"
-        f"Характер: {session['personality']}"
+        f"Диалог: всегда ON\n"
+        f"Характер: {session['personality']}\n\n"
+        f"{crosspost_status_text()}",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -2081,8 +2242,8 @@ async def catch_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "void:quick:news")
 async def void_quick_news_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "📰 Ищу новости... Скоро будет чёрновик.\n\n"
-        "Используй /news чтобы проверить результат.",
+        "📰 Новости\n\n"
+        "Пришли ссылку, заголовок или короткий пересказ новости. Я вытащу из неё сигнал, а не просто перескажу пресс-релиз.",
         reply_markup=quick_actions_keyboard(),
     )
     await callback.answer()
@@ -2091,7 +2252,7 @@ async def void_quick_news_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "void:quick:music")
 async def void_quick_music_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "🎵 Культурный режим активирован.\n\n"
+        "🎵 Музыка и культура\n\n"
         "Отправляй мне новости о музыке, артистах или платформах — "
         "и я дам культурный взгляд на тему.",
         reply_markup=quick_actions_keyboard(),
@@ -2102,7 +2263,7 @@ async def void_quick_music_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "void:quick:future")
 async def void_quick_future_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "🔮 FUTURE FILE режим активирован.\n\n"
+        "🔮 Будущее\n\n"
         "Отправляй мне тему о будущем, технологиях или трендах — "
         "и я проанализирую грядущий сдвиг.",
         reply_markup=quick_actions_keyboard(),
@@ -2118,9 +2279,6 @@ async def free_text_handler(message: Message):
     text = (message.text or "").strip()
 
     session = get_dialog_session(user_id)
-
-    if not session or not session.get("enabled"):
-        return
 
     history = get_dialog_context(user_id, limit=8)
     personality = session.get("personality", "observer")
@@ -2153,25 +2311,39 @@ async def free_text_handler(message: Message):
     await message.answer(reply)
 
 
-async def main():
+async def run_bot_once():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан")
 
     init_db()
 
-    bot = Bot(token=BOT_TOKEN)
+    session = AiohttpSession(proxy=TELEGRAM_PROXY_URL or None)
+    session._connector_init["family"] = socket.AF_INET
+    bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher()
     dp.include_router(router)
 
-    global auto_task
+    global auto_task, exchange_task
     auto_task = asyncio.create_task(auto_loop(bot))
+    exchange_task = asyncio.create_task(exchange_loop(bot))
 
     print("POLLING START", flush=True)
 
-    await dp.start_polling(
-    bot,
-    allowed_updates=["message", "callback_query"]
-)
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message", "callback_query"],
+        )
+    finally:
+        if auto_task:
+            auto_task.cancel()
+        if exchange_task:
+            exchange_task.cancel()
+        await bot.session.close()
+
+
+async def main():
+    await run_bot_once()
 
 
 if __name__ == "__main__":
