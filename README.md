@@ -1,172 +1,113 @@
-# VOID Entity — Replit MVP
+# VOID Entity
 
-VOID — редакционный Telegram-агент:
+Experimental AI persona for narrative content generation, thematic exploration and autonomous publishing.
 
-```text
-RSS новости → фильтр сигналов → VOID-оптика → черновик → публикация → кнопка “поймал”
-```
+## Overview
 
-Это не генератор цитат. Он берёт реальные инфоповоды и пишет посты через призму человека в цифровом мире: AI, внимание, контроль, культура, будущее, поведение.
+VOID is an AI content agent designed to transform news, signals and observations into unique narrative posts.
 
-## Быстрый запуск в Replit
+Unlike a standard content generator, VOID rewrites information through its own editorial perspective and publishing style.
 
-1. Создай Python Repl.
-2. Загрузи все файлы из этого проекта.
-3. В `Secrets` добавь:
+The system can:
 
-```env
-BOT_TOKEN=токен от BotFather
-CHANNEL_ID=@username_твоего_канала
-ADMIN_ID=твой_telegram_user_id
-OPENAI_API_KEY=опционально
-OPENAI_MODEL=openai/gpt-5.4
-OPENAI_POST_MODEL=openai/gpt-5.4-mini
-OPENAI_DIALOG_MODEL=openai/gpt-5.4
-OPENAI_IMAGE_MODEL=gpt-image-1
-OPENAI_IMAGE_SIZE=1024x1024
-OPENAI_IMAGE_QUALITY=medium
-NAZ_CHANNEL_ID=@naz_ai_channel_username
-NAZ_BOT_TOKEN=
-CROSSPOST_DAILY_LIMIT=2
-```
+- collect information from multiple sources
+- generate thematic posts
+- create drafts
+- publish content automatically
+- exchange adapted content with other AI agents
 
-4. Установи зависимости:
+---
 
-```bash
-pip install -r requirements.txt
-```
+## Screenshots
 
-5. Запусти:
+### Main Interface
 
-```bash
-python main.py
-```
+![Main Interface](screenshot-main.png)
 
-Replit также прочитает `.replit`, где указано `run = "python main.py"`.
+### Content Workflow
 
-## Важно для Telegram
+![Workflow](screenshot-workflow.png)
 
-- Бот должен быть добавлен в Telegram-канал как администратор.
-- У бота должно быть право публиковать сообщения.
-- `CHANNEL_ID` можно задать как `@channel_username`.
-- `ADMIN_ID` — это твой числовой Telegram ID.
+### Publishing Process
 
-## Команды
+![Publishing](screenshot-publish.png)
 
-```text
-/start — запуск
-/help — помощь
-/scan — найти свежие инфоповоды
-/candidates — показать найденные новости
-/draft ID — сделать черновик из новости
-/drafts — показать черновики
-/preview ID — показать полный черновик
-/publish ID — опубликовать черновик в канал
-/void текст — сделать Naz-черновик из VOID-фрагмента
-/publish_void текст — опубликовать Naz-кросспост из VOID-фрагмента
-/cross_status — статус кросс-постинга за сегодня
-/cross_to_naz ID — адаптировать VOID-черновик и отправить в Naz AI Bot
-/cross_from_naz текст — адаптировать пост Naz AI Bot и опубликовать в VOID
-/stats — статистика
-```
+---
 
-## Первый сценарий
+## Features
 
-```text
-/scan
-```
+- AI content generation
+- Narrative post creation
+- News and signal processing
+- Draft management
+- Automated publishing
+- Telegram integration
+- Cross-posting between AI agents
+- VPS deployment
 
-Бот найдёт новости и покажет список кандидатов:
+---
 
-```text
-#12 · AI · score 8
-OpenAI ...
-Источник: The Verge
-```
+## Agent Architecture
 
-Создать черновик:
+Source Collection
+↓
+Signal Filtering
+↓
+Draft Creation
+↓
+Editorial Rewrite
+↓
+Publishing
+↓
+Cross-Agent Distribution
 
-```text
-/draft 12
-```
+---
 
-Посмотреть:
+## Tech Stack
 
-```text
-/preview 1
-```
+- Python
+- OpenRouter API
+- Telegram Bot API
+- SQLite
+- VPS Deployment
 
-Опубликовать:
+---
 
-```text
-/publish 1
-```
+## Use Cases
 
-Под постом будет кнопка:
+### AI Media Agent
 
-```text
-поймал
-```
+Creates posts from news and signals.
 
-Реакции сохраняются в SQLite-базу `void.db`.
+### Autonomous Content Persona
 
-## AI-режим
+Maintains a unique communication style.
 
-Если `OPENAI_API_KEY` задан, бот будет использовать OpenAI Responses API для генерации постов и Images API для 1-2 релевантных картинок к опубликованному посту.
+### Multi-Agent Network
 
-`OPENAI_POST_MODEL` используется для ручного постинга и автопостинга. `OPENAI_DIALOG_MODEL` используется для диалогового режима.
+Can exchange and adapt content with other AI agents.
 
-## Cross-posting
+---
 
-VOID and Naz AI Bot can exchange adapted posts instead of mirroring the same text.
+## Current Status
 
-- `/void text` or replying `/void` to a VOID message creates a Naz AI Bot draft.
-- `/publish_void text` or replying `/publish_void` to a VOID message publishes the adapted Naz AI Bot post.
-- `/cross_to_naz ID` takes a VOID draft, rewrites it in the practical Naz AI Bot voice, and posts it to `NAZ_CHANNEL_ID`.
-- `/cross_from_naz text` takes a Naz AI Bot post, rewrites it as a VOID signal, saves a draft, and publishes it to VOID.
-- `/cross_status` shows today's counters.
-- `CROSSPOST_DAILY_LIMIT` defaults to `2` per direction per Moscow day.
+Active development.
 
-If `NAZ_BOT_TOKEN` is empty, the main bot token is used. In that case the main bot must be an admin in both channels.
+Implemented:
 
-VOID fragments for Naz AI Bot should be short thoughts, observations, dark/philosophical posts, provocative theses, images, or metaphors. Before publishing, the bot blocks inputs that look like tokens, keys, passwords, SSH/IP access, private URLs, client details, or private chats.
+- Telegram publishing
+- Draft workflow
+- Signal filtering
+- Content adaptation
+- Cross-posting experiments
 
-Если ключ не задан, бот всё равно работает: он использует fallback-редактор с шаблонной VOID-оптикой и сухим юмором.
+---
 
-## Файлы
+## Author
 
-```text
-main.py                 основной Telegram-бот
-Main.py                 wrapper, если Replit создал файл с большой буквы
-config.py               настройки и env
-sources.py              RSS-источники
-news_collector.py       сбор новостей
-void_lens.py            фильтр и классификация сигналов
-database.py             SQLite
-void_editor.py          AI/fallback редактор постов
-prompts/void_editor_prompt.txt  редакционный промпт VOID
-requirements.txt        зависимости
-.env.example            пример переменных
-.replit                 команда запуска
-```
+Nazar Zykov
 
-## Как расширять дальше
+AI Agent Developer
 
-- Добавить `/skip ID` для отклонения новости.
-- Добавить `/rewrite ID` для переписывания черновика.
-- Добавить Telegram-источники и YouTube RSS.
-- Добавить Weekly Observation.
-- Добавить частоты аудитории: какие темы чаще “поймали”.
-- Добавить автопубликацию только для постов с `publish_score >= 8`.
-
-## Russian mode
-
-VOID теперь старается показывать найденные новости на русском в `/scan` и `/candidates`.
-Для перевода нужен `OPENAI_API_KEY` в Replit Secrets. Без ключа RSS-заголовки останутся в языке источника, но бот продолжит работать.
-
-После добавления ключа перезапусти бота:
-
-```bash
-python main.py
-```
-
+Telegram:
+https://t.me/Nazar_38rus
