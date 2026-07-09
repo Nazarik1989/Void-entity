@@ -22,15 +22,31 @@ The system can:
 
 ### Main Interface
 
-![Main Interface](screenshot-main.png)
+![Main Interface](Снимок%20экрана%20(957).png)
 
 ### Content Workflow
 
-![Workflow](screenshot-workflow.png)
+![Workflow](Снимок%20экрана%20(958).png)
 
 ### Publishing Process
 
-![Publishing](screenshot-publish.png)
+![Publishing](Снимок%20экрана%20(959).png)
+
+### AI Generation
+
+![AI Generation](Снимок%20экрана%20(960).png)
+
+### Cross Posting
+
+![Cross Posting](Снимок%20экрана%20(961).png)
+
+### Commands
+
+![Commands](Снимок%20экрана%20(962).png)
+
+### Results
+
+![Results](Снимок%20экрана%20(963).png)
 
 ---
 
