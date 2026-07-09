@@ -28,10 +28,6 @@ The system can:
 
 ![Workflow](Снимок%20экрана%20(961).png)
 
-### Publishing Process
-
-![Publishing](Снимок%20экрана%20(963).png)
-
 
 ### Cross Posting
 
@@ -43,7 +39,11 @@ The system can:
 
 ### Results
 
-![Results](Снимок%20экрана%20(957?958).png)
+![Results](Снимок%20экрана%20(957).png)
+
+### Results
+
+![Results](Снимок%20экрана%20(958).png)
 
 ---
 
