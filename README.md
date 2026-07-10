@@ -25,9 +25,9 @@ OPENAI_DIALOG_MODEL=openai/gpt-5.4
 OPENAI_IMAGE_MODEL=gpt-image-1
 OPENAI_IMAGE_SIZE=1024x1024
 OPENAI_IMAGE_QUALITY=medium
-NAZ_CHANNEL_ID=@naz_ai_channel_username
-NAZ_BOT_TOKEN=
 CROSSPOST_DAILY_LIMIT=2
+CROSSPOST_EXCHANGE_ENABLED=true
+CROSSPOST_EXCHANGE_DIR=/opt/bot_exchange
 ```
 
 4. Установи зависимости:
@@ -62,10 +62,10 @@ Replit также прочитает `.replit`, где указано `run = "py
 /drafts — показать черновики
 /preview ID — показать полный черновик
 /publish ID — опубликовать черновик в канал
-/void текст — сделать Naz-черновик из VOID-фрагмента
-/publish_void текст — опубликовать Naz-кросспост из VOID-фрагмента
+/void текст — выделить реплику Void из внутреннего диалога с Naz
+/publish_void текст — передать реплику в exchange для адаптации Naz
 /cross_status — статус кросс-постинга за сегодня
-/cross_to_naz ID — адаптировать VOID-черновик и отправить в Naz AI Bot
+/cross_to_naz ID — выделить реплику из VOID-черновика и передать в exchange
 /cross_from_naz текст — адаптировать пост Naz AI Bot и опубликовать в VOID
 /stats — статистика
 ```
@@ -118,18 +118,18 @@ OpenAI ...
 
 ## Cross-posting
 
-VOID and Naz AI Bot can exchange adapted posts instead of mirroring the same text.
+VOID и Naz обмениваются фрагментами внутреннего диалога, а не зеркалят готовые посты. Снаружи это должно звучать так: сначала реплика Void, затем самостоятельная интерпретация Naz.
 
-- `/void text` or replying `/void` to a VOID message creates a Naz AI Bot draft.
-- `/publish_void text` or replying `/publish_void` to a VOID message publishes the adapted Naz AI Bot post.
-- `/cross_to_naz ID` takes a VOID draft, rewrites it in the practical Naz AI Bot voice, and posts it to `NAZ_CHANNEL_ID`.
+- `/void text` или ответ `/void` выделяет короткую реплику Void для предпросмотра. Это не готовый Naz-пост.
+- `/publish_void text` выделяет реплику и кладёт payload в `void_to_naz/inbox`; Void ничего не публикует в канале Naz.
+- `/cross_to_naz ID` делает то же самое из существующего VOID-черновика.
 - `/cross_from_naz text` takes a Naz AI Bot post, rewrites it as a VOID signal, saves a draft, and publishes it to VOID.
 - `/cross_status` shows today's counters.
 - `CROSSPOST_DAILY_LIMIT` defaults to `2` per direction per Moscow day.
 
-If `NAZ_BOT_TOKEN` is empty, the main bot token is used. In that case the main bot must be an admin in both channels.
+Outbound payload имеет тип `private_dialogue_fragment`, флаги `ready_to_publish=false` и `requires_adaptation=true`. В нём есть варианты закулисных вводных и явный запрет на заезженное «Void опять говорит странно, но по делу». Naz должен сам выбрать вводную и добавить расшифровку от первого лица.
 
-VOID fragments for Naz AI Bot should be short thoughts, observations, dark/philosophical posts, provocative theses, images, or metaphors. Before publishing, the bot blocks inputs that look like tokens, keys, passwords, SSH/IP access, private URLs, client details, or private chats.
+Автоматическая публикация обычного VOID-черновика не создаёт cross-post. Маршрут Void → Naz запускается только явной командой и идёт только через exchange/adaptation. Фрагменты должны быть короткими мыслями, кусками внутреннего диалога, странными тезисами, философскими или мрачными импульсами. Перед передачей бот блокирует секреты, токены, пароли, SSH/IP-доступ, внутренние URL и клиентские детали.
 
 Если ключ не задан, бот всё равно работает: он использует fallback-редактор с шаблонной VOID-оптикой и сухим юмором.
 

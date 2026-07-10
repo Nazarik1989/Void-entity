@@ -5,6 +5,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from main import (
+    VOID_TO_NAZ_FORBIDDEN_OPENINGS,
+    VOID_TO_NAZ_OPENING_OPTIONS,
+    build_void_to_naz_exchange_payload,
     build_rubric_header,
     clean_source_lines,
     display_source_name,
@@ -71,6 +74,28 @@ class AutopostingRubricTests(unittest.TestCase):
         )
         self.assertTrue(ok)
         self.assertEqual(reason, "")
+
+    def test_void_to_naz_payload_requires_naz_adaptation(self) -> None:
+        fragment = "Инструмент становится клеткой, когда человек перестаёт замечать его форму."
+        payload = build_void_to_naz_exchange_payload(
+            fragment,
+            source_event="test",
+            topic="Инструменты",
+        )
+
+        self.assertEqual(payload["exchange_kind"], "private_dialogue_fragment")
+        self.assertEqual(payload["text"], fragment)
+        self.assertFalse(payload["ready_to_publish"])
+        self.assertTrue(payload["requires_adaptation"])
+        self.assertEqual(payload["adaptation_role"], "naz_interpretation_after_void_voice")
+
+    def test_void_to_naz_openings_have_backstage_variety(self) -> None:
+        self.assertIn("Из тёмного угла прилетело:", VOID_TO_NAZ_OPENING_OPTIONS)
+        self.assertGreaterEqual(len(VOID_TO_NAZ_OPENING_OPTIONS), 6)
+        self.assertIn(
+            "Void опять говорит странно, но по делу:",
+            VOID_TO_NAZ_FORBIDDEN_OPENINGS,
+        )
 
 
 if __name__ == "__main__":
