@@ -27,6 +27,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
+import character_state as void_character
 from void_core import (
     CONTENT_PLAN,
     MODE_RUBRICS,
@@ -244,6 +245,32 @@ def init_db() -> None:
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS character_states (
+        character_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        core_version TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS content_signatures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        character_id TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        facet TEXT NOT NULL,
+        intent TEXT NOT NULL,
+        format TEXT NOT NULL,
+        hook TEXT NOT NULL,
+        media TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_void_signatures_created ON content_signatures(character_id, id)")
+
     conn.commit()
     conn.close()
 
@@ -263,6 +290,132 @@ def set_setting(key: str, value: str) -> None:
     )
     conn.commit()
     conn.close()
+
+
+def load_character_state() -> void_character.CharacterState:
+    conn = db()
+    row = conn.execute(
+        "SELECT state_json FROM character_states WHERE character_id=?",
+        (void_character.CHARACTER_ID,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        state = void_character.CharacterState()
+        save_character_state(state)
+        return state
+    try:
+        raw = json.loads(row["state_json"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return void_character.normalize_state(raw if isinstance(raw, dict) else {})
+
+
+def save_character_state(state: void_character.CharacterState) -> None:
+    normalized = void_character.normalize_state(state.to_dict())
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO character_states(character_id, state_json, core_version, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(character_id) DO UPDATE SET
+            state_json=excluded.state_json,
+            core_version=excluded.core_version,
+            updated_at=excluded.updated_at
+        """,
+        (
+            void_character.CHARACTER_ID,
+            json.dumps(normalized.to_dict(), ensure_ascii=False),
+            normalized.core_version,
+            now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def apply_character_event(event: str) -> void_character.CharacterState:
+    state = void_character.apply_event(load_character_state(), event)
+    save_character_state(state)
+    return state
+
+
+def set_character_axis(axis: str, value: int) -> void_character.CharacterState:
+    state = void_character.set_axis(load_character_state(), axis, value)
+    save_character_state(state)
+    return state
+
+
+def get_recent_content_signatures(limit: int = 16) -> list[dict[str, str]]:
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT platform, facet, intent, format, hook, media, topic, created_at
+        FROM content_signatures
+        WHERE character_id=?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (void_character.CHARACTER_ID, max(1, limit)),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in reversed(rows)]
+
+
+def record_content_signature(plan: dict[str, str], topic: str) -> None:
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO content_signatures(
+            character_id, platform, facet, intent, format, hook, media, topic, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            void_character.CHARACTER_ID,
+            str(plan.get("platform", "telegram")),
+            str(plan.get("facet", "observer")),
+            str(plan.get("intent", "наблюдать")),
+            str(plan.get("format", "тихое наблюдение")),
+            str(plan.get("hook", "деталь")),
+            str(plan.get("media", "кинематографический кадр")),
+            topic[:1000],
+            now_iso(),
+        ),
+    )
+    conn.execute(
+        """
+        DELETE FROM content_signatures
+        WHERE character_id=? AND id NOT IN (
+            SELECT id FROM content_signatures
+            WHERE character_id=?
+            ORDER BY id DESC
+            LIMIT 80
+        )
+        """,
+        (void_character.CHARACTER_ID, void_character.CHARACTER_ID),
+    )
+    conn.commit()
+    conn.close()
+
+
+def character_event_for_mode(mode: str) -> str:
+    if mode in {"frequency", "culture", "midnight"}:
+        return "beauty"
+    if mode in {"news", "digest", "archive"}:
+        return "noise"
+    if mode == "future":
+        return "naz_challenge"
+    return "quiet"
+
+
+def build_character_directive(topic: str, platform: str, mode: str) -> tuple[void_character.CharacterState, dict[str, str], str]:
+    state = apply_character_event(character_event_for_mode(mode))
+    plan = void_character.plan_content(
+        state,
+        get_recent_content_signatures(),
+        topic=topic,
+        platform=platform,
+    )
+    return state, plan, void_character.prompt_context(state, plan)
 
 
 def moscow_day() -> str:
@@ -525,6 +678,7 @@ def build_dialog_prompt(user_text: str, personality: str, history: list[dict], m
         memory_block = f"\n\nКраткая память:\n{memory_note}\n"
 
     personality_style = get_personality_style(personality)
+    character_context = void_character.dialogue_context(load_character_state())
 
     return f"""
 {VOID_CORE_PROMPT}
@@ -535,6 +689,7 @@ def build_dialog_prompt(user_text: str, personality: str, history: list[dict], m
     Ты — наблюдательный, сухой, чуть ироничный собеседник.
     Отвечай кратко, по-русски, без markdown.
     {personality_style}
+    {character_context}
     {memory_block}{history_block}
     Текущее сообщение пользователя: {user_text}
     """.strip()
@@ -644,6 +799,10 @@ def commands_text() -> str:
         "/help - command rooms\n"
         "/commands - this list\n"
         "/vk_commands - VK publisher and music commands\n\n"
+        "Character:\n"
+        "/character - current VOID facet and mood\n"
+        "/character_event event - apply an event (admin)\n\n"
+        "/character_set axis 0-100 - adjust state (admin)\n\n"
         "Drafts:\n"
         "/scan - find fresh signals\n"
         "/candidates - show candidates\n"
@@ -2151,6 +2310,7 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
     )
     image_count, image_error = await publish_draft_images(bot, draft)
     mark_published(draft_id, draft["source_url"] or "")
+    await asyncio.to_thread(apply_character_event, "publish")
     if image_count:
         return f"Опубликовано: #{draft_id}. Картинок: {image_count}"
     if image_error:
@@ -2275,11 +2435,18 @@ async def autopost_void_signal_once(bot: Bot) -> str:
     index, slot = await asyncio.to_thread(next_content_plan_slot)
     mode = slot["mode"]
     frequency = slot["frequency"]
+    _, editorial_plan, character_directive = await asyncio.to_thread(
+        build_character_directive,
+        str(slot.get("brief", slot["name"])),
+        "telegram",
+        mode,
+    )
     content = (
         f"CONTENT_PLAN_INDEX: {index}\n"
         f"RUBRIC: {slot['name']}\n"
         f"PLATFORM: Telegram\n"
         f"BRIEF:\n{slot['brief']}\n\n"
+        f"{character_directive}\n\n"
         "Make an original VOID post. Do not mention that this came from a plan. "
         "Do not imitate news. No external source is required."
     )
@@ -2291,6 +2458,7 @@ async def autopost_void_signal_once(bot: Bot) -> str:
         "VOID",
         f"manual://auto/{mode}/{now_iso()}",
     )
+    await asyncio.to_thread(record_content_signature, editorial_plan, str(slot.get("brief", slot["name"])))
     draft = get_draft(draft_id)
     ok, reason = quality_check(draft["post"] if draft else "")
     if not ok:
@@ -2381,12 +2549,20 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
     voice = str(slot.get("voice", "void"))
     name = str(slot.get("name", "Scheduled Signal"))
     brief = str(slot.get("brief", "Make an original post for the shared public."))
+    mode = str(slot.get("mode", "signal"))
+    _, editorial_plan, character_directive = await asyncio.to_thread(
+        build_character_directive,
+        brief,
+        "vk",
+        mode,
+    )
 
     content = (
         f"RUBRIC: {name}\n"
         f"VOICE: {voice}\n"
         f"PLATFORM: VK shared public\n"
         f"BRIEF:\n{brief}\n\n"
+        f"{character_directive}\n\n"
         "Make an original post for the shared VK public. Do not mention that this came from a schedule."
     )
 
@@ -2398,6 +2574,7 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
                 f"Описание: {item.get('summary', '')}\n"
                 f"Источник: {item.get('source_name', '')}\n"
                 f"Ссылка: {item.get('url', '')}"
+                f"\n\n{character_directive}"
             )
             draft_id = await generate_and_save(
                 item.get("mode", "news"),
@@ -2409,22 +2586,32 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
             draft = get_draft(draft_id)
             ok, _ = quality_check(draft["post"] if draft else "")
             if ok:
+                await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", brief))
                 return draft_id
         raise RuntimeError("fresh news signals not found")
 
-    return await generate_and_save(
-        str(slot.get("mode", "signal")),
+    draft_id = await generate_and_save(
+        mode,
         content,
         str(slot.get("frequency", "HUMAN")),
         "VOID / VK scheduled rubric",
         f"manual://vk/schedule/{slot.get('mode', 'signal')}/{now_iso()}",
     )
+    await asyncio.to_thread(record_content_signature, editorial_plan, brief)
+    return draft_id
 
 
 async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
     voice = str(slot.get("voice", "void"))
     name = str(slot.get("name", "Telegram VOID"))
     brief = str(slot.get("brief", "Make an original Telegram post."))
+    mode = str(slot.get("mode", "signal"))
+    _, editorial_plan, character_directive = await asyncio.to_thread(
+        build_character_directive,
+        brief,
+        "telegram",
+        mode,
+    )
 
     if voice == "news":
         items = await asyncio.to_thread(fetch_news)
@@ -2434,6 +2621,7 @@ async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
                 f"Описание: {item.get('summary', '')}\n"
                 f"Источник: {item.get('source_name', '')}\n"
                 f"Ссылка: {item.get('url', '')}"
+                f"\n\n{character_directive}"
             )
             draft_id = await generate_and_save(
                 item.get("mode", "news"),
@@ -2445,6 +2633,7 @@ async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
             draft = get_draft(draft_id)
             ok, _ = quality_check(draft["post"] if draft else "")
             if ok:
+                await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", brief))
                 return draft_id
         raise RuntimeError("fresh news signals not found")
 
@@ -2452,15 +2641,18 @@ async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
         f"RUBRIC: {name}\n"
         f"PLATFORM: Telegram VOID channel\n"
         f"BRIEF:\n{brief}\n\n"
+        f"{character_directive}\n\n"
         "Make an original VOID post for Telegram. Do not mention that this came from a schedule."
     )
-    return await generate_and_save(
-        str(slot.get("mode", "signal")),
+    draft_id = await generate_and_save(
+        mode,
         content,
         str(slot.get("frequency", "HUMAN")),
         "VOID / Telegram scheduled rubric",
         f"manual://telegram/void/{slot.get('mode', 'signal')}/{now_iso()}",
     )
+    await asyncio.to_thread(record_content_signature, editorial_plan, brief)
+    return draft_id
 
 
 async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
@@ -2583,6 +2775,44 @@ async def status_command(message: Message):
         f"{crosspost_status_text()}",
         reply_markup=reply_main_keyboard(),
     )
+
+
+@router.message(Command("character"))
+async def character_command(message: Message):
+    state = await asyncio.to_thread(load_character_state)
+    await message.answer(void_character.format_status(state), reply_markup=reply_main_keyboard())
+
+
+@router.message(Command("character_event"))
+async def character_event_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    allowed = sorted(void_character.EVENT_DELTAS)
+    if len(parts) < 2 or parts[1].strip() not in void_character.EVENT_DELTAS:
+        await message.answer("Используй: /character_event <event>\n" + ", ".join(allowed))
+        return
+    state = await asyncio.to_thread(apply_character_event, parts[1].strip())
+    await message.answer(void_character.format_status(state))
+
+
+@router.message(Command("character_set"))
+async def character_set_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3 or parts[1] not in void_character.AXES:
+        await message.answer("Используй: /character_set <axis> <0-100>\n" + ", ".join(void_character.AXES))
+        return
+    try:
+        value = int(parts[2])
+    except ValueError:
+        await message.answer("Значение должно быть числом от 0 до 100.")
+        return
+    state = await asyncio.to_thread(set_character_axis, parts[1], value)
+    await message.answer(void_character.format_status(state))
 
 
 @router.message(Command("persona"))
