@@ -131,6 +131,142 @@ CONTENT_PLAN = [
 ]
 
 
+RUBRIC_SCHEDULE = [
+    {
+        "name": "Midnight",
+        "voice": "void",
+        "mode": "midnight",
+        "frequency": "HUMAN",
+        "hours": [0, 1, 2],
+        "weight": 10,
+        "brief": "Night-only VOID signal: silence, late work, memory, city lights, loneliness, focus, or being awake while systems keep running.",
+    },
+    {
+        "name": "Frequency",
+        "voice": "void",
+        "mode": "frequency",
+        "frequency": "HUMAN",
+        "hours": [19, 20, 21, 22],
+        "weight": 7,
+        "brief": "Evening music/culture mood: sound, headphones, memory, motion, night city, track as atmosphere.",
+    },
+    {
+        "name": "The Vault",
+        "voice": "void",
+        "mode": "vault",
+        "frequency": "HUMAN",
+        "hours": [22, 23],
+        "weight": 4,
+        "brief": "A deeper saved thought for the shared public. Quiet, precise, worth returning to.",
+    },
+    {
+        "name": "Future File",
+        "voice": "void",
+        "mode": "future",
+        "frequency": "FUTURE",
+        "hours": [12, 13, 14, 15, 16, 17, 18],
+        "weight": 5,
+        "brief": "A non-hype future shift: interfaces, work, tools, cities, creators, behavior.",
+    },
+    {
+        "name": "Observation",
+        "voice": "void",
+        "mode": "observation",
+        "frequency": "ATTENTION",
+        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        "weight": 6,
+        "brief": "A cultural observation about feeds, habits, screens, attention, platforms, or daily rituals.",
+    },
+    {
+        "name": "Signal",
+        "voice": "void",
+        "mode": "signal",
+        "frequency": "HUMAN",
+        "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        "weight": 5,
+        "brief": "A short original VOID signal about staying human and attentive inside digital noise.",
+    },
+    {
+        "name": "News Signal",
+        "voice": "news",
+        "mode": "news",
+        "frequency": "AI",
+        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        "weight": 4,
+        "brief": "Fresh real-world signal from sources, only when the feed has something worth catching.",
+    },
+]
+
+
+TELEGRAM_VOID_SCHEDULE = [
+    {
+        "name": "Midnight",
+        "voice": "void",
+        "mode": "midnight",
+        "frequency": "HUMAN",
+        "hours": [0, 1, 2],
+        "weight": 10,
+        "brief": "Night-only VOID signal for Telegram: late work, silence, memory, focus, and the human awake near running systems.",
+    },
+    {
+        "name": "Frequency",
+        "voice": "void",
+        "mode": "frequency",
+        "frequency": "HUMAN",
+        "hours": [19, 20, 21, 22],
+        "weight": 7,
+        "brief": "Evening music/culture signal: headphones, mood, memory, sound, city rhythm.",
+    },
+    {
+        "name": "The Vault",
+        "voice": "void",
+        "mode": "vault",
+        "frequency": "HUMAN",
+        "hours": [22, 23],
+        "weight": 4,
+        "brief": "A deeper thought for VOID memory. Quiet, saved, worth returning to.",
+    },
+    {
+        "name": "Observation",
+        "voice": "void",
+        "mode": "observation",
+        "frequency": "ATTENTION",
+        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        "weight": 6,
+        "brief": "Observation about feeds, habits, screens, attention, platforms, work, or small digital rituals.",
+    },
+    {
+        "name": "Future File",
+        "voice": "void",
+        "mode": "future",
+        "frequency": "FUTURE",
+        "hours": [12, 13, 14, 15, 16, 17, 18],
+        "weight": 5,
+        "brief": "Future shift without hype: tools, interfaces, work, cities, creators, behavior.",
+    },
+    {
+        "name": "Signal",
+        "voice": "void",
+        "mode": "signal",
+        "frequency": "HUMAN",
+        "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
+        "weight": 5,
+        "brief": "Short original VOID signal about staying human and attentive inside digital noise.",
+    },
+    {
+        "name": "News Signal",
+        "voice": "news",
+        "mode": "news",
+        "frequency": "AI",
+        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        "weight": 4,
+        "brief": "Fresh real-world signal from sources, only when there is something worth catching.",
+    },
+]
+
+
+
+
 def platform_context(platform: str = "telegram") -> str:
     channel = PLATFORM_CHANNELS.get(platform, PLATFORM_CHANNELS["telegram"])
     return (

@@ -25,9 +25,9 @@ OPENAI_DIALOG_MODEL=openai/gpt-5.4
 OPENAI_IMAGE_MODEL=gpt-image-1
 OPENAI_IMAGE_SIZE=1024x1024
 OPENAI_IMAGE_QUALITY=medium
-NAZ_CHANNEL_ID=@naz_ai_channel_username
-NAZ_BOT_TOKEN=
 CROSSPOST_DAILY_LIMIT=2
+CROSSPOST_EXCHANGE_ENABLED=true
+CROSSPOST_EXCHANGE_DIR=/opt/bot_exchange
 ```
 
 4. Установи зависимости:
@@ -56,17 +56,21 @@ Replit также прочитает `.replit`, где указано `run = "py
 ```text
 /start — запуск
 /help — помощь
+/commands — общие команды
+/vk_commands — команды VK-публикации и музыки
 /scan — найти свежие инфоповоды
 /candidates — показать найденные новости
 /draft ID — сделать черновик из новости
 /drafts — показать черновики
 /preview ID — показать полный черновик
 /publish ID — опубликовать черновик в канал
-/void текст — сделать Naz-черновик из VOID-фрагмента
-/publish_void текст — опубликовать Naz-кросспост из VOID-фрагмента
+/void текст — выделить реплику Void из внутреннего диалога с Naz
+/publish_void текст — передать реплику в exchange для адаптации Naz
 /cross_status — статус кросс-постинга за сегодня
-/cross_to_naz ID — адаптировать VOID-черновик и отправить в Naz AI Bot
+/cross_to_naz ID — выделить реплику из VOID-черновика и передать в exchange
 /cross_from_naz текст — адаптировать пост Naz AI Bot и опубликовать в VOID
+/telegram_schedule — расписание Telegram-рубрик VOID
+/void_schedule_now — опубликовать одну scheduled-рубрику VOID
 /stats — статистика
 ```
 
@@ -118,18 +122,140 @@ OpenAI ...
 
 ## Cross-posting
 
-VOID and Naz AI Bot can exchange adapted posts instead of mirroring the same text.
+VOID и Naz обмениваются фрагментами внутреннего диалога, а не зеркалят готовые посты. Снаружи это должно звучать так: сначала реплика Void, затем самостоятельная интерпретация Naz.
 
-- `/void text` or replying `/void` to a VOID message creates a Naz AI Bot draft.
-- `/publish_void text` or replying `/publish_void` to a VOID message publishes the adapted Naz AI Bot post.
-- `/cross_to_naz ID` takes a VOID draft, rewrites it in the practical Naz AI Bot voice, and posts it to `NAZ_CHANNEL_ID`.
+- `/void text` или ответ `/void` выделяет короткую реплику Void для предпросмотра. Это не готовый Naz-пост.
+- `/publish_void text` выделяет реплику и кладёт payload в `void_to_naz/inbox`; Void ничего не публикует в канале Naz.
+- `/cross_to_naz ID` делает то же самое из существующего VOID-черновика.
 - `/cross_from_naz text` takes a Naz AI Bot post, rewrites it as a VOID signal, saves a draft, and publishes it to VOID.
 - `/cross_status` shows today's counters.
 - `CROSSPOST_DAILY_LIMIT` defaults to `2` per direction per Moscow day.
 
-If `NAZ_BOT_TOKEN` is empty, the main bot token is used. In that case the main bot must be an admin in both channels.
+Outbound payload имеет тип `private_dialogue_fragment`, флаги `ready_to_publish=false` и `requires_adaptation=true`. В нём есть варианты закулисных вводных и явный запрет на заезженное «Void опять говорит странно, но по делу». Naz должен сам выбрать вводную и добавить расшифровку от первого лица.
 
-VOID fragments for Naz AI Bot should be short thoughts, observations, dark/philosophical posts, provocative theses, images, or metaphors. Before publishing, the bot blocks inputs that look like tokens, keys, passwords, SSH/IP access, private URLs, client details, or private chats.
+Автоматическая публикация обычного VOID-черновика, включая scheduled-публикацию, не создаёт cross-post. Маршрут Void → Naz запускается только явной командой и идёт только через exchange/adaptation. Фрагменты должны быть короткими мыслями, кусками внутреннего диалога, странными тезисами, философскими или мрачными импульсами. Перед передачей бот блокирует секреты, токены, пароли, SSH/IP-доступ, внутренние URL и клиентские детали.
+
+## Telegram rubric schedules
+
+`/auto_on` enables the VOID Telegram schedule in this project:
+
+- VOID posts about every 3 hours, with `MIDNIGHT` restricted to 00-02 Moscow time, `FREQUENCY` in the evening, and daytime pools for `SIGNAL`, `OBSERVATION`, `FUTURE FILE`, and news.
+
+Naz AI Bot has its own project, channel, and schedule. Общего scheduler для двух сущностей нет: они встречаются только через exchange/adaptation.
+
+Manual controls:
+
+```text
+/telegram_schedule
+/void_schedule_now
+```
+
+## VK publisher
+
+The bot can publish test posts to a VK community wall.
+
+Environment:
+
+```text
+VK_USER_ACCESS_TOKEN=...
+VK_PHOTO_ACCESS_TOKEN=...
+VK_GROUP_ID=123456789
+VK_API_VERSION=5.199
+VK_DRY_RUN=true
+VK_MUSIC_TRACKS_FILE=data/vk_music_tracks.json
+```
+
+Commands:
+
+```text
+/vk_status
+/vk_test text
+/vk_test --yes text
+/publish_vk ID
+/publish_vk --yes ID
+/vk_music_status
+/vk_music_import Artist - Track | https://vk.com/audio... | future, night
+/vk_music_sync URL
+/vk_music_sync URL night,electronic,melancholy
+```
+
+Keep `VK_DRY_RUN=true` while checking setup. `/vk_test text` and `/publish_vk ID` return the prepared request without posting. Use `/vk_test --yes text` or `/publish_vk --yes ID` to publish for real; `--yes` bypasses dry-run for that call.
+
+`/publish_vk --yes ID` stores the VK post id in `vk_posts` and blocks duplicate VK publishing of the same draft. It also tries to generate one topic-matched image and upload it as a VK wall photo attachment. If `VK_MUSIC_TRACKS_FILE` points to a JSON playlist file, the bot picks a matching track by tags and appends it as a soundtrack link.
+
+For image attachments, `VK_PHOTO_ACCESS_TOKEN` should be a user access token with `photos` and `wall` permissions. A community/group token can publish text posts but may fail on `photos.getWallUploadServer`.
+
+## VK browser publisher
+
+Browser publishing uses your logged-in VK session as admin permission, but the post should be created on the community wall and published as the community.
+
+Setup:
+
+```bash
+pip install -r requirements.txt
+python -m playwright install chromium
+python vk_browser_publisher.py login
+```
+
+Prepare a draft payload:
+
+```bash
+python vk_browser_publisher.py prepare-draft 259
+```
+
+Compose the prepared payload in VK:
+
+```bash
+python vk_browser_publisher.py open-payload data/vk_browser_payloads/draft-259.json
+```
+
+Or publish automatically from a draft id:
+
+```bash
+python vk_browser_publisher.py publish-draft 259
+```
+
+Or create the current scheduled rubric draft on the VPS and publish it automatically:
+
+```bash
+python vk_browser_publisher.py publish-scheduled
+```
+
+Install background VK autoposting in Windows Task Scheduler (every 3 hours):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/install_vk_autopost_task.ps1
+```
+
+The task runs `scripts/vk_autopost.ps1`, uses the separate headless browser profile
+`data/vk_autopost_profile`, ignores overlapping runs, and writes logs to `logs/vk-autopost.log`.
+The computer must be running, the Windows user must be signed in, and network access must be available.
+
+The browser helper opens the community composer, uploads the generated image, inserts the draft text, searches VK audio,
+selects the closest matching track, and either stops on the final VK screen or clicks publish when `publish-draft` /
+`open-payload --publish` / `publish-scheduled` is used.
+
+Playlist format:
+
+```json
+{
+  "tracks": [
+    {
+      "artist": "Artist",
+      "title": "Track",
+      "url": "https://vk.com/audio...",
+      "tags": ["future", "city", "night"]
+    }
+  ]
+}
+```
+
+You can also import tracks through Telegram:
+
+```text
+/vk_music_import Burial - Archangel | https://vk.com/audio... | night, city
+Aphex Twin - Xtal | https://vk.com/audio... | attention, ambient
+```
 
 Если ключ не задан, бот всё равно работает: он использует fallback-редактор с шаблонной VOID-оптикой и сухим юмором.
 

@@ -5,18 +5,20 @@ import asyncio
 import base64
 import html
 import json
+import mimetypes
 import os
+import random
 import re
 import socket
 import sqlite3
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlencode, urljoin
+from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import feedparser
 from aiogram import Bot, Dispatcher, F, Router
@@ -25,7 +27,14 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
-from void_core import CONTENT_PLAN, MODE_RUBRICS, VOID_CORE_PROMPT, platform_context
+from void_core import (
+    CONTENT_PLAN,
+    MODE_RUBRICS,
+    RUBRIC_SCHEDULE,
+    TELEGRAM_VOID_SCHEDULE,
+    VOID_CORE_PROMPT,
+    platform_context,
+)
 
 try:
     from openai import OpenAI
@@ -49,8 +58,6 @@ OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 
-NAZ_CHANNEL_ID = os.getenv("NAZ_CHANNEL_ID", "")
-NAZ_BOT_TOKEN = os.getenv("NAZ_BOT_TOKEN", "")
 CROSSPOST_DAILY_LIMIT = int(os.getenv("CROSSPOST_DAILY_LIMIT", "2") or "2")
 CROSSPOST_EXCHANGE_ENABLED = os.getenv("CROSSPOST_EXCHANGE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 CROSSPOST_EXCHANGE_AUTO_PUBLISH = os.getenv("CROSSPOST_EXCHANGE_AUTO_PUBLISH", "true").strip().lower() not in {"0", "false", "no", "off"}
@@ -62,8 +69,14 @@ VK_USER_ACCESS_TOKEN = os.getenv("VK_USER_ACCESS_TOKEN", "")
 VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
 VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199")
 VK_DRY_RUN = os.getenv("VK_DRY_RUN", "true").strip().lower() not in {"0", "false", "no", "off"}
+VK_MUSIC_TRACKS_FILE = os.getenv("VK_MUSIC_TRACKS_FILE", "data/vk_music_tracks.json")
+VK_PHOTO_ACCESS_TOKEN = os.getenv("VK_PHOTO_ACCESS_TOKEN", "")
 
 DB_PATH = "void.db"
+try:
+    MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+except ZoneInfoNotFoundError:
+    MOSCOW_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
 
 router = Router()
 auto_task: asyncio.Task | None = None
@@ -202,6 +215,17 @@ def init_db() -> None:
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS vk_posts (
+        draft_id INTEGER PRIMARY KEY,
+        post_id INTEGER NOT NULL,
+        owner_id INTEGER NOT NULL,
+        attachments TEXT,
+        music_track TEXT,
+        published_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS dialog_sessions (
     user_id INTEGER PRIMARY KEY,
     enabled INTEGER DEFAULT 0,
@@ -267,7 +291,7 @@ def crosspost_status_text() -> str:
         "Cross-post today:\n"
         f"VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}\n"
         f"Naz AI Bot -> VOID: {crosspost_count('naz_to_void')}/{CROSSPOST_DAILY_LIMIT}\n"
-        f"NAZ_CHANNEL_ID: {'set' if NAZ_CHANNEL_ID else 'not set'}"
+        f"Exchange: {'enabled' if CROSSPOST_EXCHANGE_ENABLED else 'disabled'}"
     )
 
 
@@ -612,6 +636,62 @@ def welcome_text() -> str:
     )
 
 
+def commands_text() -> str:
+    return (
+        "VOID commands\n\n"
+        "Core:\n"
+        "/start - open VOID\n"
+        "/help - command rooms\n"
+        "/commands - this list\n"
+        "/vk_commands - VK publisher and music commands\n\n"
+        "Drafts:\n"
+        "/scan - find fresh signals\n"
+        "/candidates - show candidates\n"
+        "/draft ID - create draft from candidate\n"
+        "/drafts - show drafts\n"
+        "/preview ID - show full draft\n"
+        "/publish ID - publish draft to Telegram\n\n"
+        "Cross-posting:\n"
+        "/void text - prepare a private-dialogue fragment for Naz\n"
+        "/publish_void text - queue a VOID fragment for Naz adaptation\n"
+        "/cross_status - today's cross-post counters\n"
+        "/cross_to_naz ID - extract a fragment and queue it for Naz\n"
+        "/cross_from_naz text - adapt Naz AI Bot post to VOID\n\n"
+        "Rubric schedule:\n"
+        "/rubric_schedule - show rubric windows\n"
+        "/vk_schedule_draft - create one scheduled VK draft now\n\n"
+        "Telegram schedules:\n"
+        "/telegram_schedule - show VOID Telegram windows\n"
+        "/void_schedule_now - publish one scheduled VOID Telegram post\n"
+        "Stats:\n"
+        "/stats - database stats"
+    )
+
+
+def vk_commands_text() -> str:
+    return (
+        "VK commands\n\n"
+        "Publisher:\n"
+        "/vk_status - VK env and mode status\n"
+        "/vk_test text - dry-run raw VK text post\n"
+        "/vk_test --yes text - publish raw VK test post\n"
+        "/publish_vk ID - dry-run draft VK post\n"
+        "/publish_vk --yes ID - publish draft to VK\n\n"
+        "Rubric schedule:\n"
+        "/rubric_schedule - show current rubric windows\n"
+        "/vk_schedule_draft - make one scheduled VK draft now\n\n"
+        "Music cache:\n"
+        "/vk_music_status - show loaded track count\n"
+        "/vk_music_import Artist - Track | link | tags - import tracks from text\n"
+        "/vk_music_sync URL - planned browser sync from a VK playlist\n"
+        "/vk_music_sync URL night,electronic,melancholy - planned sync with base tags\n\n"
+        "Notes:\n"
+        "- /publish_vk blocks duplicate VK posts by draft id.\n"
+        "- VOID project owns VOID VK drafts only; Naz VK automation belongs in the Naz project.\n"
+        "- API publishing can still fall back to soundtrack text if browser publishing is not used."
+    )
+
+
 def guide_text() -> str:
     return (
         "🧭 Как со мной общаться\n\n"
@@ -884,6 +964,39 @@ def already_published(url: str) -> bool:
     return row is not None
 
 
+def get_vk_post_for_draft(draft_id: int) -> sqlite3.Row | None:
+    conn = db()
+    row = conn.execute("SELECT * FROM vk_posts WHERE draft_id=?", (draft_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def mark_vk_published(
+    draft_id: int,
+    post_id: int,
+    owner_id: int,
+    attachments: list[str] | None = None,
+    music_track: dict[str, Any] | None = None,
+) -> None:
+    conn = db()
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO vk_posts(draft_id, post_id, owner_id, attachments, music_track, published_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            draft_id,
+            post_id,
+            owner_id,
+            ",".join(attachments or []),
+            json.dumps(music_track or {}, ensure_ascii=False),
+            now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
 def fetch_news() -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
 
@@ -1122,6 +1235,20 @@ def build_crosspost_to_naz_sync(draft: dict | sqlite3.Row) -> str:
     return build_void_fragment_for_naz_sync(draft["post"])
 
 
+VOID_TO_NAZ_OPENING_OPTIONS = (
+    "В закулисном чате Void бросил фразу:",
+    "Из тёмного угла прилетело:",
+    "Void оставил на столе странную мысль:",
+    "Это звучало почти как помеха, но там был смысл:",
+    "Из личного диалога с Naz вытащилась такая мысль:",
+    "Void сформулировал грубо, но точно:",
+)
+
+VOID_TO_NAZ_FORBIDDEN_OPENINGS = (
+    "Void опять говорит странно, но по делу:",
+)
+
+
 def validate_void_fragment_for_naz(text: str) -> tuple[bool, str]:
     fragment = text or ""
     checks = [
@@ -1159,30 +1286,88 @@ def build_void_fragment_for_naz_sync(fragment: str) -> str:
         raise ValueError(reason)
 
     instructions = f"""
-You adapt a VOID fragment for the Naz AI Bot Telegram channel.
+You extract one private-dialogue fragment spoken by VOID to Naz.
 
 VOID source voice:
 {VOID_CORE_PROMPT}
 
-Naz AI Bot voice:
-- practical AI ecosystem, tools, automation, content systems, useful experiments;
-- clear, friendly, not mystical;
-- show where this VOID signal has practical meaning;
-- explain the trap or use case for AI, bots, content, development, projects, or a person building systems;
-- do not mirror the post word-for-word;
-- choose one format naturally: "VOID сказал", "Перевод с VOID на человеческий", or "Спор двух ботов";
-- vary the opening phrase;
-- mention VOID as the source of the signal;
-- write the Naz comment in first person: "я вижу", "я бы добавил", "для меня тут важно";
-- never write "Naz thinks", "Naz считает", "комментарий Naz", or describe Naz in third person;
+This is not a Telegram post and not copy prepared for reposting.
+Give Naz only one of these:
+- a thought;
+- a fragment of their internal dialogue;
+- a strange thesis;
+- a philosophical or dark impulse;
+- a short phrase Naz can later decode for the viewer.
+
+Rules:
+- preserve VOID's voice, tension, and odd precision;
+- 1-4 short sentences, preferably 80-500 characters;
+- do not add a headline, rubric, source line, hashtags, call to action, or explanatory conclusion;
+- do not introduce the quote and do not write Naz's interpretation;
+- do not make the fragment self-contained like a finished social-media post;
+- do not mention reposting, cross-posting, channels, audiences, or content production;
 - stop if the input contains secrets, tokens, passwords, private URLs, SSH/IP access, client details, or private chats;
 - Russian only.
 
-Return only the final Telegram post. No markdown fences.
+Return strictly:
+FRAGMENT: the fragment spoken by VOID
 """.strip()
 
-    input_text = f"VOID_FRAGMENT:\n{fragment.strip()}"
-    return trim_post(call_ai(instructions, input_text, max_output_tokens=900, model=OPENAI_POST_MODEL), limit=3000)
+    input_text = f"SOURCE_MATERIAL:\n{fragment.strip()}"
+    raw = call_ai(instructions, input_text, max_output_tokens=350, model=OPENAI_POST_MODEL)
+    match = re.search(r"FRAGMENT\s*:\s*(.+)", raw, flags=re.I | re.S)
+    result = (match.group(1) if match else raw).replace("```", "").strip()
+    return trim_post(result, limit=700)
+
+
+def build_void_to_naz_exchange_payload(
+    fragment: str,
+    *,
+    source_event: str,
+    topic: str = "",
+) -> dict[str, Any]:
+    ok, reason = validate_void_fragment_for_naz(fragment)
+    if not ok:
+        raise ValueError(reason)
+
+    return {
+        "source": "void_entity",
+        "source_event": source_event,
+        "exchange_kind": "private_dialogue_fragment",
+        "topic": topic.strip(),
+        "text": fragment.strip(),
+        "ready_to_publish": False,
+        "requires_adaptation": True,
+        "adaptation_role": "naz_interpretation_after_void_voice",
+        "opening_options": list(VOID_TO_NAZ_OPENING_OPTIONS),
+        "forbidden_openings": list(VOID_TO_NAZ_FORBIDDEN_OPENINGS),
+        "adaptation_brief": (
+            "Сначала дай зрителю услышать голос Void, затем расшифруй его от первого лица Naz. "
+            "Подавай это как вынесенный наружу фрагмент частного закулисного диалога, не как репост. "
+            "Вводные чередуй; особенно поддерживай вайб «Из тёмного угла прилетело:»."
+        ),
+        "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
+    }
+
+
+def queue_void_fragment_for_naz(
+    fragment: str,
+    *,
+    source_event: str,
+    topic: str = "",
+) -> Path | None:
+    if not can_crosspost("void_to_naz"):
+        raise ValueError(f"daily limit reached: {CROSSPOST_DAILY_LIMIT}")
+    payload = build_void_to_naz_exchange_payload(
+        fragment,
+        source_event=source_event,
+        topic=topic,
+    )
+    path = write_exchange_payload("void_to_naz", payload)
+    if path is None:
+        raise ValueError("cross-post exchange is disabled")
+    mark_crosspost("void_to_naz")
+    return path
 
 
 def build_crosspost_from_naz_sync(source_text: str) -> dict[str, str]:
@@ -1234,7 +1419,7 @@ def exchange_payload_id(source: str, text: str) -> str:
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
-def write_exchange_payload(direction: str, payload: dict[str, str]) -> Path | None:
+def write_exchange_payload(direction: str, payload: dict[str, Any]) -> Path | None:
     if not CROSSPOST_EXCHANGE_ENABLED:
         return None
     ensure_exchange_dirs()
@@ -1256,29 +1441,6 @@ def move_exchange_file(path: Path, direction: str, box: str) -> None:
     if target.exists():
         target = target_dir / f"{path.stem}-{int(datetime.now().timestamp())}{path.suffix}"
     os.replace(path, target)
-
-
-def queue_void_post_for_naz(draft: dict | sqlite3.Row) -> None:
-    if not CROSSPOST_EXCHANGE_ENABLED:
-        return
-    source_name = str(draft["source_name"] or "")
-    source_url = str(draft["source_url"] or "")
-    frequency = str(draft["frequency"] or "")
-    if source_name == "Naz AI Bot" or frequency == "crosspost" or source_url.startswith("manual://cross/naz/"):
-        return
-    post = str(draft["post"] or "").strip()
-    if len(post) < 40:
-        return
-    write_exchange_payload(
-        "void_to_naz",
-        {
-            "source": "void_entity",
-            "source_event": "published_draft",
-            "topic": str(draft["title"] or ""),
-            "text": post[:6000],
-            "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
-        },
-    )
 
 
 async def process_naz_to_void_exchange(bot: Bot) -> None:
@@ -1565,7 +1727,311 @@ def vk_owner_id_from_group_id(group_id: str) -> int:
     return -abs(int(group_id))
 
 
-def post_to_vk_wall(text: str, *, force: bool = False) -> dict[str, Any]:
+def vk_api_call(method: str, params: dict[str, Any], *, access_token: str | None = None) -> dict[str, Any]:
+    token = access_token if access_token is not None else VK_USER_ACCESS_TOKEN
+    if not token:
+        raise RuntimeError("VK access token is empty")
+
+    payload_params = {
+        **params,
+        "access_token": token,
+        "v": VK_API_VERSION,
+    }
+    data = urlencode(payload_params).encode("utf-8")
+    request = Request(f"https://api.vk.com/method/{method}", data=data, method="POST")
+    with urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if "error" in payload:
+        raise RuntimeError(format_vk_error(payload["error"]))
+    return payload.get("response", {})
+
+
+def encode_multipart_formdata(fields: dict[str, str], files: dict[str, tuple[str, bytes, str]]) -> tuple[bytes, str]:
+    boundary = f"----void-vk-{random.randrange(10**12, 10**13)}"
+    body: list[bytes] = []
+
+    for name, value in fields.items():
+        body.append(f"--{boundary}\r\n".encode("utf-8"))
+        body.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.append(str(value).encode("utf-8"))
+        body.append(b"\r\n")
+
+    for name, (filename, content, content_type) in files.items():
+        body.append(f"--{boundary}\r\n".encode("utf-8"))
+        body.append(
+            (
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        body.append(content)
+        body.append(b"\r\n")
+
+    body.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(body), f"multipart/form-data; boundary={boundary}"
+
+
+def upload_vk_wall_photo(image: bytes, filename: str = "void-wall.png") -> str:
+    token = VK_PHOTO_ACCESS_TOKEN or VK_USER_ACCESS_TOKEN
+    group_id = str(abs(int(VK_GROUP_ID)))
+    upload = vk_api_call("photos.getWallUploadServer", {"group_id": group_id}, access_token=token)
+    upload_url = upload.get("upload_url")
+    if not upload_url:
+        raise RuntimeError("VK photo upload_url is empty")
+
+    content_type = mimetypes.guess_type(filename)[0] or "image/png"
+    data, request_content_type = encode_multipart_formdata(
+        {},
+        {"photo": (filename, image, content_type)},
+    )
+    request = Request(
+        upload_url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": request_content_type},
+    )
+    with urlopen(request, timeout=60) as response:
+        uploaded = json.loads(response.read().decode("utf-8"))
+
+    saved = vk_api_call(
+        "photos.saveWallPhoto",
+        {
+            "group_id": group_id,
+            "photo": uploaded.get("photo", ""),
+            "server": uploaded.get("server", ""),
+            "hash": uploaded.get("hash", ""),
+        },
+        access_token=token,
+    )
+    if not saved:
+        raise RuntimeError("VK photos.saveWallPhoto returned empty response")
+
+    photo = saved[0]
+    return f"photo{photo['owner_id']}_{photo['id']}"
+
+
+def build_vk_image_attachment_sync(draft: dict | sqlite3.Row) -> str:
+    images = generate_post_images_sync(draft)
+    if images:
+        return upload_vk_wall_photo(images[0], filename=f"void-{draft['id']}-vk.png")
+
+    source_image_url = find_source_image_url(draft["source_url"] or "")
+    if not source_image_url:
+        raise RuntimeError("no generated image and no source image fallback")
+
+    request = Request(source_image_url, headers={"User-Agent": "VOIDBot/1.0"})
+    with urlopen(request, timeout=30) as response:
+        image = response.read(8_000_000)
+        content_type = response.headers.get_content_type()
+    extension = ".jpg" if content_type == "image/jpeg" else ".png"
+    return upload_vk_wall_photo(image, filename=f"void-{draft['id']}-source{extension}")
+
+
+def load_vk_music_tracks() -> list[dict[str, Any]]:
+    path = Path(VK_MUSIC_TRACKS_FILE)
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"vk music tracks load error: {type(e).__name__}: {e}", flush=True)
+        return []
+
+    tracks = data.get("tracks", data) if isinstance(data, dict) else data
+    if not isinstance(tracks, list):
+        return []
+    return [track for track in tracks if isinstance(track, dict) and track.get("title")]
+
+
+def vk_music_track_key(track: dict[str, Any]) -> str:
+    artist = str(track.get("artist") or "").strip().casefold()
+    title = str(track.get("title") or "").strip().casefold()
+    return f"{artist}|{title}"
+
+
+def recent_vk_music_track_keys(limit: int = 5) -> list[str]:
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT music_track
+        FROM vk_posts
+        WHERE music_track IS NOT NULL AND music_track NOT IN ('', '{}')
+        ORDER BY published_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    keys: list[str] = []
+    for row in rows:
+        try:
+            track = json.loads(row["music_track"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(track, dict) and track.get("title"):
+            keys.append(vk_music_track_key(track))
+    return keys
+
+
+VK_VIBE_KEYWORDS = {
+    "dark": ("dark", "pain", "fallen", "phantom", "shadow", "void", "cold", "black", "fear", "alone", "пуст", "тень", "боль"),
+    "future": ("future", "orbital", "space", "mercury", "digital", "machine", "signal", "neon", "tomorrow", "zavtra", "будущ", "робот", "ai"),
+    "energy": ("move", "life", "energy", "fire", "power", "run", "dance", "more", "beat", "drive", "ритм", "движ", "скорост"),
+    "calm": ("silent", "quiet", "ambient", "slow", "still", "peace", "soft", "сон", "тиш", "спокой"),
+    "melancholy": ("pain", "waste", "gone", "lost", "without", "goodbye", "rain", "memory", "sad", "боль", "дожд", "памят", "потер"),
+    "warm": ("love", "soul", "you and me", "together", "home", "heart", "summer", "light", "люб", "дом", "свет"),
+    "tension": ("thrill", "danger", "warning", "pressure", "storm", "attack", "thriller", "контрол", "угроз", "тревог"),
+    "night": ("night", "midnight", "moon", "dream", "noir", "ноч", "лун", "сон"),
+}
+
+VK_MODE_VIBES = {
+    "frequency": {"energy", "tension", "night"},
+    "midnight": {"night", "dark", "calm", "melancholy"},
+    "vault": {"dark", "melancholy", "calm"},
+    "future": {"future", "energy", "tension"},
+    "news": {"future", "tension", "energy"},
+    "signal": {"tension", "future", "energy"},
+    "observation": {"calm", "melancholy", "warm"},
+}
+
+
+def infer_vk_vibes(text: str) -> set[str]:
+    normalized = (text or "").casefold()
+    return {
+        vibe
+        for vibe, keywords in VK_VIBE_KEYWORDS.items()
+        if any(
+            re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", normalized)
+            if len(keyword) <= 2
+            else keyword in normalized
+            for keyword in keywords
+        )
+    }
+
+
+def post_vk_vibes(draft: dict | sqlite3.Row) -> set[str]:
+    mode = str(draft["mode"] or "").casefold()
+    text = " ".join(
+        (
+            mode,
+            str(draft["title"] or ""),
+            str(draft["frequency"] or ""),
+            str(draft["post"] or ""),
+        )
+    )
+    return set(VK_MODE_VIBES.get(mode, set())) | infer_vk_vibes(text)
+
+
+def track_vk_vibes(track: dict[str, Any]) -> set[str]:
+    explicit = {
+        str(tag).strip().casefold()
+        for tag in track.get("tags", [])
+        if str(tag).strip().casefold() in VK_VIBE_KEYWORDS
+    }
+    identity = f"{track.get('artist', '')} {track.get('title', '')}"
+    return explicit | infer_vk_vibes(identity)
+
+
+def choose_vk_music_track(draft: dict | sqlite3.Row) -> dict[str, Any] | None:
+    tracks = load_vk_music_tracks()
+    if not tracks:
+        return None
+
+    post_vibes = post_vk_vibes(draft)
+
+    def score(track: dict[str, Any]) -> int:
+        track_vibes = track_vk_vibes(track)
+        overlap = post_vibes & track_vibes
+        return sum(3 if vibe in {"future", "dark", "energy", "calm"} else 2 for vibe in overlap)
+
+    recent = set(recent_vk_music_track_keys(limit=5))
+    fresh_tracks = [track for track in tracks if vk_music_track_key(track) not in recent]
+    candidates = fresh_tracks or tracks
+    best_score = max(score(track) for track in candidates)
+    best = [track for track in candidates if score(track) == best_score]
+
+    draft_seed = str(draft["id"] if "id" in draft.keys() else sorted(post_vibes))
+    return random.Random(draft_seed).choice(best)
+
+
+def parse_vk_music_import(text: str) -> list[dict[str, Any]]:
+    tracks: list[dict[str, Any]] = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip().strip("-* ")
+        if not line or line.startswith("/"):
+            continue
+
+        parts = [part.strip() for part in line.split("|")]
+        main = parts[0]
+        url = parts[1] if len(parts) >= 2 and parts[1].startswith("http") else ""
+        tags_part = parts[2] if len(parts) >= 3 else ""
+
+        if " - " in main:
+            artist, title = [part.strip() for part in main.split(" - ", 1)]
+        elif " — " in main:
+            artist, title = [part.strip() for part in main.split(" — ", 1)]
+        else:
+            artist, title = "", main
+
+        if not title:
+            continue
+
+        tags = [tag.strip().lower() for tag in re.split(r"[,;]", tags_part) if tag.strip()]
+        if not tags:
+            tags = ["music", "culture", "night"]
+
+        tracks.append(
+            {
+                "artist": artist,
+                "title": title,
+                "url": url,
+                "tags": tags,
+            }
+        )
+    return tracks
+
+
+def import_vk_music_tracks(text: str) -> tuple[int, int]:
+    imported = parse_vk_music_import(text)
+    if not imported:
+        return 0, len(load_vk_music_tracks())
+
+    path = Path(VK_MUSIC_TRACKS_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_vk_music_tracks()
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for track in existing + imported:
+        key = (
+            str(track.get("artist", "")).strip().lower(),
+            str(track.get("title", "")).strip().lower(),
+        )
+        by_key[key] = track
+
+    merged = sorted(by_key.values(), key=lambda item: (str(item.get("artist", "")), str(item.get("title", ""))))
+    path.write_text(json.dumps({"tracks": merged}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return len(imported), len(merged)
+
+
+def format_vk_music_track(track: dict[str, Any] | None) -> str:
+    if not track:
+        return ""
+
+    artist = str(track.get("artist", "")).strip()
+    title = str(track.get("title", "")).strip()
+    url = str(track.get("url", "")).strip()
+    label = f"{artist} - {title}" if artist else title
+    if not url and label:
+        url = f"https://vk.com/audio?q={quote(label)}"
+    if url:
+        return f"\n\nSoundtrack: {label}\n{url}"
+    return f"\n\nSoundtrack: {label}"
+
+
+def post_to_vk_wall(text: str, *, force: bool = False, attachments: list[str] | None = None) -> dict[str, Any]:
     if not text.strip():
         raise RuntimeError("VK post text is empty")
 
@@ -1577,6 +2043,8 @@ def post_to_vk_wall(text: str, *, force: bool = False) -> dict[str, Any]:
         "access_token": VK_USER_ACCESS_TOKEN,
         "v": VK_API_VERSION,
     }
+    if attachments:
+        params["attachments"] = ",".join(attachments)
 
     if VK_DRY_RUN and not force:
         safe = {**params, "access_token": "***"}
@@ -1591,7 +2059,7 @@ def post_to_vk_wall(text: str, *, force: bool = False) -> dict[str, Any]:
         payload = json.loads(response.read().decode("utf-8"))
 
     if "error" in payload:
-        raise RuntimeError(f"VK API error: {payload['error']}")
+        raise RuntimeError(format_vk_error(payload["error"]))
 
     return {
         "ok": True,
@@ -1599,6 +2067,28 @@ def post_to_vk_wall(text: str, *, force: bool = False) -> dict[str, Any]:
         "post_id": payload.get("response", {}).get("post_id"),
         "response": payload,
     }
+
+
+def format_vk_error(error: dict[str, Any]) -> str:
+    code = error.get("error_code")
+    subcode = error.get("error_subcode")
+    message = error.get("error_msg") or "unknown VK API error"
+
+    if code == 15 and subcode == 1133:
+        return (
+            "VK access denied: token has no permission for wall.post. "
+            "Reissue VK_USER_ACCESS_TOKEN with the wall scope and make sure the user is an admin "
+            "of the VK community. Keep VK_DRY_RUN=true until /vk_test works."
+        )
+
+    if code == 27:
+        return (
+            "VK auth type rejected this method. For wall photo uploads, set VK_PHOTO_ACCESS_TOKEN "
+            "to a user access token with photos and wall permissions; group/community tokens can post text "
+            "but may fail on photos.getWallUploadServer."
+        )
+
+    return f"VK API error {code}: {message}"
 
 
 async def publish_draft_images(bot: Bot, draft: dict | sqlite3.Row) -> tuple[int, str | None]:
@@ -1661,7 +2151,6 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
     )
     image_count, image_error = await publish_draft_images(bot, draft)
     mark_published(draft_id, draft["source_url"] or "")
-    queue_void_post_for_naz(draft)
     if image_count:
         return f"Опубликовано: #{draft_id}. Картинок: {image_count}"
     if image_error:
@@ -1669,27 +2158,52 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
     return f"Опубликовано: #{draft_id}. Картинок: 0"
 
 
-async def send_to_naz_channel(bot: Bot, text: str) -> None:
-    if not NAZ_CHANNEL_ID:
-        raise ValueError("NAZ_CHANNEL_ID is not set")
+async def publish_draft_to_vk(draft_id: int, *, force: bool = False) -> str:
+    draft = get_draft(draft_id)
+    if not draft:
+        return "Draft not found."
 
-    if NAZ_BOT_TOKEN and NAZ_BOT_TOKEN != BOT_TOKEN:
-        naz_bot = Bot(token=NAZ_BOT_TOKEN)
+    existing = get_vk_post_for_draft(draft_id)
+    if existing:
+        return f"VK duplicate blocked: draft #{draft_id} already published as post_id={existing['post_id']}."
+
+    ok, reason = quality_check(draft["post"])
+    if not ok:
+        return f"VK publish blocked: {reason}. Check /preview {draft_id} first."
+
+    track = await asyncio.to_thread(choose_vk_music_track, draft)
+    post_text = f"{draft['post']}{format_vk_music_track(track)}"
+    attachments: list[str] = []
+    image_error = ""
+
+    if force:
         try:
-            await naz_bot.send_message(
-                chat_id=NAZ_CHANNEL_ID,
-                text=text,
-                disable_web_page_preview=True,
-            )
-        finally:
-            await naz_bot.session.close()
-        return
+            image_attachment = await asyncio.to_thread(build_vk_image_attachment_sync, draft)
+            attachments.append(image_attachment)
+        except Exception as e:
+            image_error = f" image=failed:{type(e).__name__}:{e}"
 
-    await bot.send_message(
-        chat_id=NAZ_CHANNEL_ID,
-        text=text,
-        disable_web_page_preview=True,
+    try:
+        result = await asyncio.to_thread(post_to_vk_wall, post_text, force=force, attachments=attachments)
+    except Exception as e:
+        return f"VK publish failed: {type(e).__name__}: {e}"
+
+    status = "dry-run" if result.get("dry_run") else "published"
+    post_id = result.get("post_id")
+    if result.get("dry_run"):
+        track_note = " track=yes" if track else " track=none"
+        return f"VK {status}: draft #{draft_id}. post_id={post_id}.{track_note} image=skipped. To publish for real: /publish_vk --yes {draft_id}"
+
+    mark_vk_published(
+        draft_id,
+        int(post_id or 0),
+        vk_owner_id_from_group_id(VK_GROUP_ID),
+        attachments=attachments,
+        music_track=track,
     )
+    image_note = " image=yes" if attachments else image_error or " image=none"
+    track_note = " track=yes" if track else " track=none"
+    return f"VK {status}: draft #{draft_id}. post_id={post_id}.{image_note}{track_note}"
 
 
 async def make_news_drafts(limit: int = 5) -> tuple[int, int]:
@@ -1786,12 +2300,220 @@ async def autopost_void_signal_once(bot: Bot) -> str:
     return f"VOID-план: {result}"
 
 
+def eligible_rubric_slots(now: datetime | None = None) -> list[dict[str, Any]]:
+    current = now or datetime.now(MOSCOW_TZ)
+    hour = current.hour
+    eligible = [slot for slot in RUBRIC_SCHEDULE if hour in slot.get("hours", [])]
+    if eligible:
+        return eligible
+    return [slot for slot in RUBRIC_SCHEDULE if slot.get("voice") in {"void", "news"}]
+
+
+def eligible_schedule_slots(schedule: list[dict[str, Any]], now: datetime | None = None) -> list[dict[str, Any]]:
+    current = now or datetime.now(MOSCOW_TZ)
+    hour = current.hour
+    eligible = [slot for slot in schedule if hour in slot.get("hours", [])]
+    return eligible or schedule
+
+
+def choose_schedule_slot(schedule: list[dict[str, Any]], recent_key: str, now: datetime | None = None) -> dict[str, Any]:
+    slots = eligible_schedule_slots(schedule, now)
+    recent_raw = get_setting(recent_key, "")
+    recent = [item for item in recent_raw.split(",") if item]
+    filtered = [slot for slot in slots if slot["name"] not in recent[-3:]]
+    if filtered:
+        slots = filtered
+    weights = [int(slot.get("weight", 1) or 1) for slot in slots]
+    slot = random.choices(slots, weights=weights, k=1)[0]
+    recent.append(str(slot["name"]))
+    set_setting(recent_key, ",".join(recent[-8:]))
+    return slot
+
+
+def choose_scheduled_rubric(now: datetime | None = None) -> dict[str, Any]:
+    return choose_schedule_slot(RUBRIC_SCHEDULE, "rubric_recent", now)
+
+
+def rubric_schedule_text(now: datetime | None = None) -> str:
+    current = now or datetime.now(MOSCOW_TZ)
+    lines = [
+        "VK/VOID rubric schedule",
+        "",
+        f"Moscow now: {current:%H:%M}",
+        "",
+        "Fixed windows:",
+        "00-02: MIDNIGHT / VOID",
+        "19-22: FREQUENCY / VOID",
+        "22-23: THE VAULT / VOID",
+        "",
+        "Random pools:",
+        "09-18: SIGNAL, OBSERVATION, FUTURE FILE, NEWS",
+        "18-21: evening VOID formats and NEWS",
+        "",
+        "Eligible now:",
+    ]
+    for slot in eligible_rubric_slots(current):
+        lines.append(f"- {slot['name']} ({slot['voice']}, weight={slot.get('weight', 1)})")
+    return "\n".join(lines)
+
+
+def telegram_schedule_text(now: datetime | None = None) -> str:
+    current = now or datetime.now(MOSCOW_TZ)
+    lines = [
+        "Telegram rubric schedule",
+        "",
+        f"Moscow now: {current:%H:%M}",
+        "",
+        "VOID:",
+        "00-02: MIDNIGHT",
+        "19-22: FREQUENCY",
+        "22-23: THE VAULT",
+        "09-18: SIGNAL / OBSERVATION / FUTURE FILE / NEWS",
+        "",
+        "Eligible VOID now:",
+    ]
+    for slot in eligible_schedule_slots(TELEGRAM_VOID_SCHEDULE, current):
+        lines.append(f"- {slot['name']} (weight={slot.get('weight', 1)})")
+    return "\n".join(lines)
+
+
+async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
+    voice = str(slot.get("voice", "void"))
+    name = str(slot.get("name", "Scheduled Signal"))
+    brief = str(slot.get("brief", "Make an original post for the shared public."))
+
+    content = (
+        f"RUBRIC: {name}\n"
+        f"VOICE: {voice}\n"
+        f"PLATFORM: VK shared public\n"
+        f"BRIEF:\n{brief}\n\n"
+        "Make an original post for the shared VK public. Do not mention that this came from a schedule."
+    )
+
+    if voice == "news":
+        items = await asyncio.to_thread(fetch_news)
+        for item in items[:10]:
+            news_content = (
+                f"Заголовок: {item['title']}\n"
+                f"Описание: {item.get('summary', '')}\n"
+                f"Источник: {item.get('source_name', '')}\n"
+                f"Ссылка: {item.get('url', '')}"
+            )
+            draft_id = await generate_and_save(
+                item.get("mode", "news"),
+                news_content,
+                item.get("frequency", "HUMAN"),
+                item.get("source_name", ""),
+                item.get("url", ""),
+            )
+            draft = get_draft(draft_id)
+            ok, _ = quality_check(draft["post"] if draft else "")
+            if ok:
+                return draft_id
+        raise RuntimeError("fresh news signals not found")
+
+    return await generate_and_save(
+        str(slot.get("mode", "signal")),
+        content,
+        str(slot.get("frequency", "HUMAN")),
+        "VOID / VK scheduled rubric",
+        f"manual://vk/schedule/{slot.get('mode', 'signal')}/{now_iso()}",
+    )
+
+
+async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
+    voice = str(slot.get("voice", "void"))
+    name = str(slot.get("name", "Telegram VOID"))
+    brief = str(slot.get("brief", "Make an original Telegram post."))
+
+    if voice == "news":
+        items = await asyncio.to_thread(fetch_news)
+        for item in items[:10]:
+            content = (
+                f"Заголовок: {item['title']}\n"
+                f"Описание: {item.get('summary', '')}\n"
+                f"Источник: {item.get('source_name', '')}\n"
+                f"Ссылка: {item.get('url', '')}"
+            )
+            draft_id = await generate_and_save(
+                item.get("mode", "news"),
+                content,
+                item.get("frequency", "HUMAN"),
+                item.get("source_name", ""),
+                item.get("url", ""),
+            )
+            draft = get_draft(draft_id)
+            ok, _ = quality_check(draft["post"] if draft else "")
+            if ok:
+                return draft_id
+        raise RuntimeError("fresh news signals not found")
+
+    content = (
+        f"RUBRIC: {name}\n"
+        f"PLATFORM: Telegram VOID channel\n"
+        f"BRIEF:\n{brief}\n\n"
+        "Make an original VOID post for Telegram. Do not mention that this came from a schedule."
+    )
+    return await generate_and_save(
+        str(slot.get("mode", "signal")),
+        content,
+        str(slot.get("frequency", "HUMAN")),
+        "VOID / Telegram scheduled rubric",
+        f"manual://telegram/void/{slot.get('mode', 'signal')}/{now_iso()}",
+    )
+
+
+async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
+    slot = await asyncio.to_thread(
+        lambda: choose_schedule_slot(TELEGRAM_VOID_SCHEDULE, "telegram_void_recent")
+    )
+    try:
+        draft_id = await save_telegram_void_scheduled_draft(slot)
+    except Exception as e:
+        if slot.get("voice") == "news":
+            fallback = await asyncio.to_thread(
+                lambda: random.choice([item for item in TELEGRAM_VOID_SCHEDULE if item.get("voice") == "void"])
+            )
+            draft_id = await save_telegram_void_scheduled_draft(fallback)
+            slot = fallback
+        else:
+            return f"Telegram VOID schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
+
+    draft = get_draft(draft_id)
+    ok, reason = quality_check(draft["post"] if draft else "")
+    if not ok:
+        return f"Telegram VOID schedule: draft #{draft_id} blocked: {reason}"
+    result = await publish_draft(bot, draft_id)
+    return f"Telegram VOID schedule: {slot['name']} -> {result}"
+
+
 async def autopost_scheduled_once(bot: Bot) -> str:
-    cycle = int(get_setting("auto_publish_cycle", "0") or "0")
-    set_setting("auto_publish_cycle", str(cycle + 1))
-    if cycle % 3 == 2:
-        return await autopost_once(bot)
-    return await autopost_void_signal_once(bot)
+    slot = await asyncio.to_thread(choose_scheduled_rubric)
+    try:
+        draft_id = await save_scheduled_rubric_draft(slot)
+    except Exception as e:
+        if slot.get("voice") == "news":
+            fallback = await asyncio.to_thread(
+                lambda: random.choice([item for item in RUBRIC_SCHEDULE if item.get("voice") == "void"])
+            )
+            draft_id = await save_scheduled_rubric_draft(fallback)
+            slot = fallback
+        else:
+            return f"Rubric schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
+
+    draft = get_draft(draft_id)
+    ok, reason = quality_check(draft["post"] if draft else "")
+    if not ok:
+        return f"Rubric schedule: draft #{draft_id} blocked: {reason}"
+
+    result = await publish_draft(bot, draft_id)
+    return f"Rubric schedule: {slot['name']} -> {result}"
+
+
+async def make_scheduled_rubric_draft_once() -> str:
+    slot = await asyncio.to_thread(choose_scheduled_rubric)
+    draft_id = await save_scheduled_rubric_draft(slot)
+    return f"Scheduled VK draft: #{draft_id}\nRubric: {slot['name']} / {slot['voice']}\n/preview {draft_id}"
 
 
 async def auto_loop(bot: Bot) -> None:
@@ -1800,15 +2522,15 @@ async def auto_loop(bot: Bot) -> None:
             enabled = get_setting("auto_publish", "0") == "1"
             if enabled:
                 now_ts = int(datetime.now(timezone.utc).timestamp())
-                last_ts = int(get_setting("auto_publish_last_ts", "0") or "0")
-                if now_ts - last_ts >= 60 * 60 * 3:
-                    set_setting("auto_publish_last_ts", str(now_ts))
-                    result = await autopost_scheduled_once(bot)
+                void_last_ts = int(get_setting("telegram_void_last_ts", "0") or "0")
+                if now_ts - void_last_ts >= 60 * 60 * 3:
+                    set_setting("telegram_void_last_ts", str(now_ts))
+                    result = await publish_telegram_void_scheduled_once(bot)
                     print(result, flush=True)
         except Exception as e:
             print(f"auto_loop error: {type(e).__name__}: {e}", flush=True)
 
-        await asyncio.sleep(60 * 60 * 3)
+        await asyncio.sleep(60 * 5)
 
 
 @router.message(CommandStart())
@@ -1821,7 +2543,23 @@ async def start(message: Message):
         
 @router.message(Command("help"))
 async def help_command(message: Message):
-    await start(message)
+    await message.answer(
+        "Command rooms:\n\n"
+        "/commands - core, drafts, cross-posting\n"
+        "/vk_commands - VK publisher, VK music, playlist sync\n\n"
+        "You can still write ordinary text to talk with VOID.",
+        reply_markup=reply_main_keyboard(),
+    )
+
+
+@router.message(Command("commands"))
+async def commands_command(message: Message):
+    await message.answer(commands_text(), reply_markup=reply_main_keyboard())
+
+
+@router.message(Command("vk_commands"))
+async def vk_commands_command(message: Message):
+    await message.answer(vk_commands_text(), reply_markup=reply_main_keyboard())
 
 @router.message(Command("dialog"))
 async def dialog_command(message: Message):
@@ -2109,6 +2847,110 @@ async def publish_command(message: Message, bot: Bot):
     await message.answer(result)
 
 
+@router.message(Command("publish_vk"))
+async def publish_vk_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    parts = (message.text or "").split()
+    force = False
+    if len(parts) >= 2 and parts[1] == "--yes":
+        force = True
+        parts.pop(1)
+
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Use: /publish_vk ID\nPublish for real: /publish_vk --yes ID")
+        return
+
+    result = await publish_draft_to_vk(int(parts[1]), force=force)
+    await message.answer(result)
+
+
+@router.message(Command("rubric_schedule"))
+async def rubric_schedule_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer(rubric_schedule_text())
+
+
+@router.message(Command("vk_schedule_draft"))
+async def vk_schedule_draft_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer("Выбираю рубрику по московскому времени и собираю VK-черновик.")
+    try:
+        result = await make_scheduled_rubric_draft_once()
+    except Exception as e:
+        await message.answer(f"VK scheduled draft failed: {type(e).__name__}: {e}")
+        return
+    await message.answer(
+        f"{result}\n"
+        "Auto-publish locally:\n"
+        "python vk_browser_publisher.py publish-draft ID"
+    )
+
+
+@router.message(Command("vk_music_status"))
+async def vk_music_status_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    tracks = await asyncio.to_thread(load_vk_music_tracks)
+    await message.answer(f"VK music tracks: {len(tracks)}\nFile: {VK_MUSIC_TRACKS_FILE}")
+
+
+@router.message(Command("vk_music_import"))
+async def vk_music_import_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    payload = (message.text or "").split(maxsplit=1)
+    text = payload[1].strip() if len(payload) > 1 else ""
+    if not text:
+        await message.answer(
+            "Use:\n"
+            "/vk_music_import Artist - Track | https://vk.com/audio... | future, night\n"
+            "One track per line."
+        )
+        return
+
+    added, total = await asyncio.to_thread(import_vk_music_tracks, text)
+    await message.answer(f"VK music import: added={added}, total={total}")
+
+
+@router.message(Command("vk_music_sync"))
+async def vk_music_sync_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    payload = (message.text or "").split(maxsplit=2)
+    if len(payload) < 2 or not payload[1].startswith("http"):
+        await message.answer(
+            "Use:\n"
+            "/vk_music_sync URL\n"
+            "/vk_music_sync URL night,electronic,melancholy\n\n"
+            "Browser playlist sync is the next VK automation step; this command is reserved for it."
+        )
+        return
+
+    url = payload[1].strip()
+    tags = payload[2].strip() if len(payload) > 2 else ""
+    await message.answer(
+        "VK music sync queued conceptually, not running yet.\n"
+        f"URL: {url}\n"
+        f"Base tags: {tags or 'music,culture,night'}\n\n"
+        "Next implementation step: authorized browser scraper for VK playlists."
+    )
+
+
 @router.message(Command("vk_status"))
 async def vk_status_command(message: Message):
     if not is_admin(message):
@@ -2119,10 +2961,13 @@ async def vk_status_command(message: Message):
         "VK publisher\n\n"
         f"VK_GROUP_ID: {'задан' if VK_GROUP_ID else 'не задан'}\n"
         f"VK_USER_ACCESS_TOKEN: {'задан' if VK_USER_ACCESS_TOKEN else 'не задан'}\n"
+        f"VK_PHOTO_ACCESS_TOKEN: {'задан' if VK_PHOTO_ACCESS_TOKEN else 'не задан'}\n"
         f"VK_API_VERSION: {VK_API_VERSION}\n"
         f"VK_DRY_RUN: {VK_DRY_RUN}\n\n"
         "Проверка: /vk_test текст\n"
-        "Реальная публикация: /vk_test --yes текст"
+        "Тест черновика: /publish_vk ID\n"
+        "Реальная публикация: /publish_vk --yes ID\n"
+        "Реальная тест-публикация: /vk_test --yes текст"
     )
 
 
@@ -2179,19 +3024,22 @@ async def void_crosspost_draft_command(message: Message):
         await message.answer(f"Остановил черновик: {reason}. Сначала очисти входной текст.")
         return
 
-    await message.answer("Собираю Naz-черновик из VOID-фрагмента.")
-    adapted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
-    await message.answer(adapted)
+    await message.answer("Вынимаю из текста фрагмент внутреннего разговора Void и Naz.")
+    try:
+        extracted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
+    except ValueError as e:
+        await message.answer(f"Фрагмент остановлен: {e}.")
+        return
+    await message.answer(
+        f"Голос Void (ещё не пост для Naz):\n\n{extracted}\n\n"
+        "Чтобы передать на адаптацию через exchange: /publish_void с этим текстом."
+    )
 
 
 @router.message(Command("publish_void"))
-async def publish_void_crosspost_command(message: Message, bot: Bot):
+async def publish_void_crosspost_command(message: Message):
     if not is_admin(message):
         await message.answer(admin_required())
-        return
-
-    if not NAZ_CHANNEL_ID:
-        await message.answer("NAZ_CHANNEL_ID не задан. Добавь канал Naz AI Bot в .env/Secrets.")
         return
 
     if not can_crosspost("void_to_naz"):
@@ -2205,24 +3053,30 @@ async def publish_void_crosspost_command(message: Message, bot: Bot):
 
     ok, reason = validate_void_fragment_for_naz(fragment)
     if not ok:
-        await message.answer(f"Автопубликация остановлена: {reason}. Сначала очисти входной текст.")
+        await message.answer(f"Передача остановлена: {reason}. Сначала очисти входной текст.")
         return
 
-    await message.answer("Готовлю Naz-кросспост и публикую.")
-    adapted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
-    await send_to_naz_channel(bot, adapted)
-    mark_crosspost("void_to_naz")
-    await message.answer(f"Опубликовано в Naz AI Bot. VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}")
+    await message.answer("Вынимаю голос Void и передаю Naz через exchange для отдельной интерпретации.")
+    try:
+        extracted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
+        path = queue_void_fragment_for_naz(
+            extracted,
+            source_event="manual_void_fragment",
+        )
+    except ValueError as e:
+        await message.answer(f"Передача остановлена: {e}.")
+        return
+    await message.answer(
+        f"Фрагмент передан в exchange, но не опубликован Void-проектом в Naz.\n"
+        f"Файл: {path.name}\n"
+        f"VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}"
+    )
 
 
 @router.message(Command("cross_to_naz"))
-async def cross_to_naz_command(message: Message, bot: Bot):
+async def cross_to_naz_command(message: Message):
     if not is_admin(message):
         await message.answer(admin_required())
-        return
-
-    if not NAZ_CHANNEL_ID:
-        await message.answer("NAZ_CHANNEL_ID не задан. Добавь канал Naz AI Bot в .env/Secrets.")
         return
 
     if not can_crosspost("void_to_naz"):
@@ -2239,15 +3093,21 @@ async def cross_to_naz_command(message: Message, bot: Bot):
         await message.answer("Черновик не найден.")
         return
 
-    await message.answer("Адаптирую VOID-сигнал под Naz AI Bot и отправляю.")
+    await message.answer("Вынимаю из VOID-черновика реплику для внутреннего диалога и кладу в exchange.")
     try:
-        adapted = await asyncio.to_thread(build_crosspost_to_naz_sync, draft)
+        extracted = await asyncio.to_thread(build_crosspost_to_naz_sync, draft)
+        path = queue_void_fragment_for_naz(
+            extracted,
+            source_event="manual_void_draft",
+            topic=str(draft["title"] or ""),
+        )
     except ValueError as e:
-        await message.answer(f"Автопубликация остановлена: {e}. Сначала очисти черновик.")
+        await message.answer(f"Передача остановлена: {e}. Сначала проверь черновик и exchange.")
         return
-    await send_to_naz_channel(bot, adapted)
-    mark_crosspost("void_to_naz")
-    await message.answer(f"Готово. VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}")
+    await message.answer(
+        f"Готово: {path.name}. Naz должен сам расшифровать реплику перед публикацией.\n"
+        f"VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}"
+    )
 
 
 @router.message(Command("cross_from_naz"))
@@ -2313,6 +3173,26 @@ async def void_now_command(message: Message, bot: Bot):
     await message.answer(result)
 
 
+@router.message(Command("telegram_schedule"))
+async def telegram_schedule_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer(telegram_schedule_text())
+
+
+@router.message(Command("void_schedule_now"))
+async def void_schedule_now_command(message: Message, bot: Bot):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer("Запускаю scheduled-рубрику VOID для Telegram.")
+    result = await publish_telegram_void_scheduled_once(bot)
+    await message.answer(result)
+
+
 @router.message(Command("auto_on"))
 async def auto_on_command(message: Message):
     if not is_admin(message):
@@ -2322,7 +3202,8 @@ async def auto_on_command(message: Message):
     set_setting("auto_publish", "1")
     await message.answer(
         "Автопубликация включена.\n"
-        "VOID будет сам искать, проверять и публиковать лучший сигнал примерно раз в 3 часа.\n"
+        "VOID будет публиковать scheduled-рубрику примерно раз в 3 часа.\n"
+        "Naz живёт в своём проекте; здесь остаётся только обмен через exchange/adaptation.\n"
         "Если он начнёт душнить — это всё ещё наша ответственность. Увы, зрелость."
     )
 
@@ -2340,7 +3221,10 @@ async def auto_off_command(message: Message):
 @router.message(Command("auto_status"))
 async def auto_status_command(message: Message):
     enabled = get_setting("auto_publish", "0") == "1"
-    await message.answer(f"Автопубликация: {'включена' if enabled else 'выключена'}")
+    await message.answer(
+        f"Автопубликация: {'включена' if enabled else 'выключена'}\n\n"
+        f"VOID last_ts: {get_setting('telegram_void_last_ts', '0')}"
+    )
 
 
 @router.callback_query(F.data.startswith("catch:"))

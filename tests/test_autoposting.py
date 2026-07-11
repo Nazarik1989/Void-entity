@@ -1,19 +1,29 @@
 import os
 import sys
 import unittest
+from datetime import datetime
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from main import (
+    VOID_TO_NAZ_FORBIDDEN_OPENINGS,
+    VOID_TO_NAZ_OPENING_OPTIONS,
+    build_void_to_naz_exchange_payload,
     build_rubric_header,
     clean_source_lines,
+    choose_vk_music_track,
     display_source_name,
+    eligible_schedule_slots,
+    eligible_rubric_slots,
     inject_rubric_header,
+    post_vk_vibes,
+    track_vk_vibes,
     too_much_english,
     trim_post,
     validate_void_fragment_for_naz,
 )
-from void_core import CONTENT_PLAN
+from void_core import CONTENT_PLAN, RUBRIC_SCHEDULE, TELEGRAM_VOID_SCHEDULE
 
 
 class AutopostingRubricTests(unittest.TestCase):
@@ -30,6 +40,32 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertIn("frequency", modes)
         self.assertIn("observation", modes)
         self.assertIn("vault", modes)
+
+    def test_rubric_schedule_is_void_owned(self) -> None:
+        voices = {slot["voice"] for slot in RUBRIC_SCHEDULE}
+        self.assertIn("void", voices)
+        self.assertIn("news", voices)
+        self.assertNotIn("naz", voices)
+        self.assertNotIn("dialog", voices)
+
+    def test_midnight_is_only_eligible_at_night(self) -> None:
+        night = datetime(2026, 7, 9, 1, 0)
+        day = datetime(2026, 7, 9, 14, 0)
+        night_modes = {slot["mode"] for slot in eligible_rubric_slots(night)}
+        day_modes = {slot["mode"] for slot in eligible_rubric_slots(day)}
+        self.assertIn("midnight", night_modes)
+        self.assertNotIn("midnight", day_modes)
+
+    def test_telegram_schedule_is_void_owned(self) -> None:
+        self.assertTrue(all(slot["voice"] in {"void", "news"} for slot in TELEGRAM_VOID_SCHEDULE))
+
+    def test_telegram_void_midnight_is_night_only(self) -> None:
+        night = datetime(2026, 7, 9, 1, 0)
+        day = datetime(2026, 7, 9, 14, 0)
+        night_modes = {slot["mode"] for slot in eligible_schedule_slots(TELEGRAM_VOID_SCHEDULE, night)}
+        day_modes = {slot["mode"] for slot in eligible_schedule_slots(TELEGRAM_VOID_SCHEDULE, day)}
+        self.assertIn("midnight", night_modes)
+        self.assertNotIn("midnight", day_modes)
 
     def test_inject_rubric_header_into_post(self) -> None:
         post = inject_rubric_header("news", "AI", "Текст поста")
@@ -71,6 +107,62 @@ class AutopostingRubricTests(unittest.TestCase):
         )
         self.assertTrue(ok)
         self.assertEqual(reason, "")
+
+    def test_void_to_naz_payload_requires_naz_adaptation(self) -> None:
+        fragment = "Инструмент становится клеткой, когда человек перестаёт замечать его форму."
+        payload = build_void_to_naz_exchange_payload(
+            fragment,
+            source_event="test",
+            topic="Инструменты",
+        )
+
+        self.assertEqual(payload["exchange_kind"], "private_dialogue_fragment")
+        self.assertEqual(payload["text"], fragment)
+        self.assertFalse(payload["ready_to_publish"])
+        self.assertTrue(payload["requires_adaptation"])
+        self.assertEqual(payload["adaptation_role"], "naz_interpretation_after_void_voice")
+
+    def test_void_to_naz_openings_have_backstage_variety(self) -> None:
+        self.assertIn("Из тёмного угла прилетело:", VOID_TO_NAZ_OPENING_OPTIONS)
+        self.assertGreaterEqual(len(VOID_TO_NAZ_OPENING_OPTIONS), 6)
+        self.assertIn(
+            "Void опять говорит странно, но по делу:",
+            VOID_TO_NAZ_FORBIDDEN_OPENINGS,
+        )
+
+    def test_vk_music_rotation_skips_recent_track(self) -> None:
+        tracks = [
+            {"artist": "A", "title": "First", "tags": ["future"]},
+            {"artist": "B", "title": "Second", "tags": ["future"]},
+            {"artist": "C", "title": "Third", "tags": ["future"]},
+        ]
+        draft = {
+            "id": 42,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch("main.recent_vk_music_track_keys", return_value=["a|first", "b|second"]),
+        ):
+            selected = choose_vk_music_track(draft)
+
+        self.assertEqual(selected["title"], "Third")
+
+    def test_vk_music_vibes_come_from_post_mode_and_track_title(self) -> None:
+        draft = {
+            "mode": "midnight",
+            "title": "Ночной сигнал",
+            "frequency": "HUMAN",
+            "post": "Тихая память города после дождя.",
+        }
+        track = {"artist": "Example", "title": "Silent Night Rain", "tags": ["music"]}
+
+        self.assertTrue({"night", "calm", "melancholy"} <= post_vk_vibes(draft))
+        self.assertTrue({"night", "calm", "melancholy"} <= track_vk_vibes(track))
 
 
 if __name__ == "__main__":

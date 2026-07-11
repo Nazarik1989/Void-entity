@@ -3,3 +3,4 @@ aiohttp-socks
 feedparser
 python-dotenv
 openai
+playwright
