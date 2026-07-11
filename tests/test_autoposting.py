@@ -116,11 +116,14 @@ class AutopostingRubricTests(unittest.TestCase):
             topic="Инструменты",
         )
 
-        self.assertEqual(payload["exchange_kind"], "private_dialogue_fragment")
+        self.assertEqual(payload["exchange_kind"], "private_thought")
+        self.assertEqual(payload["schema"], "private_thought.v1")
         self.assertEqual(payload["text"], fragment)
         self.assertFalse(payload["ready_to_publish"])
+        self.assertFalse(payload["already_published"])
         self.assertTrue(payload["requires_adaptation"])
-        self.assertEqual(payload["adaptation_role"], "naz_interpretation_after_void_voice")
+        self.assertTrue(payload["public_attribution_allowed"])
+        self.assertEqual(payload["adaptation_role"], "naz_original_reflection_after_private_conversation")
 
     def test_void_to_naz_openings_have_backstage_variety(self) -> None:
         self.assertIn("Из тёмного угла прилетело:", VOID_TO_NAZ_OPENING_OPTIONS)

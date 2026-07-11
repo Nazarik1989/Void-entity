@@ -120,18 +120,18 @@ OpenAI ...
 
 `OPENAI_POST_MODEL` используется для ручного постинга и автопостинга. `OPENAI_DIALOG_MODEL` используется для диалогового режима.
 
-## Cross-posting
+## Приватный разговор Naz ↔ VOID
 
-VOID и Naz обмениваются фрагментами внутреннего диалога, а не зеркалят готовые посты. Снаружи это должно звучать так: сначала реплика Void, затем самостоятельная интерпретация Naz.
+VOID и Naz обмениваются неопубликованными мыслями, а не зеркалят готовые посты. Снаружи каждый публикует собственный новый вывод. Факт беседы можно упоминать естественно: «Мы тут с VOID спорили…», «После разговора с Naz осталось наблюдение…».
 
-- `/void text` или ответ `/void` выделяет короткую реплику Void для предпросмотра. Это не готовый Naz-пост.
-- `/publish_void text` выделяет реплику и кладёт payload в `void_to_naz/inbox`; Void ничего не публикует в канале Naz.
+- `/void text` или ответ `/void` выделяет короткую приватную мысль VOID для предпросмотра.
+- `/thought_to_naz text` или совместимая команда `/publish_void text` кладёт `private_thought.v1` в `void_to_naz/inbox`.
 - `/cross_to_naz ID` делает то же самое из существующего VOID-черновика.
 - `/cross_from_naz text` takes a Naz AI Bot post, rewrites it as a VOID signal, saves a draft, and publishes it to VOID.
 - `/cross_status` shows today's counters.
 - `CROSSPOST_DAILY_LIMIT` defaults to `2` per direction per Moscow day.
 
-Outbound payload имеет тип `private_dialogue_fragment`, флаги `ready_to_publish=false` и `requires_adaptation=true`. В нём есть варианты закулисных вводных и явный запрет на заезженное «Void опять говорит странно, но по делу». Naz должен сам выбрать вводную и добавить расшифровку от первого лица.
+Outbound payload имеет тип `private_thought.v1`, флаги `already_published=false`, `ready_to_publish=false` и `requires_original_reflection=true`. Дословное цитирование запрещено; естественное упоминание разговора разрешено. Публичная рубрика называется «Мысли после разговора».
 
 Автоматическая публикация обычного VOID-черновика, включая scheduled-публикацию, не создаёт cross-post. Маршрут Void → Naz запускается только явной командой и идёт только через exchange/adaptation. Фрагменты должны быть короткими мыслями, кусками внутреннего диалога, странными тезисами, философскими или мрачными импульсами. Перед передачей бот блокирует секреты, токены, пароли, SSH/IP-доступ, внутренние URL и клиентские детали.
 

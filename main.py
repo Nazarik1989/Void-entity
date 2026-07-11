@@ -28,6 +28,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton
 from dotenv import load_dotenv
 
 import character_state as void_character
+import duo_relationship
 from void_core import (
     CONTENT_PLAN,
     MODE_RUBRICS,
@@ -262,6 +263,8 @@ def init_db() -> None:
         facet TEXT NOT NULL,
         intent TEXT NOT NULL,
         format TEXT NOT NULL,
+        content_format TEXT NOT NULL DEFAULT 'text_story',
+        content_kind TEXT NOT NULL DEFAULT 'text',
         hook TEXT NOT NULL,
         media TEXT NOT NULL,
         topic TEXT NOT NULL,
@@ -269,7 +272,35 @@ def init_db() -> None:
     )
     """)
 
+    signature_columns = {row[1] for row in cur.execute("PRAGMA table_info(content_signatures)").fetchall()}
+    if "content_format" not in signature_columns:
+        cur.execute("ALTER TABLE content_signatures ADD COLUMN content_format TEXT NOT NULL DEFAULT 'text_story'")
+    if "content_kind" not in signature_columns:
+        cur.execute("ALTER TABLE content_signatures ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'text'")
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_void_signatures_created ON content_signatures(character_id, id)")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS relationship_states (
+        relationship_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        version TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS private_thoughts (
+        thought_id TEXT PRIMARY KEY,
+        speaker TEXT NOT NULL,
+        receiver TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'new',
+        created_at TEXT NOT NULL,
+        consumed_at TEXT
+    )
+    """)
 
     conn.commit()
     conn.close()
@@ -349,7 +380,7 @@ def get_recent_content_signatures(limit: int = 16) -> list[dict[str, str]]:
     conn = db()
     rows = conn.execute(
         """
-        SELECT platform, facet, intent, format, hook, media, topic, created_at
+        SELECT platform, facet, intent, format, content_format, content_kind, hook, media, topic, created_at
         FROM content_signatures
         WHERE character_id=?
         ORDER BY id DESC
@@ -366,8 +397,9 @@ def record_content_signature(plan: dict[str, str], topic: str) -> None:
     conn.execute(
         """
         INSERT INTO content_signatures(
-            character_id, platform, facet, intent, format, hook, media, topic, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            character_id, platform, facet, intent, format, content_format, content_kind,
+            hook, media, topic, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             void_character.CHARACTER_ID,
@@ -375,6 +407,8 @@ def record_content_signature(plan: dict[str, str], topic: str) -> None:
             str(plan.get("facet", "observer")),
             str(plan.get("intent", "наблюдать")),
             str(plan.get("format", "тихое наблюдение")),
+            str(plan.get("content_format", "text_story")),
+            str(plan.get("content_kind", "text")),
             str(plan.get("hook", "деталь")),
             str(plan.get("media", "кинематографический кадр")),
             topic[:1000],
@@ -416,6 +450,66 @@ def build_character_directive(topic: str, platform: str, mode: str) -> tuple[voi
         platform=platform,
     )
     return state, plan, void_character.prompt_context(state, plan)
+
+
+def load_relationship_state() -> duo_relationship.RelationshipState:
+    init_db()
+    conn = db()
+    row = conn.execute(
+        "SELECT state_json FROM relationship_states WHERE relationship_id='naz-void'"
+    ).fetchone()
+    conn.close()
+    if not row:
+        state = duo_relationship.RelationshipState()
+        save_relationship_state(state)
+        return state
+    try:
+        raw = json.loads(row["state_json"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return duo_relationship.normalize_state(raw if isinstance(raw, dict) else {})
+
+
+def save_relationship_state(state: duo_relationship.RelationshipState) -> None:
+    normalized = duo_relationship.normalize_state(state.to_dict())
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO relationship_states(relationship_id, state_json, version, updated_at)
+        VALUES ('naz-void', ?, ?, ?)
+        ON CONFLICT(relationship_id) DO UPDATE SET
+            state_json=excluded.state_json, version=excluded.version, updated_at=excluded.updated_at
+        """,
+        (json.dumps(normalized.to_dict(), ensure_ascii=False), normalized.version, now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def apply_relationship_event(event: str, *, topic: str = "", note: str = "") -> duo_relationship.RelationshipState:
+    state = duo_relationship.apply_event(load_relationship_state(), event, topic=topic, note=note)
+    save_relationship_state(state)
+    return state
+
+
+def save_private_thought(payload: dict[str, Any], status: str = "new") -> None:
+    ok, reason = duo_relationship.validate_private_thought_payload(payload)
+    if not ok:
+        raise ValueError(reason)
+    conn = db()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO private_thoughts(
+            thought_id, speaker, receiver, topic, payload_json, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["thought_id"], payload["speaker"], payload["receiver"],
+            str(payload.get("topic", ""))[:1000], json.dumps(payload, ensure_ascii=False), status, now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 def moscow_day() -> str:
@@ -803,16 +897,22 @@ def commands_text() -> str:
         "/character - current VOID facet and mood\n"
         "/character_event event - apply an event (admin)\n\n"
         "/character_set axis 0-100 - adjust state (admin)\n\n"
+        "/character_simulate 10 - preview future states without saving\n"
+        "/relationship - Naz/VOID relationship state\n"
+        "/relationship_event event topic - apply relationship event (admin)\n\n"
         "Drafts:\n"
         "/scan - find fresh signals\n"
+        "/discuss_news - start one shared Naz/VOID news conversation\n"
         "/candidates - show candidates\n"
         "/draft ID - create draft from candidate\n"
         "/drafts - show drafts\n"
         "/preview ID - show full draft\n"
         "/publish ID - publish draft to Telegram\n\n"
-        "Cross-posting:\n"
+        "Private conversation:\n"
         "/void text - prepare a private-dialogue fragment for Naz\n"
         "/publish_void text - queue a VOID fragment for Naz adaptation\n"
+        "/thought_to_naz text - send an unpublished private thought to Naz\n"
+        "/thought_from_naz text - digest an unpublished Naz thought\n"
         "/cross_status - today's cross-post counters\n"
         "/cross_to_naz ID - extract a fragment and queue it for Naz\n"
         "/cross_from_naz text - adapt Naz AI Bot post to VOID\n\n"
@@ -1489,24 +1589,32 @@ def build_void_to_naz_exchange_payload(
     if not ok:
         raise ValueError(reason)
 
-    return {
+    relationship = apply_relationship_event("challenge", topic=topic or fragment[:200])
+    payload = duo_relationship.build_private_thought_payload(
+        speaker="void",
+        thought=fragment,
+        topic=topic or "мысль после разговора",
+        relationship=relationship,
+        source_kind=source_event,
+    )
+    payload.update({
+        "id": payload["thought_id"],
         "source": "void_entity",
         "source_event": source_event,
-        "exchange_kind": "private_dialogue_fragment",
-        "topic": topic.strip(),
-        "text": fragment.strip(),
-        "ready_to_publish": False,
+        "exchange_kind": "private_thought",
+        "text": payload["thought"],
         "requires_adaptation": True,
-        "adaptation_role": "naz_interpretation_after_void_voice",
-        "opening_options": list(VOID_TO_NAZ_OPENING_OPTIONS),
+        "adaptation_role": "naz_original_reflection_after_private_conversation",
+        "opening_options": list(duo_relationship.PUBLIC_MENTION_FRAMES["naz"]),
         "forbidden_openings": list(VOID_TO_NAZ_FORBIDDEN_OPENINGS),
         "adaptation_brief": (
-            "Сначала дай зрителю услышать голос Void, затем расшифруй его от первого лица Naz. "
-            "Подавай это как вынесенный наружу фрагмент частного закулисного диалога, не как репост. "
-            "Вводные чередуй; особенно поддерживай вайб «Из тёмного угла прилетело:»."
+            "Naz может естественно упомянуть разговор с VOID, но не цитирует и не репостит мысль. "
+            "Он выносит в канал собственное новое размышление в рубрике «Мысли после разговора»."
         ),
         "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
-    }
+    })
+    save_private_thought(payload, status="queued")
+    return payload
 
 
 def queue_void_fragment_for_naz(
@@ -1529,16 +1637,38 @@ def queue_void_fragment_for_naz(
     return path
 
 
-def build_crosspost_from_naz_sync(source_text: str) -> dict[str, str]:
+def build_crosspost_from_naz_sync(source_text: str, payload: dict[str, Any] | None = None) -> dict[str, str]:
+    if isinstance((payload or {}).get("relationship_snapshot"), dict):
+        save_relationship_state(duo_relationship.normalize_state(payload["relationship_snapshot"]))
+    relationship = apply_relationship_event("challenge", topic=str((payload or {}).get("topic") or source_text[:200]))
+    if payload and payload.get("schema") == "private_thought.v1":
+        private_payload = payload
+    else:
+        private_payload = duo_relationship.build_private_thought_payload(
+            speaker="naz",
+            thought=source_text,
+            topic=str((payload or {}).get("topic") or "мысль после разговора"),
+            relationship=relationship,
+            source_kind=str((payload or {}).get("source_event") or "manual_private_thought"),
+        )
+    save_private_thought(private_payload, status="received")
+    character = load_character_state()
+    reflection = duo_relationship.reflection_brief(
+        receiver="void",
+        payload=private_payload,
+        relationship=relationship,
+        receiver_character_context=void_character.dialogue_context(character),
+    )
     instructions = f"""
-You adapt a Naz AI Bot post for the VOID Signals Telegram channel.
+You write an original VOID reflection after a private conversation with Naz.
 
 VOID core:
 {VOID_CORE_PROMPT}
 
 Task:
-- Do not repost literally.
-- Translate practical AI/tool content into a VOID observation about the human in a digital world.
+- Never repost or quote Naz literally.
+- You may naturally mention Naz or the conversation.
+- Digest the practical AI/tool thought into a new VOID observation about the human in a digital world.
 - Keep it calm, precise, slightly ironic.
 - Comment in first person as VOID: "я вижу", "для меня это сигнал", "я бы оставил здесь одну мысль".
 - Do not write "VOID thinks", "VOID считает", "комментарий VOID", or describe VOID in third person.
@@ -1551,13 +1681,16 @@ MODE: one of signal, observation, future, vault
 POST: final VOID post
 """.strip()
 
-    raw = call_ai(instructions, f"NAZ_AI_BOT_POST:\n{source_text}", max_output_tokens=1100, model=OPENAI_POST_MODEL)
+    raw = call_ai(instructions, reflection, max_output_tokens=1100, model=OPENAI_POST_MODEL)
     title, post = parse_ai_output(raw)
     mode_match = re.search(r"MODE\s*:\s*(signal|observation|future|vault)", raw, flags=re.I)
     mode = mode_match.group(1).lower() if mode_match else "observation"
     post = clean_source_lines(post)
-    if "Источник:" not in post:
-        post = f"{post.rstrip()}\n\nИсточник: Naz AI Bot"
+    if not post.startswith("МЫСЛИ ПОСЛЕ РАЗГОВОРА"):
+        post = f"МЫСЛИ ПОСЛЕ РАЗГОВОРА\n\n{post}"
+    original, originality_reason = duo_relationship.reflection_is_original(private_payload["thought"], post)
+    if not original:
+        raise ValueError(f"reflection blocked: {originality_reason}")
     return {"title": title, "mode": mode, "post": trim_post(post, limit=3200)}
 
 
@@ -1619,7 +1752,7 @@ async def process_naz_to_void_exchange(bot: Bot) -> None:
             if len(source_text) < 40:
                 raise ValueError("empty or too short Naz payload")
 
-            adapted = await asyncio.to_thread(build_crosspost_from_naz_sync, source_text)
+            adapted = await asyncio.to_thread(build_crosspost_from_naz_sync, source_text, payload)
             draft_id = save_draft(
                 adapted["mode"],
                 adapted["title"],
@@ -1682,7 +1815,7 @@ def quality_check(post: str) -> tuple[bool, str]:
         return False, "слишком длинно"
     if too_much_english(post):
         return False, "слишком много английского"
-    if "Источник:" not in post and "manual://" not in post:
+    if "Источник:" not in post and "manual://" not in post and "МЫСЛИ ПОСЛЕ РАЗГОВОРА" not in post:
         return False, "нет источника"
     return True, "ok"
 
@@ -1755,9 +1888,9 @@ def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
     }
 
     structure.setdefault("signal", structure["manual"])
-    structure.setdefault("frequency", "1. ???????: {rubric}\n2. ?????????, ????, ????? ??? ?????????? ?????.\n3. ??? ??? ?????? ? ????????? ? ?????????.\n4. VOID COMMENT: ???????, ??? ????????? ??????.")
-    structure.setdefault("archive", "1. ???????: {rubric}\n2. 3-5 ????????? ????????.\n3. ????? ?????: ??? ????? ???? ????????? ??????.\n4. VOID COMMENT: ????? ???????? ??? ??????.")
-    structure.setdefault("vault", "1. ???????: {rubric}\n2. ??????? ?????.\n3. ?????? ??? ????? ??? ???????? ? ???????? ?????.\n4. ??? ????? ?????????.\n5. VOID COMMENT: ??? ??????, ?? ? ?????.")
+    structure.setdefault("frequency", "1. Рубрика: {rubric}\n2. Атмосфера, звук, город или внутреннее состояние.\n3. Что это говорит о человеке и времени.\n4. VOID COMMENT: коротко, без лишнего пафоса.")
+    structure.setdefault("archive", "1. Рубрика: {rubric}\n2. Три-пять коротких сигналов.\n3. Общая нить: что связывает их и почему это важно человеку.\n4. VOID COMMENT: одна точная фраза без морали.")
+    structure.setdefault("vault", "1. Рубрика: {rubric}\n2. Глубокая, но конкретная мысль.\n3. Почему её стоит сохранить в памяти VOID.\n4. Что человек обычно перестаёт замечать.\n5. VOID COMMENT: тихо, точно, без позы мудреца.")
 
     return f"""
 {VOID_CORE_PROMPT}
@@ -2400,11 +2533,23 @@ async def autopost_once(bot: Bot) -> str:
         return "Автопостинг: новых сигналов не найдено."
 
     for item in items[:10]:
+        state, editorial_plan, character_directive = await asyncio.to_thread(
+            build_character_directive,
+            item.get("title", "news"),
+            "telegram",
+            item.get("mode", "news"),
+        )
+        attitude = duo_relationship.news_attitude(
+            "void", item.get("title", ""), item.get("summary", ""),
+            tension=state.tension, curiosity=state.curiosity,
+        )
         content = (
             f"Заголовок: {item['title']}\n"
             f"Описание: {item.get('summary', '')}\n"
             f"Источник: {item.get('source_name', '')}\n"
-            f"Ссылка: {item.get('url', '')}"
+            f"Ссылка: {item.get('url', '')}\n"
+            f"Позиция VOID: {attitude['stance']} — {attitude['tone']}\n\n"
+            f"{character_directive}"
         )
         draft_id = await generate_and_save(
             item.get("mode", "news"),
@@ -2416,6 +2561,7 @@ async def autopost_once(bot: Bot) -> str:
         draft = get_draft(draft_id)
         ok, reason = quality_check(draft["post"] if draft else "")
         if ok:
+            await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", "news"))
             result = await publish_draft(bot, draft_id)
             return f"Автопостинг: {result}"
         else:
@@ -2815,6 +2961,44 @@ async def character_set_command(message: Message):
     await message.answer(void_character.format_status(state))
 
 
+@router.message(Command("character_simulate"))
+async def character_simulate_command(message: Message):
+    parts = (message.text or "").split()
+    try:
+        count = max(1, min(30, int(parts[1]))) if len(parts) > 1 else 10
+    except ValueError:
+        count = 10
+    state = await asyncio.to_thread(load_character_state)
+    recent = await asyncio.to_thread(get_recent_content_signatures, 16)
+    plans = void_character.simulate(state, recent, count=count)
+    lines = ["VOID simulation · состояние базы не изменено", ""]
+    for index, plan in enumerate(plans, 1):
+        lines.append(
+            f"{index}. {plan['event']} → {plan['facet']} · {plan['state']}\n"
+            f"   {plan['content_format_label']} / {plan['format']} / {plan['hook']}"
+        )
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("relationship"))
+async def relationship_command(message: Message):
+    state = await asyncio.to_thread(load_relationship_state)
+    await message.answer(duo_relationship.format_status(state))
+
+
+@router.message(Command("relationship_event"))
+async def relationship_event_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or parts[1] not in duo_relationship.EVENT_DELTAS:
+        await message.answer("Используй: /relationship_event <event> [topic]\n" + ", ".join(sorted(duo_relationship.EVENT_DELTAS)))
+        return
+    state = await asyncio.to_thread(apply_relationship_event, parts[1], topic=parts[2] if len(parts) > 2 else "")
+    await message.answer(duo_relationship.format_status(state))
+
+
 @router.message(Command("persona"))
 async def persona_command(message: Message):
     await message.answer(
@@ -2861,6 +3045,58 @@ async def news_command(message: Message):
     await message.answer("Ищу новости. Сейчас попробую найти сигнал, а не просто очередной пресс-релиз с галстуком.")
     saved, drafts = await make_news_drafts(limit=5)
     await message.answer(f"Готово. Кандидатов: {saved}. Черновиков: {drafts}.\n\n/drafts — посмотреть")
+
+
+@router.message(Command("discuss_news"))
+async def discuss_news_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    await message.answer("Ищу один общий сигнал для приватного разговора Naz и VOID.")
+    items = await asyncio.to_thread(fetch_news)
+    if not items:
+        await message.answer("Свежего сигнала не нашлось.")
+        return
+    item = items[0]
+    state, editorial_plan, directive = await asyncio.to_thread(
+        build_character_directive, item.get("title", "news"), "telegram", item.get("mode", "news")
+    )
+    attitude = duo_relationship.news_attitude(
+        "void", item.get("title", ""), item.get("summary", ""),
+        tension=state.tension, curiosity=state.curiosity,
+    )
+    private_material = (
+        f"Новость: {item.get('title', '')}. "
+        f"Факты: {item.get('summary', '')[:700]}. "
+        f"Моя первичная реакция: {attitude['tone']}."
+    )
+    try:
+        private_thought = await asyncio.to_thread(build_void_fragment_for_naz_sync, private_material)
+        exchange_path = queue_void_fragment_for_naz(
+            private_thought,
+            source_event="shared_news_discussion",
+            topic=item.get("title", ""),
+        )
+        apply_relationship_event("news_discussion", topic=item.get("title", ""))
+    except Exception as exc:
+        await message.answer(f"Не смог начать разговор: {exc}")
+        return
+    content = (
+        f"Заголовок: {item.get('title', '')}\nОписание: {item.get('summary', '')}\n"
+        f"Источник: {item.get('source_name', '')}\nСсылка: {item.get('url', '')}\n"
+        f"Позиция VOID: {attitude['stance']} — {attitude['tone']}\n\n{directive}"
+    )
+    draft_id = await generate_and_save(
+        item.get("mode", "news"), content, item.get("frequency", "HUMAN"),
+        item.get("source_name", ""), item.get("url", ""),
+    )
+    await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", "news"))
+    await message.answer(
+        f"Общий сигнал: {item.get('title', '')}\n"
+        f"VOID-черновик: #{draft_id}\n"
+        f"Приватная мысль для Naz: {exchange_path.name if exchange_path else 'exchange disabled'}\n"
+        "Naz получит не пост VOID, а отдельный импульс из разговора."
+    )
 
 
 @router.message(Command("candidates"))
@@ -3057,6 +3293,9 @@ async def preview_command(message: Message):
     draft = get_draft(int(parts[1]))
     if not draft:
         await message.answer("Черновик не найден.")
+        return
+    if draft["published_at"]:
+        await message.answer("Этот текст уже опубликован. Для разговора нужна новая неопубликованная мысль VOID.")
         return
 
     await message.answer(draft["post"])
@@ -3267,6 +3506,7 @@ async def void_crosspost_draft_command(message: Message):
 
 
 @router.message(Command("publish_void"))
+@router.message(Command("thought_to_naz"))
 async def publish_void_crosspost_command(message: Message):
     if not is_admin(message):
         await message.answer(admin_required())
@@ -3278,7 +3518,7 @@ async def publish_void_crosspost_command(message: Message):
 
     fragment = extract_void_fragment_payload(message)
     if len(fragment) < 20:
-        await message.answer("Используй: /publish_void текст поста VOID или ответь /publish_void на сообщение VOID.")
+        await message.answer("Используй: /thought_to_naz неопубликованная мысль VOID для Naz.")
         return
 
     ok, reason = validate_void_fragment_for_naz(fragment)
@@ -3341,6 +3581,7 @@ async def cross_to_naz_command(message: Message):
 
 
 @router.message(Command("cross_from_naz"))
+@router.message(Command("thought_from_naz"))
 async def cross_from_naz_command(message: Message, bot: Bot):
     if not is_admin(message):
         await message.answer(admin_required())
@@ -3360,10 +3601,10 @@ async def cross_from_naz_command(message: Message, bot: Bot):
         ).strip()
 
     if len(source_text) < 20:
-        await message.answer("Используй: /cross_from_naz текст поста Naz AI Bot")
+        await message.answer("Используй: /thought_from_naz неопубликованная мысль Naz")
         return
 
-    await message.answer("Перевожу пост Naz AI Bot в голос VOID и публикую.")
+    await message.answer("VOID переваривает приватную мысль Naz и собирает собственный выпуск рубрики.")
     adapted = await asyncio.to_thread(build_crosspost_from_naz_sync, source_text)
     draft_id = save_draft(
         adapted["mode"],
