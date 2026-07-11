@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 import character_state as void_character
 import delegated_messaging
 import duo_relationship
+import gaming_vertical
 from void_core import (
     CONTENT_PLAN,
     MODE_RUBRICS,
@@ -1320,6 +1321,10 @@ def commands_text() -> str:
         "/drafts - show drafts\n"
         "/preview ID - show full draft\n"
         "/publish ID - publish draft to Telegram\n\n"
+        "Gaming:\n"
+        "/gaming topic - create a VOID gaming draft\n"
+        "/gaming_commercial topic - gaming draft with a soft product test\n"
+        "/gaming_plan topic - preview rubric and format\n\n"
         "Private conversation:\n"
         "/void text - prepare a private-dialogue fragment for Naz\n"
         "/publish_void text - queue a VOID fragment for Naz adaptation\n"
@@ -3739,6 +3744,60 @@ async def future_command(message: Message):
         await message.answer("Используй: /future тема будущего")
         return
     await manual_like(message, "future", parts[1])
+
+
+@router.message(Command("gaming_plan"))
+async def gaming_plan_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    topic = parts[1].strip() if len(parts) > 1 else "игры как человеческое пространство"
+    plan = gaming_vertical.plan_gaming_content("void", topic, get_recent_content_signatures(), platform="telegram")
+    await message.answer(
+        f"🎮 Игровой план VOID\n\nРубрика: {plan['intent']}\nФормат: {plan['format']}\n"
+        f"Коммерческий угол: {plan['commercial_angle']}\nТема: {topic}"
+    )
+
+
+async def gaming_draft(message: Message, *, commercial: bool = False) -> None:
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or len(parts[1].strip()) < 3:
+        await message.answer("Используй: /gaming тема игры, механики или явления")
+        return
+    topic = parts[1].strip()
+    plan = gaming_vertical.plan_gaming_content(
+        "void", topic, get_recent_content_signatures(), platform="telegram", commercial=commercial
+    )
+    instructions = f"{VOID_CORE_PROMPT}\n\n{gaming_vertical.prompt_context('void', plan)}"
+    await message.answer(f"🎮 {plan['intent']} · {plan['format']}. Собираю игровой черновик.")
+    try:
+        post = await asyncio.to_thread(call_ai, instructions, f"Тема игрового текста: {topic}", 700, OPENAI_POST_MODEL)
+        draft_id = save_draft(
+            "gaming", f"Gaming: {topic[:120]}", post,
+            "VOID gaming vertical", f"manual://gaming/{now_iso()}", "GAMING", 7,
+        )
+        record_content_signature(plan, topic)
+    except Exception as exc:
+        await message.answer(f"Игровой черновик не получился: {type(exc).__name__}: {exc}")
+        return
+    await message.answer(
+        f"Черновик создан: #{draft_id}\n/preview {draft_id}\n/publish {draft_id}\n\n"
+        "Игровая автопубликация пока выключена."
+    )
+
+
+@router.message(Command("gaming"))
+async def gaming_command(message: Message):
+    await gaming_draft(message, commercial=False)
+
+
+@router.message(Command("gaming_commercial"))
+async def gaming_commercial_command(message: Message):
+    await gaming_draft(message, commercial=True)
 
 
 @router.message(Command("archive"))
