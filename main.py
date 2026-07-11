@@ -28,6 +28,7 @@ from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton
 from dotenv import load_dotenv
 
 import character_state as void_character
+import delegated_messaging
 import duo_relationship
 from void_core import (
     CONTENT_PLAN,
@@ -83,6 +84,7 @@ except ZoneInfoNotFoundError:
 router = Router()
 auto_task: asyncio.Task | None = None
 exchange_task: asyncio.Task | None = None
+pending_delegation_purposes: dict[int, str] = {}
 
 
 RSS_SOURCES = [
@@ -301,7 +303,329 @@ def init_db() -> None:
         consumed_at TEXT
     )
     """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS saved_contacts (
+        chat_id INTEGER PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL,
+        alias TEXT,
+        display_name TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_name',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(owner_user_id, alias)
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS contact_naming_requests (
+        prompt_message_id INTEGER PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL,
+        contact_chat_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS reachable_peers (
+        chat_id INTEGER PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS delegation_invites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token TEXT NOT NULL UNIQUE,
+        owner_user_id INTEGER NOT NULL,
+        character_id TEXT NOT NULL,
+        contact_label TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'waiting',
+        contact_chat_id INTEGER,
+        contact_name TEXT,
+        max_turns INTEGER NOT NULL DEFAULT 20,
+        turns_used INTEGER NOT NULL DEFAULT 0,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS delegated_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        delegation_id INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS delegation_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_user_id INTEGER NOT NULL,
+        character_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        turns_used INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_delegation_contact ON delegation_invites(contact_chat_id, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_delegated_messages ON delegated_messages(delegation_id, id)")
 
+    conn.commit()
+    conn.close()
+
+
+def create_delegation_invite(owner_user_id: int, contact_label: str, purpose: str, token: str, expires_at: str) -> int:
+    init_db()
+    conn = db()
+    active = conn.execute(
+        "SELECT id FROM delegation_invites WHERE owner_user_id=? AND status IN ('accepted','active','paused')",
+        (owner_user_id,),
+    ).fetchone()
+    if active:
+        conn.close()
+        raise ValueError(f"Сначала заверши текущее поручение #{active['id']}.")
+    stale = conn.execute("SELECT id FROM delegation_invites WHERE owner_user_id=?", (owner_user_id,)).fetchall()
+    for row in stale:
+        conn.execute("DELETE FROM delegated_messages WHERE delegation_id=?", (row["id"],))
+    conn.execute("DELETE FROM delegation_invites WHERE owner_user_id=?", (owner_user_id,))
+    now = now_iso()
+    cur = conn.execute(
+        """INSERT INTO delegation_invites(
+            token, owner_user_id, character_id, contact_label, purpose, status,
+            max_turns, expires_at, created_at, updated_at
+        ) VALUES (?, ?, 'void', ?, ?, 'waiting', 20, ?, ?, ?)""",
+        (token, owner_user_id, contact_label[:200], purpose[:1200], expires_at, now, now),
+    )
+    delegation_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return delegation_id
+
+
+def remember_reachable_peer(chat_id: int, display_name: str, expires_at: str) -> None:
+    init_db()
+    conn = db()
+    conn.execute("DELETE FROM reachable_peers WHERE expires_at<=?", (now_iso(),))
+    conn.execute(
+        """INSERT INTO reachable_peers(chat_id, display_name, expires_at, created_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET display_name=excluded.display_name, expires_at=excluded.expires_at""",
+        (chat_id, display_name[:200], expires_at, now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def register_contact_arrival(owner_user_id: int, chat_id: int, display_name: str) -> bool:
+    init_db()
+    conn = db()
+    row = conn.execute("SELECT status FROM saved_contacts WHERE chat_id=?", (chat_id,)).fetchone()
+    if row:
+        conn.close()
+        return False
+    now = now_iso()
+    conn.execute(
+        "INSERT INTO saved_contacts(chat_id, owner_user_id, display_name, status, created_at, updated_at) VALUES (?, ?, ?, 'pending_name', ?, ?)",
+        (chat_id, owner_user_id, display_name[:200], now, now),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def save_contact_naming_request(prompt_message_id: int, owner_user_id: int, contact_chat_id: int) -> None:
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO contact_naming_requests(prompt_message_id, owner_user_id, contact_chat_id, created_at) VALUES (?, ?, ?, ?)",
+        (prompt_message_id, owner_user_id, contact_chat_id, now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def name_contact_from_reply(prompt_message_id: int, owner_user_id: int, alias: str) -> dict | None:
+    clean_alias = " ".join((alias or "").split()).strip()[:80]
+    if not clean_alias:
+        return None
+    conn = db()
+    request = conn.execute(
+        "SELECT * FROM contact_naming_requests WHERE prompt_message_id=? AND owner_user_id=?",
+        (prompt_message_id, owner_user_id),
+    ).fetchone()
+    if not request:
+        conn.close()
+        return None
+    duplicate = conn.execute(
+        "SELECT chat_id FROM saved_contacts WHERE owner_user_id=? AND lower(alias)=lower(?) AND chat_id<>?",
+        (owner_user_id, clean_alias, request["contact_chat_id"]),
+    ).fetchone()
+    if duplicate:
+        conn.close()
+        raise ValueError("Такое имя уже занято другим контактом.")
+    conn.execute(
+        "UPDATE saved_contacts SET alias=?, status='saved', updated_at=? WHERE chat_id=?",
+        (clean_alias, now_iso(), request["contact_chat_id"]),
+    )
+    conn.execute("DELETE FROM contact_naming_requests WHERE prompt_message_id=?", (prompt_message_id,))
+    row = conn.execute("SELECT * FROM saved_contacts WHERE chat_id=?", (request["contact_chat_id"],)).fetchone()
+    conn.commit()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_saved_contacts(owner_user_id: int) -> list[dict]:
+    init_db()
+    conn = db()
+    rows = conn.execute(
+        "SELECT chat_id, alias, display_name FROM saved_contacts WHERE owner_user_id=? AND status='saved' ORDER BY alias",
+        (owner_user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def save_named_contact(owner_user_id: int, chat_id: int, display_name: str, alias: str) -> dict:
+    clean_alias = " ".join((alias or "").split()).strip()[:80]
+    if not clean_alias:
+        raise ValueError("Имя контакта пустое.")
+    init_db()
+    conn = db()
+    duplicate = conn.execute(
+        "SELECT chat_id FROM saved_contacts WHERE owner_user_id=? AND lower(alias)=lower(?) AND chat_id<>?",
+        (owner_user_id, clean_alias, chat_id),
+    ).fetchone()
+    if duplicate:
+        conn.close()
+        raise ValueError("Такое имя уже занято другим контактом.")
+    now = now_iso()
+    conn.execute(
+        """INSERT INTO saved_contacts(chat_id, owner_user_id, alias, display_name, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'saved', ?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET owner_user_id=excluded.owner_user_id,
+               alias=excluded.alias, display_name=excluded.display_name, status='saved', updated_at=excluded.updated_at""",
+        (chat_id, owner_user_id, clean_alias, display_name[:200], now, now),
+    )
+    row = conn.execute("SELECT * FROM saved_contacts WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return dict(row)
+
+
+def list_previous_contact_ids(owner_user_id: int, limit: int = 30) -> list[int]:
+    init_db()
+    conn = db()
+    rows = conn.execute(
+        """SELECT DISTINCT user_id FROM dialog_messages
+           WHERE user_id<>? AND user_id NOT IN (
+               SELECT chat_id FROM saved_contacts WHERE owner_user_id=? AND status='saved'
+           ) ORDER BY user_id DESC LIMIT ?""",
+        (owner_user_id, owner_user_id, max(1, limit)),
+    ).fetchall()
+    conn.close()
+    return [int(row["user_id"]) for row in rows]
+
+
+def get_reachable_peer(chat_id: int) -> dict | None:
+    init_db()
+    conn = db()
+    conn.execute("DELETE FROM reachable_peers WHERE expires_at<=?", (now_iso(),))
+    row = conn.execute("SELECT * FROM reachable_peers WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_delegation(delegation_id: int) -> dict | None:
+    init_db()
+    conn = db()
+    row = conn.execute("SELECT * FROM delegation_invites WHERE id=?", (delegation_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def accept_delegation_invite(token: str, contact_chat_id: int, contact_name: str) -> dict | None:
+    init_db()
+    conn = db()
+    now = now_iso()
+    row = conn.execute(
+        "SELECT * FROM delegation_invites WHERE token=? AND status='waiting' AND expires_at>?",
+        (token, now),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+    conn.execute(
+        "UPDATE delegation_invites SET status='accepted', contact_chat_id=?, contact_name=?, updated_at=? WHERE id=?",
+        (contact_chat_id, contact_name[:200], now, row["id"]),
+    )
+    conn.commit()
+    conn.close()
+    result = dict(row)
+    result.update(status="accepted", contact_chat_id=contact_chat_id, contact_name=contact_name[:200], updated_at=now)
+    return result
+
+
+def set_delegation_status(delegation_id: int, status: str) -> None:
+    conn = db()
+    conn.execute("UPDATE delegation_invites SET status=?, updated_at=? WHERE id=?", (status, now_iso(), delegation_id))
+    conn.commit()
+    conn.close()
+
+
+def get_active_delegation(contact_chat_id: int) -> dict | None:
+    init_db()
+    conn = db()
+    row = conn.execute(
+        """SELECT * FROM delegation_invites WHERE contact_chat_id=? AND status='active' AND expires_at>?
+           ORDER BY id DESC LIMIT 1""",
+        (contact_chat_id, now_iso()),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_delegated_message(delegation_id: int, role: str, content: str) -> None:
+    conn = db()
+    conn.execute(
+        "INSERT INTO delegated_messages(delegation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+        (delegation_id, role, content[:8000], now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_delegated_history(delegation_id: int, limit: int = 10) -> list[dict[str, str]]:
+    conn = db()
+    rows = conn.execute(
+        "SELECT role, content FROM delegated_messages WHERE delegation_id=? ORDER BY id DESC LIMIT ?",
+        (delegation_id, max(1, limit)),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in reversed(rows)]
+
+
+def increment_delegation_turns(delegation_id: int) -> int:
+    conn = db()
+    conn.execute("UPDATE delegation_invites SET turns_used=turns_used+1, updated_at=? WHERE id=?", (now_iso(), delegation_id))
+    row = conn.execute("SELECT turns_used FROM delegation_invites WHERE id=?", (delegation_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return int(row["turns_used"]) if row else 0
+
+
+def purge_delegation(delegation_id: int, outcome: str) -> None:
+    conn = db()
+    row = conn.execute("SELECT * FROM delegation_invites WHERE id=?", (delegation_id,)).fetchone()
+    if row:
+        conn.execute(
+            "INSERT INTO delegation_audit(owner_user_id, character_id, outcome, turns_used, created_at) VALUES (?, ?, ?, ?, ?)",
+            (row["owner_user_id"], row["character_id"], outcome[:80], row["turns_used"], now_iso()),
+        )
+        conn.execute("DELETE FROM delegated_messages WHERE delegation_id=?", (delegation_id,))
+        if row["contact_chat_id"] is not None:
+            conn.execute("DELETE FROM reachable_peers WHERE chat_id=?", (row["contact_chat_id"],))
+        conn.execute("DELETE FROM delegation_invites WHERE id=?", (delegation_id,))
     conn.commit()
     conn.close()
 
@@ -885,6 +1209,94 @@ def welcome_text() -> str:
     )
 
 
+def delegation_from_row(row: dict[str, Any]) -> delegated_messaging.Delegation:
+    return delegated_messaging.Delegation(
+        character_id=str(row["character_id"]), owner_user_id=int(row["owner_user_id"]),
+        contact_chat_id=int(row["contact_chat_id"]),
+        contact_name=str(row.get("contact_name") or row.get("contact_label") or "Собеседник"),
+        purpose=str(row["purpose"]), status=str(row["status"]), max_turns=int(row["max_turns"]),
+        turns_used=int(row["turns_used"]), expires_at=str(row["expires_at"]),
+    )
+
+
+async def ensure_contact_named(message: Message) -> None:
+    if not message.from_user or not ADMIN_ID or message.from_user.id == ADMIN_ID:
+        return
+    if not register_contact_arrival(ADMIN_ID, message.from_user.id, message.from_user.full_name):
+        return
+    prompt = await message.bot.send_message(
+        ADMIN_ID,
+        f"Мне впервые написал {message.from_user.full_name} (Telegram ID {message.from_user.id}).\n"
+        "Как записать контакт? Ответь на это сообщение одним именем, например: Диман",
+    )
+    save_contact_naming_request(prompt.message_id, ADMIN_ID, message.from_user.id)
+
+
+async def start_saved_contact_delegation(message: Message, contact: dict[str, Any], purpose: str) -> None:
+    token = delegated_messaging.invite_token()
+    expires = (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds")
+    delegation_id = create_delegation_invite(message.from_user.id, str(contact["alias"]), purpose, token, expires)
+    row = accept_delegation_invite(token, int(contact["chat_id"]), str(contact["alias"]))
+    if not row:
+        raise RuntimeError("Не удалось привязать сохранённый контакт.")
+    delegation = delegation_from_row(row)
+    intro = delegated_messaging.introduction(delegation)
+    await message.bot.send_message(delegation.contact_chat_id, intro)
+    save_delegated_message(delegation_id, "assistant", intro)
+    set_delegation_status(delegation_id, "active")
+    await message.answer(
+        f"Нашёл {contact['alias']} и начал поручение #{delegation_id}. После разговора удалю сессию и переписку."
+    )
+
+
+async def handle_delegated_reply(message: Message, text: str) -> bool:
+    if not message.from_user:
+        return False
+    row = get_active_delegation(message.from_user.id)
+    if not row:
+        return False
+    delegation_id = int(row["id"])
+    delegation = delegation_from_row(row)
+    if delegated_messaging.is_stop(text):
+        await message.answer("Остановился. Переписка этой сессии удалена.")
+        await message.bot.send_message(delegation.owner_user_id, f"Собеседник остановил поручение #{delegation_id}.")
+        purge_delegation(delegation_id, "contact_stopped")
+        return True
+    risks = delegated_messaging.assess_risk(text)
+    save_delegated_message(delegation_id, "contact", text)
+    if risks:
+        set_delegation_status(delegation_id, "paused")
+        await message.answer("Тут нужно подтверждение Назара. Я поставил разговор на паузу.")
+        await message.bot.send_message(
+            delegation.owner_user_id,
+            f"Поручение #{delegation_id} на паузе ({', '.join(risks)}). Ответить: /delegate_reply {delegation_id} текст",
+        )
+        return True
+    history = get_delegated_history(delegation_id, 24)
+    prompt = delegated_messaging.system_prompt(
+        delegation=delegation,
+        character_context=void_character.dialogue_context(load_character_state()),
+        history=history,
+    )
+    reply = await asyncio.to_thread(call_ai, prompt, text, 500, OPENAI_DIALOG_MODEL)
+    if reply == "OWNER_CONFIRMATION_REQUIRED" or delegated_messaging.assess_risk(reply):
+        set_delegation_status(delegation_id, "paused")
+        await message.answer("Мне нужно свериться с Назаром. Поставил разговор на паузу.")
+        await message.bot.send_message(
+            delegation.owner_user_id,
+            f"VOID остановил поручение #{delegation_id}. Ответить: /delegate_reply {delegation_id} текст",
+        )
+        return True
+    await message.answer(reply)
+    save_delegated_message(delegation_id, "assistant", reply)
+    turns = increment_delegation_turns(delegation_id)
+    if turns >= delegation.max_turns:
+        await message.answer("На этом поручение завершено. Спасибо за разговор.")
+        await message.bot.send_message(delegation.owner_user_id, f"Поручение #{delegation_id} завершено по лимиту.")
+        purge_delegation(delegation_id, "turn_limit")
+    return True
+
+
 def commands_text() -> str:
     return (
         "VOID commands\n\n"
@@ -913,6 +1325,10 @@ def commands_text() -> str:
         "/publish_void text - queue a VOID fragment for Naz adaptation\n"
         "/thought_to_naz text - send an unpublished private thought to Naz\n"
         "/thought_from_naz text - digest an unpublished Naz thought\n"
+        "Напиши Диману, чтобы… - начать разговор с сохранённым контактом\n"
+        "/contact_candidates - прежние незаписанные собеседники\n"
+        "/contact_add ID Имя - сохранить прежнего собеседника\n"
+        "/delegate_stop ID - завершить поручение\n"
         "/cross_status - today's cross-post counters\n"
         "/cross_to_naz ID - extract a fragment and queue it for Naz\n"
         "/cross_from_naz text - adapt Naz AI Bot post to VOID\n\n"
@@ -2873,6 +3289,29 @@ async def auto_loop(bot: Bot) -> None:
 
 @router.message(CommandStart())
 async def start(message: Message):
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].startswith("delegate_"):
+        token = parts[1].removeprefix("delegate_")
+        row = accept_delegation_invite(token, message.from_user.id, message.from_user.full_name)
+        if not row:
+            await message.answer("Ссылка недействительна, уже использована или устарела.")
+            return
+        delegation = delegation_from_row(row)
+        intro = delegated_messaging.introduction(delegation)
+        await message.answer(intro)
+        save_delegated_message(int(row["id"]), "assistant", intro)
+        set_delegation_status(int(row["id"]), "active")
+        await message.bot.send_message(
+            delegation.owner_user_id,
+            f"{delegation.contact_name} открыл(а) ссылку. VOID начал поручение #{row['id']}.",
+        )
+        return
+    if message.from_user.id != ADMIN_ID:
+        remember_reachable_peer(
+            message.from_user.id, message.from_user.full_name,
+            (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+        )
+        await ensure_contact_named(message)
     set_dialog_enabled(message.from_user.id, True)
     await message.answer(
         welcome_text(),
@@ -2997,6 +3436,87 @@ async def relationship_event_command(message: Message):
         return
     state = await asyncio.to_thread(apply_relationship_event, parts[1], topic=parts[2] if len(parts) > 2 else "")
     await message.answer(duo_relationship.format_status(state))
+
+
+@router.message(Command("delegate_stop"))
+async def delegate_stop_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /delegate_stop ID")
+        return
+    delegation_id = int(parts[1])
+    row = get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != message.from_user.id:
+        await message.answer("Поручение не найдено.")
+        return
+    if row.get("contact_chat_id"):
+        await message.bot.send_message(int(row["contact_chat_id"]), "Разговор завершён. Спасибо.")
+    purge_delegation(delegation_id, "owner_stopped")
+    await message.answer("Поручение завершено; сессия и переписка удалены, имя осталось в адресной книге.")
+
+
+@router.message(Command("delegate_reply"))
+async def delegate_reply_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        await message.answer("Использование: /delegate_reply ID текст")
+        return
+    delegation_id = int(parts[1])
+    row = get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != message.from_user.id or row["status"] != "paused":
+        await message.answer("Нет приостановленного поручения с таким ID.")
+        return
+    await message.bot.send_message(int(row["contact_chat_id"]), parts[2])
+    save_delegated_message(delegation_id, "assistant", parts[2])
+    set_delegation_status(delegation_id, "active")
+    await message.answer("Твой ответ отправлен; VOID может продолжить в рамках поручения.")
+
+
+@router.message(Command("contact_add"))
+async def contact_add_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Использование: /contact_add TELEGRAM_ID Имя")
+        return
+    chat_id = int(parts[1])
+    try:
+        chat = await message.bot.get_chat(chat_id)
+        display_name = " ".join(part for part in [chat.first_name or "", chat.last_name or ""] if part).strip()
+        row = save_named_contact(message.from_user.id, chat_id, display_name or str(chat_id), parts[2])
+    except Exception as exc:
+        await message.answer(f"Не записал контакт: {exc}")
+        return
+    await message.answer(f"Записал: {row['alias']} → {row['display_name']} ({chat_id}).")
+
+
+@router.message(Command("contact_candidates"))
+async def contact_candidates_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    ids = list_previous_contact_ids(message.from_user.id)
+    if not ids:
+        await message.answer("Незаписанных прежних собеседников не нашёл.")
+        return
+    lines = ["Ранее писали боту:"]
+    for chat_id in ids:
+        try:
+            chat = await message.bot.get_chat(chat_id)
+            name = " ".join(part for part in [chat.first_name or "", chat.last_name or ""] if part).strip()
+        except Exception:
+            name = "имя недоступно"
+        lines.append(f"• {chat_id} — {name}")
+    lines.append("\nЗаписать: /contact_add TELEGRAM_ID Имя")
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("persona"))
@@ -3823,6 +4343,48 @@ async def free_text_handler(message: Message):
     chat_id = message.chat.id
     user_id = message.from_user.id
     text = (message.text or "").strip()
+
+    if await handle_delegated_reply(message, text):
+        return
+
+    if is_admin(message) and message.reply_to_message:
+        try:
+            named = name_contact_from_reply(message.reply_to_message.message_id, user_id, text)
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        if named:
+            await message.answer(
+                f"Записал: {named['alias']} → {named['display_name']}. Теперь можно сказать: «Напиши {named['alias']}, чтобы…»"
+            )
+            return
+
+    if is_admin(message):
+        try:
+            request = delegated_messaging.parse_delegation_request(text)
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        if request:
+            spoken_alias, purpose = request
+            contacts = list_saved_contacts(user_id)
+            contact = delegated_messaging.resolve_saved_contact(contacts, spoken_alias)
+            if not contact:
+                aliases = ", ".join(str(item["alias"]) for item in contacts) or "пока пусто"
+                await message.answer(f"Не нашёл один точный контакт «{spoken_alias}». Сохранены: {aliases}.")
+                return
+            try:
+                await start_saved_contact_delegation(message, contact, purpose)
+            except ValueError as exc:
+                await message.answer(str(exc))
+            return
+
+    if user_id != ADMIN_ID:
+        remember_reachable_peer(
+            user_id, message.from_user.full_name,
+            (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+        )
+        await ensure_contact_named(message)
 
     if await handle_reply_button(message, text):
         return
