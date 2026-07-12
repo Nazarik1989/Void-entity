@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import errno
 import json
 import os
 import re
@@ -141,8 +142,6 @@ def enqueue_job(queue_root: Path, job: dict[str, Any], media: dict[str, bytes]) 
     queue_root = Path(queue_root)
     pending = queue_root / "pending"
     pending.mkdir(parents=True, exist_ok=True)
-    if _dedupe_seen(queue_root, job["dedupe_key"]):
-        raise DuplicateJobError(f"duplicate dedupe_key: {job['dedupe_key']}")
     final = pending / job["job_id"]
     if final.exists():
         raise DuplicateJobError(f"job already exists: {job['job_id']}")
@@ -160,7 +159,12 @@ def enqueue_job(queue_root: Path, job: dict[str, Any], media: dict[str, bytes]) 
         job_file = temp / "job.json"
         job_file.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         os.chmod(job_file, 0o640)
-        os.replace(temp, final)
+        try:
+            os.replace(temp, final)
+        except OSError as exc:
+            if final.exists() or exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise DuplicateJobError(f"job already exists: {job['job_id']}") from exc
+            raise
     except Exception:
         shutil.rmtree(temp, ignore_errors=True)
         raise
@@ -210,7 +214,11 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
             os.replace(processing, queue_root / "done" / source.name)
             return 0
         except Exception as exc:
+            failed_target = queue_root / "failed" / source.name
+            if isinstance(exc, DuplicateJobError) and failed_target.is_dir():
+                shutil.rmtree(processing)
+                return 1
             (processing / "error.txt").write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
-            os.replace(processing, queue_root / "failed" / source.name)
+            os.replace(processing, failed_target)
             return 1
     return 0
