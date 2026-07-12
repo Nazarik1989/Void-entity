@@ -1,310 +1,195 @@
-# VOID Entity — Replit MVP
+# VOID Entity
 
-VOID — редакционный Telegram-агент:
+VOID is an experimental AI editorial persona for narrative content generation, thematic exploration, and autonomous publishing.
+
+It transforms news, signals, and observations through its own perspective on AI, attention, control, culture, human behaviour, and the future:
 
 ```text
-RSS новости → фильтр сигналов → VOID-оптика → черновик → публикация → кнопка “поймал”
+Source collection → signal filtering → draft → editorial rewrite → publishing
 ```
 
-Это не генератор цитат. Он берёт реальные инфоповоды и пишет посты через призму человека в цифровом мире: AI, внимание, контроль, культура, будущее, поведение.
+## Features
 
-## Быстрый запуск в Replit
+- news and signal processing;
+- narrative drafts and Telegram publishing;
+- persistent character state and content-shape planning;
+- private Naz/VOID thoughts and original public reflections;
+- delegated conversations with saved contacts and safety boundaries;
+- gaming editorial and commercial-test verticals;
+- isolated VK publishing through a shared VPS queue;
+- adaptation-based cross-agent exchange.
 
-1. Создай Python Repl.
-2. Загрузи все файлы из этого проекта.
-3. В `Secrets` добавь:
+## Screenshots
 
-```env
-BOT_TOKEN=токен от BotFather
-CHANNEL_ID=@username_твоего_канала
-ADMIN_ID=твой_telegram_user_id
-OPENAI_API_KEY=опционально
-OPENAI_MODEL=openai/gpt-5.4
-OPENAI_POST_MODEL=openai/gpt-5.4-mini
-OPENAI_DIALOG_MODEL=openai/gpt-5.4
-OPENAI_IMAGE_MODEL=gpt-image-1
-OPENAI_IMAGE_SIZE=1024x1024
-OPENAI_IMAGE_QUALITY=medium
-CROSSPOST_DAILY_LIMIT=2
-CROSSPOST_EXCHANGE_ENABLED=true
-CROSSPOST_EXCHANGE_DIR=/opt/bot_exchange
-```
+### Main interface
 
-4. Установи зависимости:
+![Main interface](Снимок%20экрана%20(959).png)
+
+### Content workflow
+
+![Workflow](Снимок%20экрана%20(961).png)
+
+### Cross-posting
+
+![Cross-posting](Снимок%20экрана%20(960).png)
+
+### Commands
+
+![Commands](Снимок%20экрана%20(971).png)
+
+### Results
+
+![Result](Снимок%20экрана%20(957).png)
+
+![Result](Снимок%20экрана%20(958).png)
+
+## Local setup
+
+Use `.env.example` as the configuration reference. Never commit `.env`, tokens, cookies, browser profiles, databases, or logs.
 
 ```bash
 pip install -r requirements.txt
-```
-
-5. Запусти:
-
-```bash
 python main.py
 ```
 
-Replit также прочитает `.replit`, где указано `run = "python main.py"`.
+For Telegram publishing, add the bot to the target channel as an administrator. `CHANNEL_ID` may be a channel username; `ADMIN_ID` is the administrator’s numeric Telegram ID.
 
-## Важно для Telegram
-
-- Бот должен быть добавлен в Telegram-канал как администратор.
-- У бота должно быть право публиковать сообщения.
-- `CHANNEL_ID` можно задать как `@channel_username`.
-- `ADMIN_ID` — это твой числовой Telegram ID.
-
-## Команды
+## Main commands
 
 ```text
-/start — запуск
-/help — помощь
-/commands — общие команды
-/vk_commands — команды VK-публикации и музыки
-/scan — найти свежие инфоповоды
-/candidates — показать найденные новости
-/draft ID — сделать черновик из новости
-/drafts — показать черновики
-/preview ID — показать полный черновик
-/publish ID — опубликовать черновик в канал
-/void текст — выделить реплику Void из внутреннего диалога с Naz
-/publish_void текст — передать реплику в exchange для адаптации Naz
-/cross_status — статус кросс-постинга за сегодня
-/cross_to_naz ID — выделить реплику из VOID-черновика и передать в exchange
-/cross_from_naz текст — адаптировать пост Naz AI Bot и опубликовать в VOID
-/telegram_schedule — расписание Telegram-рубрик VOID
-/void_schedule_now — опубликовать одну scheduled-рубрику VOID
-/stats — статистика
+/start                         start the bot
+/help                          help
+/commands                      command overview
+/scan                          collect fresh signals
+/candidates                    list candidates
+/draft ID                      create a draft
+/drafts                        list drafts
+/preview ID                    preview a draft
+/publish ID                    publish a Telegram draft
+/stats                         statistics
+/telegram_schedule             VOID Telegram schedule
+/void_schedule_now             run one scheduled VOID publication
 ```
 
-## Первый сценарий
+## Character state
+
+VOID has a stable core and a bounded evolving state. Events adjust axes and select a current facet without rewriting the character’s identity. Content planning also observes recent format and shape cooldowns.
+
+Administrative and diagnostic commands include character state, event application, correction, simulation, and planning. The detailed character and duo contract is in `docs/CHARACTER_DUO_BIBLE.md`.
+
+## Private Naz ↔ VOID thoughts
+
+VOID and Naz exchange unpublished thoughts, not mirrored finished posts. Each side creates an original public reflection; natural mention of the conversation is allowed, verbatim reuse is blocked.
 
 ```text
-/scan
+/void text                     preview a short VOID thought
+/thought_to_naz text           send private_thought.v1 for Naz reflection
+/publish_void text             compatible explicit send command
+/cross_to_naz ID               derive a private thought from a VOID draft
+/cross_from_naz text            adapt Naz material into a VOID publication
+/cross_status                  exchange status
+/relationship                  Naz/VOID relationship state
+/relationship_event ...        apply an admin relationship event
 ```
 
-Бот найдёт новости и покажет список кандидатов:
+Outbound private thoughts use `private_thought.v1` with `already_published=false`, `ready_to_publish=false`, and `requires_original_reflection=true`. Automatic scheduled publishing never creates a cross-post. Secret, credential, infrastructure, and private-client material is blocked before exchange.
+
+## Delegated contacts and conversations
+
+VOID can keep an explicit contact list and conduct a contextual delegated Telegram conversation when the administrator requests it. Ambiguous aliases are not guessed; VOID discloses its identity and owner, preserves conversation context, and applies stop/risk guards.
 
 ```text
-#12 · AI · score 8
-OpenAI ...
-Источник: The Verge
+/contact_add TELEGRAM_ID Name   save a contact
+/contacts                       list contacts
+/delegate ...                   start a delegated conversation
 ```
 
-Создать черновик:
+Delegated conversations do not grant arbitrary messaging authority and remain separate from publication automation.
+
+## Gaming vertical
+
+VOID and Naz have distinct gaming rubrics and voices. VOID can create editorial gaming drafts or an explicitly requested soft commercial test while preserving disclosure and safety boundaries.
 
 ```text
-/draft 12
+/gaming topic                   create a VOID gaming draft
+/gaming_plan topic              preview rubric and format
+/gaming_commercial topic        create a soft commercial-test draft
 ```
 
-Посмотреть:
+Gaming autopublishing remains disabled unless separately configured. See `docs/GAMING_VERTICAL.md`.
 
-```text
-/preview 1
-```
+## VK manual diagnostics
 
-Опубликовать:
-
-```text
-/publish 1
-```
-
-Под постом будет кнопка:
-
-```text
-поймал
-```
-
-Реакции сохраняются в SQLite-базу `void.db`.
-
-## AI-режим
-
-Если `OPENAI_API_KEY` задан, бот будет использовать OpenAI Responses API для генерации постов и Images API для 1-2 релевантных картинок к опубликованному посту.
-
-`OPENAI_POST_MODEL` используется для ручного постинга и автопостинга. `OPENAI_DIALOG_MODEL` используется для диалогового режима.
-
-## Приватный разговор Naz ↔ VOID
-
-VOID и Naz обмениваются неопубликованными мыслями, а не зеркалят готовые посты. Снаружи каждый публикует собственный новый вывод. Факт беседы можно упоминать естественно: «Мы тут с VOID спорили…», «После разговора с Naz осталось наблюдение…».
-
-- `/void text` или ответ `/void` выделяет короткую приватную мысль VOID для предпросмотра.
-- `/thought_to_naz text` или совместимая команда `/publish_void text` кладёт `private_thought.v1` в `void_to_naz/inbox`.
-- `/cross_to_naz ID` делает то же самое из существующего VOID-черновика.
-- `/cross_from_naz text` takes a Naz AI Bot post, rewrites it as a VOID signal, saves a draft, and publishes it to VOID.
-- `/cross_status` shows today's counters.
-- `CROSSPOST_DAILY_LIMIT` defaults to `2` per direction per Moscow day.
-
-Outbound payload имеет тип `private_thought.v1`, флаги `already_published=false`, `ready_to_publish=false` и `requires_original_reflection=true`. Дословное цитирование запрещено; естественное упоминание разговора разрешено. Публичная рубрика называется «Мысли после разговора».
-
-Автоматическая публикация обычного VOID-черновика, включая scheduled-публикацию, не создаёт cross-post. Маршрут Void → Naz запускается только явной командой и идёт только через exchange/adaptation. Фрагменты должны быть короткими мыслями, кусками внутреннего диалога, странными тезисами, философскими или мрачными импульсами. Перед передачей бот блокирует секреты, токены, пароли, SSH/IP-доступ, внутренние URL и клиентские детали.
-
-## Telegram rubric schedules
-
-`/auto_on` enables the VOID Telegram schedule in this project:
-
-- VOID posts about every 3 hours, with `MIDNIGHT` restricted to 00-02 Moscow time, `FREQUENCY` in the evening, and daytime pools for `SIGNAL`, `OBSERVATION`, `FUTURE FILE`, and news.
-
-Naz AI Bot has its own project, channel, and schedule. Общего scheduler для двух сущностей нет: они встречаются только через exchange/adaptation.
-
-Manual controls:
-
-```text
-/telegram_schedule
-/void_schedule_now
-```
-
-## VK publisher
-
-The bot can publish test posts to a VK community wall.
-
-Environment:
-
-```text
-VK_USER_ACCESS_TOKEN=...
-VK_PHOTO_ACCESS_TOKEN=...
-VK_GROUP_ID=123456789
-VK_API_VERSION=5.199
-VK_DRY_RUN=true
-VK_MUSIC_TRACKS_FILE=data/vk_music_tracks.json
-```
-
-Commands:
-
-```text
-/vk_status
-/vk_test text
-/vk_test --yes text
-/publish_vk ID
-/publish_vk --yes ID
-/vk_music_status
-/vk_music_import Artist - Track | https://vk.com/audio... | future, night
-/vk_music_sync URL
-/vk_music_sync URL night,electronic,melancholy
-```
-
-Keep `VK_DRY_RUN=true` while checking setup. `/vk_test text` and `/publish_vk ID` return the prepared request without posting. Use `/vk_test --yes text` or `/publish_vk --yes ID` to publish for real; `--yes` bypasses dry-run for that call.
-
-`/publish_vk --yes ID` stores the VK post id in `vk_posts` and blocks duplicate VK publishing of the same draft. It also tries to generate one topic-matched image and upload it as a VK wall photo attachment. If `VK_MUSIC_TRACKS_FILE` points to a JSON playlist file, the bot picks a matching track by tags and appends it as a soundtrack link.
-
-For image attachments, `VK_PHOTO_ACCESS_TOKEN` should be a user access token with `photos` and `wall` permissions. A community/group token can publish text posts but may fail on `photos.getWallUploadServer`.
-
-## VK browser publisher
-
-Browser publishing uses your logged-in VK session as admin permission, but the post should be created on the community wall and published as the community.
-
-Setup:
+The manual browser helper is retained for diagnosis:
 
 ```bash
-pip install -r requirements.txt
 python -m playwright install chromium
 python vk_browser_publisher.py login
-```
-
-Prepare a draft payload:
-
-```bash
 python vk_browser_publisher.py prepare-draft 259
-```
-
-Compose the prepared payload in VK:
-
-```bash
 python vk_browser_publisher.py open-payload data/vk_browser_payloads/draft-259.json
-```
-
-Or publish automatically from a draft id:
-
-```bash
 python vk_browser_publisher.py publish-draft 259
 ```
 
-Or enqueue an existing draft for the deterministic VPS publisher:
+Manual VK and music commands are documented by `/vk_commands`. Keep dry-run enabled while checking any API-based diagnostic path.
 
-```bash
-python void_vk_producer.py enqueue-draft 259
+## Isolated VPS VK pipeline
+
+Production VK publishing does not depend on a Windows computer and does not expose browser credentials to bots or LLM code.
+
+```text
+VOID producer ─┐
+               ├→ /var/lib/void-vk-publisher/queue/pending
+Naz producer  ─┘
+                              ↓
+                  standalone VK consumer
+                              ↓
+                  one allowlisted community
 ```
 
-The legacy Windows task is diagnostic only and is not part of the VPS production path:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts/install_vk_autopost_task.ps1
-```
-
-The task runs `scripts/vk_autopost.ps1`, uses the separate headless browser profile
-`data/vk_autopost_profile`, ignores overlapping runs, and writes logs to `logs/vk-autopost.log`.
-The computer must be running, the Windows user must be signed in, and network access must be available.
-
-Production uses one shared queue and a profile readable only by `publisher`:
+Canonical paths:
 
 ```text
 VK_PUBLISH_QUEUE_DIR=/var/lib/void-vk-publisher/queue
 VK_BROWSER_PROFILE_DIR=/var/lib/void-vk-publisher/profile
 ```
 
-`void-vk-producer.timer` generates scheduled VOID content and enqueues it without browser access.
-`void-vk-autopost.timer` runs only the standalone consumer in `vk_queue_consumer.py`; that process
-does not import `main.py`, Telegram, or LLM code. VPS users, group membership, modes, ACL option,
-one-time profile authorization, kill switch, and admin requeue are documented in
-`deploy/VPS_VK_PUBLISHER.md`.
+Each `vk_publish_job.v1` job is an atomically renamed directory. Producers can write only `pending`; only `publisher` can read the browser profile and move jobs through `processing`, `done`, and `failed`. Global deduplication is enforced by the consumer across all states. Failed jobs may be retried only through the administrative `requeue-failed` command.
 
-The browser helper opens the community composer, uploads the generated image, inserts the draft text, searches VK audio,
-selects the closest matching track, and either stops on the final VK screen or clicks publish for manual diagnostic commands.
+`void-vk-producer.timer` generates scheduled VOID content and enqueues it without opening a browser. `void-vk-autopost.timer` runs only `vk_queue_consumer.py`, which does not import `main.py`, Telegram, or LLM code. It opens exactly the configured allowlisted VK community, creates a post, attaches local media, selects the requested track, and exits with a meaningful status.
 
-Playlist format:
+The consumer has a kill switch at `/etc/void-vk-publisher.disabled`. Complete user/group permissions, systemd hardening, one-time VPS profile authorization, service installation, and requeue operations are documented in `deploy/VPS_VK_PUBLISHER.md`.
 
-```json
-{
-  "tracks": [
-    {
-      "artist": "Artist",
-      "title": "Track",
-      "url": "https://vk.com/audio...",
-      "tags": ["future", "city", "night"]
-    }
-  ]
-}
-```
+The Windows Task Scheduler scripts are retained only for legacy manual diagnostics. They are not a production scheduler.
 
-You can also import tracks through Telegram:
+## Architecture and storage
 
-```text
-/vk_music_import Burial - Archangel | https://vk.com/audio... | night, city
-Aphex Twin - Xtal | https://vk.com/audio... | attention, ambient
-```
+- `main.py` — Telegram bot, schedules, drafts, relationships, contacts, and content flows.
+- `character_state.py` — bounded character-state engine.
+- `duo_relationship.py` — Naz/VOID relationship and private-thought rules.
+- `delegated_messaging.py` — delegated-contact safety and context.
+- `gaming_vertical.py` — gaming rubric and format planning.
+- `vk_publish_queue.py` — strict filesystem queue contract.
+- `void_vk_producer.py` — VOID queue producer; never opens Chromium.
+- `vk_queue_consumer.py` — standalone allowlisted production consumer.
+- `vk_browser_publisher.py` — retained manual browser diagnostics.
+- `deploy/` — VPS documentation and systemd units.
+- `tests/` — unit and compatibility tests.
 
-Если ключ не задан, бот всё равно работает: он использует fallback-редактор с шаблонной VOID-оптикой и сухим юмором.
+SQLite stores drafts, reactions, settings, character state, relationship state, contacts, and delegated-conversation context. Local database files remain untracked.
 
-## Файлы
+## Tech stack
 
-```text
-main.py                 основной Telegram-бот
-Main.py                 wrapper, если Replit создал файл с большой буквы
-config.py               настройки и env
-sources.py              RSS-источники
-news_collector.py       сбор новостей
-void_lens.py            фильтр и классификация сигналов
-database.py             SQLite
-void_editor.py          AI/fallback редактор постов
-prompts/void_editor_prompt.txt  редакционный промпт VOID
-requirements.txt        зависимости
-.env.example            пример переменных
-.replit                 команда запуска
-```
+- Python
+- aiogram / Telegram Bot API
+- OpenAI-compatible content and image APIs when configured
+- Playwright for the isolated VK publisher
+- SQLite
+- systemd on the VPS
 
-## Как расширять дальше
+## Status
 
-- Добавить `/skip ID` для отклонения новости.
-- Добавить `/rewrite ID` для переписывания черновика.
-- Добавить Telegram-источники и YouTube RSS.
-- Добавить Weekly Observation.
-- Добавить частоты аудитории: какие темы чаще “поймали”.
-- Добавить автопубликацию только для постов с `publish_score >= 8`.
+Active development. Telegram publishing, draft workflow, signal filtering, character/relationship systems, delegated contacts, gaming content, cross-agent adaptation, and the isolated VPS VK pipeline are implemented.
 
-## Russian mode
+## Author
 
-VOID теперь старается показывать найденные новости на русском в `/scan` и `/candidates`.
-Для перевода нужен `OPENAI_API_KEY` в Replit Secrets. Без ключа RSS-заголовки останутся в языке источника, но бот продолжит работать.
-
-После добавления ключа перезапусти бота:
-
-```bash
-python main.py
-```
-
+Nazar Zykov — AI Agent Developer
