@@ -88,6 +88,22 @@ exchange_task: asyncio.Task | None = None
 pending_delegation_purposes: dict[int, str] = {}
 
 
+@dataclass(frozen=True)
+class TelegramPostPackage:
+    text: str
+    draft_id: int
+    images: tuple[bytes, ...] = ()
+    source_image_url: str | None = None
+    no_image_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class TelegramPublishOutcome:
+    success: bool
+    image_count: int = 0
+    error: str | None = None
+
+
 RSS_SOURCES = [
     {
         "name": "MIT Technology Review",
@@ -766,8 +782,17 @@ def character_event_for_mode(mode: str) -> str:
     return "quiet"
 
 
-def build_character_directive(topic: str, platform: str, mode: str) -> tuple[void_character.CharacterState, dict[str, str], str]:
-    state = apply_character_event(character_event_for_mode(mode))
+def build_character_directive(
+    topic: str,
+    platform: str,
+    mode: str,
+    persist_event: bool = True,
+) -> tuple[void_character.CharacterState, dict[str, str], str]:
+    event = character_event_for_mode(mode)
+    if persist_event:
+        state = apply_character_event(event)
+    else:
+        state = void_character.apply_event(load_character_state(), event)
     plan = void_character.plan_content(
         state,
         get_recent_content_signatures(),
@@ -2804,47 +2829,100 @@ def format_vk_error(error: dict[str, Any]) -> str:
     return f"VK API error {code}: {message}"
 
 
-async def publish_draft_images(bot: Bot, draft: dict | sqlite3.Row) -> tuple[int, str | None]:
-    image_error: str | None = None
+async def prepare_telegram_post_package(draft: dict | sqlite3.Row) -> TelegramPostPackage:
+    """Prepare the complete Telegram payload before the first Bot API call."""
+    text = str(draft["post"] or "")
+    if not text.strip():
+        raise ValueError("Telegram post text is empty")
 
+    image_issue: str | None = None
     try:
-        images = await asyncio.to_thread(generate_post_images_sync, draft)
+        generated = await asyncio.to_thread(generate_post_images_sync, draft)
+        images = tuple(bytes(image) for image in generated if isinstance(image, (bytes, bytearray)) and image)
+        if len(images) != len(generated):
+            image_issue = "image generation returned an invalid image payload"
+            images = ()
     except Exception as e:
-        images = []
-        image_error = f"{type(e).__name__}: {e}"
+        images = ()
+        image_issue = f"image generation failed: {type(e).__name__}: {e}"
 
-    if not images:
-        source_image_url = await asyncio.to_thread(find_source_image_url, draft["source_url"] or "")
-        if source_image_url:
-            try:
-                await bot.send_photo(chat_id=CHANNEL_ID, photo=source_image_url)
-                return 1, None
-            except Exception as e:
-                fallback_error = f"{type(e).__name__}: {e}"
-                return 0, f"{image_error}; source image fallback: {fallback_error}" if image_error else fallback_error
-        return 0, image_error
+    if images:
+        return TelegramPostPackage(text=text, draft_id=int(draft["id"]), images=images)
 
+    source_image_url = await asyncio.to_thread(find_source_image_url, draft["source_url"] or "")
+    if source_image_url:
+        return TelegramPostPackage(
+            text=text,
+            draft_id=int(draft["id"]),
+            source_image_url=source_image_url,
+        )
+
+    no_image_reason = image_issue or "image generation returned no images and source fallback is unavailable"
+    return TelegramPostPackage(
+        text=text,
+        draft_id=int(draft["id"]),
+        no_image_reason=no_image_reason,
+    )
+
+
+async def send_telegram_post(bot: Bot, package: TelegramPostPackage) -> TelegramPublishOutcome:
+    """Send one complete channel post in the invariant media-then-text order."""
+    image_count = len(package.images) or (1 if package.source_image_url else 0)
     try:
-        if len(images) == 1:
-            await bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=BufferedInputFile(images[0], filename=f"void-{draft['id']}-1.png"),
-            )
-        else:
-            media = [
-                InputMediaPhoto(
-                    media=BufferedInputFile(image, filename=f"void-{draft['id']}-{index}.png")
+        if package.images:
+            if len(package.images) == 1:
+                await bot.send_photo(
+                    chat_id=CHANNEL_ID,
+                    photo=BufferedInputFile(
+                        package.images[0], filename=f"void-{package.draft_id}-1.png"
+                    ),
                 )
-                for index, image in enumerate(images, start=1)
-            ]
-            await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+            else:
+                media = [
+                    InputMediaPhoto(
+                        media=BufferedInputFile(
+                            image, filename=f"void-{package.draft_id}-{index}.png"
+                        )
+                    )
+                    for index, image in enumerate(package.images, start=1)
+                ]
+                await bot.send_media_group(chat_id=CHANNEL_ID, media=media)
+        elif package.source_image_url:
+            await bot.send_photo(chat_id=CHANNEL_ID, photo=package.source_image_url)
+        else:
+            print(
+                f"telegram text-only draft #{package.draft_id}: {package.no_image_reason}",
+                flush=True,
+            )
     except Exception as e:
-        return 0, f"{type(e).__name__}: {e}"
+        error = f"media send failed: {type(e).__name__}: {e}"
+        print(f"telegram publish failed draft #{package.draft_id}: {error}", flush=True)
+        return TelegramPublishOutcome(success=False, error=error)
 
-    return len(images), None
+    try:
+        await bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=package.text,
+            reply_markup=catch_keyboard(package.draft_id),
+            disable_web_page_preview=True,
+        )
+    except Exception as e:
+        error = f"text send failed: {type(e).__name__}: {e}"
+        print(f"telegram publish failed draft #{package.draft_id}: {error}", flush=True)
+        return TelegramPublishOutcome(success=False, image_count=image_count, error=error)
+
+    return TelegramPublishOutcome(success=True, image_count=image_count)
 
 
-async def publish_draft(bot: Bot, draft_id: int) -> str:
+async def publish_draft(
+    bot: Bot,
+    draft_id: int,
+    *,
+    content_plan: dict[str, str] | None = None,
+    content_topic: str = "",
+    apply_planned_character_event: bool = False,
+    setting_updates: dict[str, str] | None = None,
+) -> str:
     if not CHANNEL_ID:
         return "CHANNEL_ID не задан. Добавь канал в Secrets."
 
@@ -2856,19 +2934,25 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
     if not ok:
         return f"Не публикую: {reason}. Сначала /preview {draft_id}."
 
-    await bot.send_message(
-        chat_id=CHANNEL_ID,
-        text=draft["post"],
-        reply_markup=catch_keyboard(draft_id),
-        disable_web_page_preview=True,
-    )
-    image_count, image_error = await publish_draft_images(bot, draft)
+    try:
+        package = await prepare_telegram_post_package(draft)
+    except Exception as e:
+        return f"Публикация не выполнена: #{draft_id}. Подготовка пакета: {type(e).__name__}: {e}"
+
+    outcome = await send_telegram_post(bot, package)
+    if not outcome.success:
+        return f"Публикация не выполнена: #{draft_id}. {outcome.error}"
+
     mark_published(draft_id, draft["source_url"] or "")
+    if apply_planned_character_event:
+        await asyncio.to_thread(apply_character_event, character_event_for_mode(str(draft["mode"] or "")))
+    if content_plan is not None:
+        await asyncio.to_thread(record_content_signature, content_plan, content_topic)
+    for key, value in (setting_updates or {}).items():
+        await asyncio.to_thread(set_setting, key, value)
     await asyncio.to_thread(apply_character_event, "publish")
-    if image_count:
-        return f"Опубликовано: #{draft_id}. Картинок: {image_count}"
-    if image_error:
-        return f"Опубликовано: #{draft_id}. Картинки не приложились: {image_error}"
+    if outcome.image_count:
+        return f"Опубликовано: #{draft_id}. Картинок: {outcome.image_count}"
     return f"Опубликовано: #{draft_id}. Картинок: 0"
 
 
@@ -2959,6 +3043,7 @@ async def autopost_once(bot: Bot) -> str:
             item.get("title", "news"),
             "telegram",
             item.get("mode", "news"),
+            False,
         )
         attitude = duo_relationship.news_attitude(
             "void", item.get("title", ""), item.get("summary", ""),
@@ -2982,8 +3067,13 @@ async def autopost_once(bot: Bot) -> str:
         draft = get_draft(draft_id)
         ok, reason = quality_check(draft["post"] if draft else "")
         if ok:
-            await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", "news"))
-            result = await publish_draft(bot, draft_id)
+            result = await publish_draft(
+                bot,
+                draft_id,
+                content_plan=editorial_plan,
+                content_topic=item.get("title", "news"),
+                apply_planned_character_event=True,
+            )
             return f"Автопостинг: {result}"
         else:
             continue
@@ -2991,15 +3081,16 @@ async def autopost_once(bot: Bot) -> str:
     return "Автопостинг: сигналы были, но quality gate всё зарезал. Редкий случай, когда цензура оказалась полезной."
 
 
-def next_content_plan_slot() -> tuple[int, dict[str, str]]:
+def next_content_plan_slot(*, advance: bool = True) -> tuple[int, dict[str, str]]:
     current = int(get_setting("auto_content_index", "0") or "0")
     slot = CONTENT_PLAN[current % len(CONTENT_PLAN)]
-    set_setting("auto_content_index", str(current + 1))
+    if advance:
+        set_setting("auto_content_index", str(current + 1))
     return current, slot
 
 
 async def autopost_void_signal_once(bot: Bot) -> str:
-    index, slot = await asyncio.to_thread(next_content_plan_slot)
+    index, slot = await asyncio.to_thread(next_content_plan_slot, advance=False)
     mode = slot["mode"]
     frequency = slot["frequency"]
     _, editorial_plan, character_directive = await asyncio.to_thread(
@@ -3007,6 +3098,7 @@ async def autopost_void_signal_once(bot: Bot) -> str:
         str(slot.get("brief", slot["name"])),
         "telegram",
         mode,
+        False,
     )
     content = (
         f"CONTENT_PLAN_INDEX: {index}\n"
@@ -3025,13 +3117,19 @@ async def autopost_void_signal_once(bot: Bot) -> str:
         "VOID",
         f"manual://auto/{mode}/{now_iso()}",
     )
-    await asyncio.to_thread(record_content_signature, editorial_plan, str(slot.get("brief", slot["name"])))
     draft = get_draft(draft_id)
     ok, reason = quality_check(draft["post"] if draft else "")
     if not ok:
         return f"VOID-план: черновик #{draft_id} не опубликован: {reason}"
 
-    result = await publish_draft(bot, draft_id)
+    result = await publish_draft(
+        bot,
+        draft_id,
+        content_plan=editorial_plan,
+        content_topic=str(slot.get("brief", slot["name"])),
+        apply_planned_character_event=True,
+        setting_updates={"auto_content_index": str(index + 1)},
+    )
     return f"VOID-план: {result}"
 
 
@@ -3051,6 +3149,12 @@ def eligible_schedule_slots(schedule: list[dict[str, Any]], now: datetime | None
     return eligible or schedule
 
 
+def schedule_recent_value(recent_key: str, slot_name: str) -> str:
+    recent = [item for item in get_setting(recent_key, "").split(",") if item]
+    recent.append(slot_name)
+    return ",".join(recent[-8:])
+
+
 def choose_schedule_slot(schedule: list[dict[str, Any]], recent_key: str, now: datetime | None = None) -> dict[str, Any]:
     slots = eligible_schedule_slots(schedule, now)
     recent_raw = get_setting(recent_key, "")
@@ -3067,6 +3171,17 @@ def choose_schedule_slot(schedule: list[dict[str, Any]], recent_key: str, now: d
 
 def choose_scheduled_rubric(now: datetime | None = None) -> dict[str, Any]:
     return choose_schedule_slot(RUBRIC_SCHEDULE, "rubric_recent", now)
+
+
+def choose_telegram_schedule_slot(now: datetime | None = None) -> dict[str, Any]:
+    slots = eligible_schedule_slots(TELEGRAM_VOID_SCHEDULE, now)
+    recent_raw = get_setting("telegram_void_recent", "")
+    recent = [item for item in recent_raw.split(",") if item]
+    filtered = [slot for slot in slots if slot["name"] not in recent[-3:]]
+    if filtered:
+        slots = filtered
+    weights = [int(slot.get("weight", 1) or 1) for slot in slots]
+    return random.choices(slots, weights=weights, k=1)[0]
 
 
 def rubric_schedule_text(now: datetime | None = None) -> str:
@@ -3168,7 +3283,9 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
     return draft_id
 
 
-async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
+async def save_telegram_void_scheduled_draft(
+    slot: dict[str, Any],
+) -> tuple[int, dict[str, str], str]:
     voice = str(slot.get("voice", "void"))
     name = str(slot.get("name", "Telegram VOID"))
     brief = str(slot.get("brief", "Make an original Telegram post."))
@@ -3178,6 +3295,7 @@ async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
         brief,
         "telegram",
         mode,
+        False,
     )
 
     if voice == "news":
@@ -3200,8 +3318,7 @@ async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
             draft = get_draft(draft_id)
             ok, _ = quality_check(draft["post"] if draft else "")
             if ok:
-                await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", brief))
-                return draft_id
+                return draft_id, editorial_plan, item.get("title", brief)
         raise RuntimeError("fresh news signals not found")
 
     content = (
@@ -3218,22 +3335,19 @@ async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
         "VOID / Telegram scheduled rubric",
         f"manual://telegram/void/{slot.get('mode', 'signal')}/{now_iso()}",
     )
-    await asyncio.to_thread(record_content_signature, editorial_plan, brief)
-    return draft_id
+    return draft_id, editorial_plan, brief
 
 
 async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
-    slot = await asyncio.to_thread(
-        lambda: choose_schedule_slot(TELEGRAM_VOID_SCHEDULE, "telegram_void_recent")
-    )
+    slot = await asyncio.to_thread(choose_telegram_schedule_slot)
     try:
-        draft_id = await save_telegram_void_scheduled_draft(slot)
+        draft_id, editorial_plan, content_topic = await save_telegram_void_scheduled_draft(slot)
     except Exception as e:
         if slot.get("voice") == "news":
             fallback = await asyncio.to_thread(
                 lambda: random.choice([item for item in TELEGRAM_VOID_SCHEDULE if item.get("voice") == "void"])
             )
-            draft_id = await save_telegram_void_scheduled_draft(fallback)
+            draft_id, editorial_plan, content_topic = await save_telegram_void_scheduled_draft(fallback)
             slot = fallback
         else:
             return f"Telegram VOID schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
@@ -3242,31 +3356,23 @@ async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
     ok, reason = quality_check(draft["post"] if draft else "")
     if not ok:
         return f"Telegram VOID schedule: draft #{draft_id} blocked: {reason}"
-    result = await publish_draft(bot, draft_id)
+    result = await publish_draft(
+        bot,
+        draft_id,
+        content_plan=editorial_plan,
+        content_topic=content_topic,
+        apply_planned_character_event=True,
+        setting_updates={
+            "telegram_void_recent": schedule_recent_value(
+                "telegram_void_recent", str(slot["name"])
+            )
+        },
+    )
     return f"Telegram VOID schedule: {slot['name']} -> {result}"
 
 
 async def autopost_scheduled_once(bot: Bot) -> str:
-    slot = await asyncio.to_thread(choose_scheduled_rubric)
-    try:
-        draft_id = await save_scheduled_rubric_draft(slot)
-    except Exception as e:
-        if slot.get("voice") == "news":
-            fallback = await asyncio.to_thread(
-                lambda: random.choice([item for item in RUBRIC_SCHEDULE if item.get("voice") == "void"])
-            )
-            draft_id = await save_scheduled_rubric_draft(fallback)
-            slot = fallback
-        else:
-            return f"Rubric schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
-
-    draft = get_draft(draft_id)
-    ok, reason = quality_check(draft["post"] if draft else "")
-    if not ok:
-        return f"Rubric schedule: draft #{draft_id} blocked: {reason}"
-
-    result = await publish_draft(bot, draft_id)
-    return f"Rubric schedule: {slot['name']} -> {result}"
+    return await publish_telegram_void_scheduled_once(bot)
 
 
 async def make_scheduled_rubric_draft_once() -> str:
@@ -3283,8 +3389,9 @@ async def auto_loop(bot: Bot) -> None:
                 now_ts = int(datetime.now(timezone.utc).timestamp())
                 void_last_ts = int(get_setting("telegram_void_last_ts", "0") or "0")
                 if now_ts - void_last_ts >= 60 * 60 * 3:
-                    set_setting("telegram_void_last_ts", str(now_ts))
                     result = await publish_telegram_void_scheduled_once(bot)
+                    if "-> Опубликовано:" in result:
+                        set_setting("telegram_void_last_ts", str(now_ts))
                     print(result, flush=True)
         except Exception as e:
             print(f"auto_loop error: {type(e).__name__}: {e}", flush=True)
