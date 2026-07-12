@@ -1,0 +1,224 @@
+"""Strict filesystem contract shared by VK queue producers and consumer."""
+from __future__ import annotations
+
+import hashlib
+import errno
+import json
+import os
+import re
+import shutil
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable
+
+SCHEMA = "vk_publish_job.v1"
+FIELDS = frozenset({"schema", "job_id", "producer", "target_group_id", "text", "media", "track_query", "created_at", "not_before", "dedupe_key", "source_ref"})
+PRODUCERS = frozenset({"naz", "void"})
+STATES = ("pending", "processing", "done", "failed")
+MAX_TEXT_LENGTH = 16_000
+MAX_MEDIA_COUNT = 4
+MAX_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_TRACK_QUERY_LENGTH = 300
+MAX_DEDUPE_KEY_LENGTH = 256
+JOB_ID_RE = re.compile(r"^(naz|void)-[0-9a-f]{24}$")
+
+
+class QueueValidationError(ValueError):
+    pass
+
+
+class DuplicateJobError(QueueValidationError):
+    pass
+
+
+def canonical_job_id(producer: str, dedupe_key: str) -> str:
+    if producer not in PRODUCERS:
+        raise QueueValidationError("unknown producer")
+    if not isinstance(dedupe_key, str) or not dedupe_key or len(dedupe_key) > MAX_DEDUPE_KEY_LENGTH:
+        raise QueueValidationError("invalid dedupe_key")
+    digest = hashlib.sha256(dedupe_key.encode("utf-8")).hexdigest()
+    return f"{producer}-{digest[:24]}"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _safe_media_name(value: Any) -> str:
+    if not isinstance(value, str) or not value or "\\" in value or "://" in value:
+        raise QueueValidationError("media names must be relative file names")
+    path = PurePosixPath(value)
+    if path.is_absolute() or len(path.parts) != 1 or value in {".", ".."}:
+        raise QueueValidationError("media names must be relative file names")
+    return value
+
+
+def _validate_shape(job: Any, allowed_group_id: str | None = None) -> dict[str, Any]:
+    if not isinstance(job, dict) or set(job) != FIELDS:
+        raise QueueValidationError("unknown or missing job fields")
+    if job["schema"] != SCHEMA:
+        raise QueueValidationError("unknown schema")
+    if job["producer"] not in PRODUCERS:
+        raise QueueValidationError("unknown producer")
+    if not isinstance(job["target_group_id"], str) or not job["target_group_id"]:
+        raise QueueValidationError("target_group_id must be a JSON string")
+    if allowed_group_id is not None and job["target_group_id"] != str(allowed_group_id):
+        raise QueueValidationError("target_group_id is not allowed")
+    expected_id = canonical_job_id(job["producer"], job["dedupe_key"])
+    if not isinstance(job["job_id"], str) or not JOB_ID_RE.fullmatch(job["job_id"]) or job["job_id"] != expected_id:
+        raise QueueValidationError("job_id is not canonical")
+    if not isinstance(job["text"], str) or not job["text"] or len(job["text"]) > MAX_TEXT_LENGTH:
+        raise QueueValidationError("invalid text length")
+    if not isinstance(job["track_query"], str) or len(job["track_query"]) > MAX_TRACK_QUERY_LENGTH:
+        raise QueueValidationError("invalid track_query")
+    if not all(isinstance(job[key], str) for key in ("created_at", "not_before", "source_ref")):
+        raise QueueValidationError("invalid metadata")
+    if not job["created_at"] or not job["source_ref"]:
+        raise QueueValidationError("created_at and source_ref are required")
+    for key in ("created_at", "not_before"):
+        if job[key]:
+            try:
+                parsed = datetime.fromisoformat(job[key].replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise QueueValidationError(f"invalid {key}") from exc
+            if parsed.tzinfo is None:
+                raise QueueValidationError(f"{key} must include timezone")
+    media = job["media"]
+    if not isinstance(media, list) or len(media) > MAX_MEDIA_COUNT or len(media) != len(set(media)):
+        raise QueueValidationError("invalid media attachments")
+    for name in media:
+        _safe_media_name(name)
+    return job
+
+
+def validate_job(job_dir: Path, allowed_group_id: str) -> dict[str, Any]:
+    job_dir = Path(job_dir)
+    job_file = job_dir / "job.json"
+    if job_dir.is_symlink() or job_file.is_symlink() or not job_file.is_file():
+        raise QueueValidationError("job directory and job.json must be regular")
+    try:
+        job = _validate_shape(json.loads(job_file.read_text(encoding="utf-8")), allowed_group_id)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QueueValidationError("invalid job.json") from exc
+    if job["job_id"] != job_dir.name:
+        raise QueueValidationError("job_id does not match directory")
+    for name in job["media"]:
+        path = job_dir / name
+        if path.is_symlink() or not path.is_file():
+            raise QueueValidationError("media must be regular files")
+        if path.stat().st_size > MAX_IMAGE_BYTES:
+            raise QueueValidationError("image is too large")
+    return job
+
+
+def _dedupe_seen(queue_root: Path, key: str, current: Path | None = None) -> bool:
+    for state in STATES:
+        directory = Path(queue_root) / state
+        if not directory.exists():
+            continue
+        for job_file in directory.glob("*/job.json"):
+            if current is not None and job_file.parent == current:
+                continue
+            if job_file.is_symlink():
+                continue
+            try:
+                if json.loads(job_file.read_text(encoding="utf-8")).get("dedupe_key") == key:
+                    return True
+            except (OSError, json.JSONDecodeError, TypeError):
+                continue
+    return False
+
+
+def build_job(*, producer: str, target_group_id: str, text: str, media: list[str], track_query: str = "", not_before: str = "", dedupe_key: str, source_ref: str, created_at: str | None = None) -> dict[str, Any]:
+    job = {"schema": SCHEMA, "job_id": canonical_job_id(producer, dedupe_key), "producer": producer, "target_group_id": str(target_group_id), "text": text, "media": media, "track_query": track_query, "created_at": created_at or _utc_now(), "not_before": not_before, "dedupe_key": dedupe_key, "source_ref": source_ref}
+    return _validate_shape(job)
+
+
+def enqueue_job(queue_root: Path, job: dict[str, Any], media: dict[str, bytes]) -> Path:
+    job = _validate_shape(job)
+    if set(media) != set(job["media"]):
+        raise QueueValidationError("media payload does not match job.media")
+    queue_root = Path(queue_root)
+    pending = queue_root / "pending"
+    pending.mkdir(parents=True, exist_ok=True)
+    final = pending / job["job_id"]
+    if final.exists():
+        raise DuplicateJobError(f"job already exists: {job['job_id']}")
+    temp = pending / f".{job['job_id']}.tmp-{uuid.uuid4().hex}"
+    old_umask = os.umask(0o027)
+    try:
+        temp.mkdir(mode=0o770)
+        os.chmod(temp, 0o770)
+        for name, content in media.items():
+            if len(content) > MAX_IMAGE_BYTES:
+                raise QueueValidationError("image is too large")
+            path = temp / name
+            path.write_bytes(content)
+            os.chmod(path, 0o640)
+        job_file = temp / "job.json"
+        job_file.write_text(json.dumps(job, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.chmod(job_file, 0o640)
+        try:
+            os.replace(temp, final)
+        except OSError as exc:
+            if final.exists() or exc.errno in {errno.EEXIST, errno.ENOTEMPTY}:
+                raise DuplicateJobError(f"job already exists: {job['job_id']}") from exc
+            raise
+    except Exception:
+        shutil.rmtree(temp, ignore_errors=True)
+        raise
+    finally:
+        os.umask(old_umask)
+    return final
+
+
+def requeue_failed(queue_root: Path, job_id: str, allowed_group_id: str) -> Path:
+    queue_root = Path(queue_root)
+    source = queue_root / "failed" / job_id
+    if source.is_symlink() or not source.is_dir():
+        raise QueueValidationError("failed job not found")
+    job = validate_job(source, allowed_group_id)
+    if job["job_id"] != job_id:
+        raise QueueValidationError("job_id mismatch")
+    target = queue_root / "pending" / job_id
+    if target.exists():
+        raise DuplicateJobError("pending job already exists")
+    error_file = source / "error.txt"
+    if error_file.exists() and not error_file.is_symlink():
+        error_file.unlink()
+    os.replace(source, target)
+    return target
+
+
+def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dict[str, Any], list[Path]], None]) -> int:
+    queue_root = Path(queue_root)
+    for state in STATES:
+        (queue_root / state).mkdir(parents=True, exist_ok=True)
+    for source in sorted((queue_root / "pending").iterdir()):
+        if not source.is_dir() or source.is_symlink() or source.name.startswith("."):
+            continue
+        processing = queue_root / "processing" / source.name
+        try:
+            os.replace(source, processing)
+        except OSError:
+            continue
+        try:
+            job = validate_job(processing, allowed_group_id)
+            if _dedupe_seen(queue_root, job["dedupe_key"], processing):
+                raise DuplicateJobError("duplicate dedupe_key")
+            if job["not_before"] and datetime.fromisoformat(job["not_before"].replace("Z", "+00:00")) > datetime.now(timezone.utc):
+                os.replace(processing, source)
+                continue
+            publish(job, [processing / name for name in job["media"]])
+            os.replace(processing, queue_root / "done" / source.name)
+            return 0
+        except Exception as exc:
+            failed_target = queue_root / "failed" / source.name
+            if isinstance(exc, DuplicateJobError) and failed_target.is_dir():
+                shutil.rmtree(processing)
+                return 1
+            (processing / "error.txt").write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
+            os.replace(processing, failed_target)
+            return 1
+    return 0

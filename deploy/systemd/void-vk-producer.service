@@ -1,0 +1,23 @@
+[Unit]
+Description=Produce one scheduled VOID VK queue job
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/etc/void-vk-producer.disabled
+
+[Service]
+Type=oneshot
+User=void
+Group=vkqueue
+SupplementaryGroups=vkqueue
+WorkingDirectory=/opt/void_entity
+EnvironmentFile=/opt/void_entity/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=VK_PUBLISH_QUEUE_DIR=/var/lib/void-vk-publisher/queue
+UMask=0027
+ExecStart=/opt/void_entity/venv/bin/python /opt/void_entity/void_vk_producer.py produce-scheduled
+TimeoutStartSec=30min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/void_entity/void.db /opt/void_entity/data/vk_browser_payloads /var/lib/void-vk-publisher/queue/pending

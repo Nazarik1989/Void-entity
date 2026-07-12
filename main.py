@@ -4,23 +4,41 @@ from __future__ import annotations
 import asyncio
 import base64
 import html
+import json
+import mimetypes
 import os
+import random
 import re
+import socket
 import sqlite3
+import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin
+from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import feedparser
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.filters import Command, CommandStart
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 
-from void_core import CONTENT_PLAN, MODE_RUBRICS, VOID_CORE_PROMPT, platform_context
+import character_state as void_character
+import delegated_messaging
+import duo_relationship
+import gaming_vertical
+from void_core import (
+    CONTENT_PLAN,
+    MODE_RUBRICS,
+    RUBRIC_SCHEDULE,
+    TELEGRAM_VOID_SCHEDULE,
+    VOID_CORE_PROMPT,
+    platform_context,
+)
 
 try:
     from openai import OpenAI
@@ -42,15 +60,32 @@ OPENAI_DIALOG_MODEL = os.getenv("OPENAI_DIALOG_MODEL", os.getenv("OPENAI_MODEL",
 OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
 OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
+TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 
-NAZ_CHANNEL_ID = os.getenv("NAZ_CHANNEL_ID", "")
-NAZ_BOT_TOKEN = os.getenv("NAZ_BOT_TOKEN", "")
 CROSSPOST_DAILY_LIMIT = int(os.getenv("CROSSPOST_DAILY_LIMIT", "2") or "2")
+CROSSPOST_EXCHANGE_ENABLED = os.getenv("CROSSPOST_EXCHANGE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+CROSSPOST_EXCHANGE_AUTO_PUBLISH = os.getenv("CROSSPOST_EXCHANGE_AUTO_PUBLISH", "true").strip().lower() not in {"0", "false", "no", "off"}
+CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exchange").strip())
+CROSSPOST_EXCHANGE_INTERVAL_SECONDS = max(60, int(os.getenv("CROSSPOST_EXCHANGE_INTERVAL_SECONDS", "300") or "300"))
+CROSSPOST_EXCHANGE_MAX_PER_RUN = max(1, min(int(os.getenv("CROSSPOST_EXCHANGE_MAX_PER_RUN", "1") or "1"), 5))
+
+VK_USER_ACCESS_TOKEN = os.getenv("VK_USER_ACCESS_TOKEN", "")
+VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
+VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199")
+VK_DRY_RUN = os.getenv("VK_DRY_RUN", "true").strip().lower() not in {"0", "false", "no", "off"}
+VK_MUSIC_TRACKS_FILE = os.getenv("VK_MUSIC_TRACKS_FILE", "data/vk_music_tracks.json")
+VK_PHOTO_ACCESS_TOKEN = os.getenv("VK_PHOTO_ACCESS_TOKEN", "")
 
 DB_PATH = "void.db"
+try:
+    MOSCOW_TZ = ZoneInfo("Europe/Moscow")
+except ZoneInfoNotFoundError:
+    MOSCOW_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
 
 router = Router()
 auto_task: asyncio.Task | None = None
+exchange_task: asyncio.Task | None = None
+pending_delegation_purposes: dict[int, str] = {}
 
 
 RSS_SOURCES = [
@@ -185,6 +220,17 @@ def init_db() -> None:
     """)
 
     cur.execute("""
+    CREATE TABLE IF NOT EXISTS vk_posts (
+        draft_id INTEGER PRIMARY KEY,
+        post_id INTEGER NOT NULL,
+        owner_id INTEGER NOT NULL,
+        attachments TEXT,
+        music_track TEXT,
+        published_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
     CREATE TABLE IF NOT EXISTS dialog_sessions (
     user_id INTEGER PRIMARY KEY,
     enabled INTEGER DEFAULT 0,
@@ -203,6 +249,384 @@ def init_db() -> None:
     )
     """)
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS character_states (
+        character_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        core_version TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS content_signatures (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        character_id TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        facet TEXT NOT NULL,
+        intent TEXT NOT NULL,
+        format TEXT NOT NULL,
+        content_format TEXT NOT NULL DEFAULT 'text_story',
+        content_kind TEXT NOT NULL DEFAULT 'text',
+        hook TEXT NOT NULL,
+        media TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+
+    signature_columns = {row[1] for row in cur.execute("PRAGMA table_info(content_signatures)").fetchall()}
+    if "content_format" not in signature_columns:
+        cur.execute("ALTER TABLE content_signatures ADD COLUMN content_format TEXT NOT NULL DEFAULT 'text_story'")
+    if "content_kind" not in signature_columns:
+        cur.execute("ALTER TABLE content_signatures ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'text'")
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_void_signatures_created ON content_signatures(character_id, id)")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS relationship_states (
+        relationship_id TEXT PRIMARY KEY,
+        state_json TEXT NOT NULL,
+        version TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS private_thoughts (
+        thought_id TEXT PRIMARY KEY,
+        speaker TEXT NOT NULL,
+        receiver TEXT NOT NULL,
+        topic TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'new',
+        created_at TEXT NOT NULL,
+        consumed_at TEXT
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS saved_contacts (
+        chat_id INTEGER PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL,
+        alias TEXT,
+        display_name TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending_name',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(owner_user_id, alias)
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS contact_naming_requests (
+        prompt_message_id INTEGER PRIMARY KEY,
+        owner_user_id INTEGER NOT NULL,
+        contact_chat_id INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS reachable_peers (
+        chat_id INTEGER PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS delegation_invites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        token TEXT NOT NULL UNIQUE,
+        owner_user_id INTEGER NOT NULL,
+        character_id TEXT NOT NULL,
+        contact_label TEXT NOT NULL,
+        purpose TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'waiting',
+        contact_chat_id INTEGER,
+        contact_name TEXT,
+        max_turns INTEGER NOT NULL DEFAULT 20,
+        turns_used INTEGER NOT NULL DEFAULT 0,
+        expires_at TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS delegated_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        delegation_id INTEGER NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS delegation_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        owner_user_id INTEGER NOT NULL,
+        character_id TEXT NOT NULL,
+        outcome TEXT NOT NULL,
+        turns_used INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_delegation_contact ON delegation_invites(contact_chat_id, status)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_delegated_messages ON delegated_messages(delegation_id, id)")
+
+    conn.commit()
+    conn.close()
+
+
+def create_delegation_invite(owner_user_id: int, contact_label: str, purpose: str, token: str, expires_at: str) -> int:
+    init_db()
+    conn = db()
+    active = conn.execute(
+        "SELECT id FROM delegation_invites WHERE owner_user_id=? AND status IN ('accepted','active','paused')",
+        (owner_user_id,),
+    ).fetchone()
+    if active:
+        conn.close()
+        raise ValueError(f"Сначала заверши текущее поручение #{active['id']}.")
+    stale = conn.execute("SELECT id FROM delegation_invites WHERE owner_user_id=?", (owner_user_id,)).fetchall()
+    for row in stale:
+        conn.execute("DELETE FROM delegated_messages WHERE delegation_id=?", (row["id"],))
+    conn.execute("DELETE FROM delegation_invites WHERE owner_user_id=?", (owner_user_id,))
+    now = now_iso()
+    cur = conn.execute(
+        """INSERT INTO delegation_invites(
+            token, owner_user_id, character_id, contact_label, purpose, status,
+            max_turns, expires_at, created_at, updated_at
+        ) VALUES (?, ?, 'void', ?, ?, 'waiting', 20, ?, ?, ?)""",
+        (token, owner_user_id, contact_label[:200], purpose[:1200], expires_at, now, now),
+    )
+    delegation_id = int(cur.lastrowid)
+    conn.commit()
+    conn.close()
+    return delegation_id
+
+
+def remember_reachable_peer(chat_id: int, display_name: str, expires_at: str) -> None:
+    init_db()
+    conn = db()
+    conn.execute("DELETE FROM reachable_peers WHERE expires_at<=?", (now_iso(),))
+    conn.execute(
+        """INSERT INTO reachable_peers(chat_id, display_name, expires_at, created_at)
+           VALUES (?, ?, ?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET display_name=excluded.display_name, expires_at=excluded.expires_at""",
+        (chat_id, display_name[:200], expires_at, now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def register_contact_arrival(owner_user_id: int, chat_id: int, display_name: str) -> bool:
+    init_db()
+    conn = db()
+    row = conn.execute("SELECT status FROM saved_contacts WHERE chat_id=?", (chat_id,)).fetchone()
+    if row:
+        conn.close()
+        return False
+    now = now_iso()
+    conn.execute(
+        "INSERT INTO saved_contacts(chat_id, owner_user_id, display_name, status, created_at, updated_at) VALUES (?, ?, ?, 'pending_name', ?, ?)",
+        (chat_id, owner_user_id, display_name[:200], now, now),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def save_contact_naming_request(prompt_message_id: int, owner_user_id: int, contact_chat_id: int) -> None:
+    conn = db()
+    conn.execute(
+        "INSERT OR REPLACE INTO contact_naming_requests(prompt_message_id, owner_user_id, contact_chat_id, created_at) VALUES (?, ?, ?, ?)",
+        (prompt_message_id, owner_user_id, contact_chat_id, now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def name_contact_from_reply(prompt_message_id: int, owner_user_id: int, alias: str) -> dict | None:
+    clean_alias = " ".join((alias or "").split()).strip()[:80]
+    if not clean_alias:
+        return None
+    conn = db()
+    request = conn.execute(
+        "SELECT * FROM contact_naming_requests WHERE prompt_message_id=? AND owner_user_id=?",
+        (prompt_message_id, owner_user_id),
+    ).fetchone()
+    if not request:
+        conn.close()
+        return None
+    duplicate = conn.execute(
+        "SELECT chat_id FROM saved_contacts WHERE owner_user_id=? AND lower(alias)=lower(?) AND chat_id<>?",
+        (owner_user_id, clean_alias, request["contact_chat_id"]),
+    ).fetchone()
+    if duplicate:
+        conn.close()
+        raise ValueError("Такое имя уже занято другим контактом.")
+    conn.execute(
+        "UPDATE saved_contacts SET alias=?, status='saved', updated_at=? WHERE chat_id=?",
+        (clean_alias, now_iso(), request["contact_chat_id"]),
+    )
+    conn.execute("DELETE FROM contact_naming_requests WHERE prompt_message_id=?", (prompt_message_id,))
+    row = conn.execute("SELECT * FROM saved_contacts WHERE chat_id=?", (request["contact_chat_id"],)).fetchone()
+    conn.commit()
+    conn.close()
+    return dict(row) if row else None
+
+
+def list_saved_contacts(owner_user_id: int) -> list[dict]:
+    init_db()
+    conn = db()
+    rows = conn.execute(
+        "SELECT chat_id, alias, display_name FROM saved_contacts WHERE owner_user_id=? AND status='saved' ORDER BY alias",
+        (owner_user_id,),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def save_named_contact(owner_user_id: int, chat_id: int, display_name: str, alias: str) -> dict:
+    clean_alias = " ".join((alias or "").split()).strip()[:80]
+    if not clean_alias:
+        raise ValueError("Имя контакта пустое.")
+    init_db()
+    conn = db()
+    duplicate = conn.execute(
+        "SELECT chat_id FROM saved_contacts WHERE owner_user_id=? AND lower(alias)=lower(?) AND chat_id<>?",
+        (owner_user_id, clean_alias, chat_id),
+    ).fetchone()
+    if duplicate:
+        conn.close()
+        raise ValueError("Такое имя уже занято другим контактом.")
+    now = now_iso()
+    conn.execute(
+        """INSERT INTO saved_contacts(chat_id, owner_user_id, alias, display_name, status, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 'saved', ?, ?)
+           ON CONFLICT(chat_id) DO UPDATE SET owner_user_id=excluded.owner_user_id,
+               alias=excluded.alias, display_name=excluded.display_name, status='saved', updated_at=excluded.updated_at""",
+        (chat_id, owner_user_id, clean_alias, display_name[:200], now, now),
+    )
+    row = conn.execute("SELECT * FROM saved_contacts WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return dict(row)
+
+
+def list_previous_contact_ids(owner_user_id: int, limit: int = 30) -> list[int]:
+    init_db()
+    conn = db()
+    rows = conn.execute(
+        """SELECT DISTINCT user_id FROM dialog_messages
+           WHERE user_id<>? AND user_id NOT IN (
+               SELECT chat_id FROM saved_contacts WHERE owner_user_id=? AND status='saved'
+           ) ORDER BY user_id DESC LIMIT ?""",
+        (owner_user_id, owner_user_id, max(1, limit)),
+    ).fetchall()
+    conn.close()
+    return [int(row["user_id"]) for row in rows]
+
+
+def get_reachable_peer(chat_id: int) -> dict | None:
+    init_db()
+    conn = db()
+    conn.execute("DELETE FROM reachable_peers WHERE expires_at<=?", (now_iso(),))
+    row = conn.execute("SELECT * FROM reachable_peers WHERE chat_id=?", (chat_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_delegation(delegation_id: int) -> dict | None:
+    init_db()
+    conn = db()
+    row = conn.execute("SELECT * FROM delegation_invites WHERE id=?", (delegation_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def accept_delegation_invite(token: str, contact_chat_id: int, contact_name: str) -> dict | None:
+    init_db()
+    conn = db()
+    now = now_iso()
+    row = conn.execute(
+        "SELECT * FROM delegation_invites WHERE token=? AND status='waiting' AND expires_at>?",
+        (token, now),
+    ).fetchone()
+    if not row:
+        conn.close()
+        return None
+    conn.execute(
+        "UPDATE delegation_invites SET status='accepted', contact_chat_id=?, contact_name=?, updated_at=? WHERE id=?",
+        (contact_chat_id, contact_name[:200], now, row["id"]),
+    )
+    conn.commit()
+    conn.close()
+    result = dict(row)
+    result.update(status="accepted", contact_chat_id=contact_chat_id, contact_name=contact_name[:200], updated_at=now)
+    return result
+
+
+def set_delegation_status(delegation_id: int, status: str) -> None:
+    conn = db()
+    conn.execute("UPDATE delegation_invites SET status=?, updated_at=? WHERE id=?", (status, now_iso(), delegation_id))
+    conn.commit()
+    conn.close()
+
+
+def get_active_delegation(contact_chat_id: int) -> dict | None:
+    init_db()
+    conn = db()
+    row = conn.execute(
+        """SELECT * FROM delegation_invites WHERE contact_chat_id=? AND status='active' AND expires_at>?
+           ORDER BY id DESC LIMIT 1""",
+        (contact_chat_id, now_iso()),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def save_delegated_message(delegation_id: int, role: str, content: str) -> None:
+    conn = db()
+    conn.execute(
+        "INSERT INTO delegated_messages(delegation_id, role, content, created_at) VALUES (?, ?, ?, ?)",
+        (delegation_id, role, content[:8000], now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_delegated_history(delegation_id: int, limit: int = 10) -> list[dict[str, str]]:
+    conn = db()
+    rows = conn.execute(
+        "SELECT role, content FROM delegated_messages WHERE delegation_id=? ORDER BY id DESC LIMIT ?",
+        (delegation_id, max(1, limit)),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in reversed(rows)]
+
+
+def increment_delegation_turns(delegation_id: int) -> int:
+    conn = db()
+    conn.execute("UPDATE delegation_invites SET turns_used=turns_used+1, updated_at=? WHERE id=?", (now_iso(), delegation_id))
+    row = conn.execute("SELECT turns_used FROM delegation_invites WHERE id=?", (delegation_id,)).fetchone()
+    conn.commit()
+    conn.close()
+    return int(row["turns_used"]) if row else 0
+
+
+def purge_delegation(delegation_id: int, outcome: str) -> None:
+    conn = db()
+    row = conn.execute("SELECT * FROM delegation_invites WHERE id=?", (delegation_id,)).fetchone()
+    if row:
+        conn.execute(
+            "INSERT INTO delegation_audit(owner_user_id, character_id, outcome, turns_used, created_at) VALUES (?, ?, ?, ?, ?)",
+            (row["owner_user_id"], row["character_id"], outcome[:80], row["turns_used"], now_iso()),
+        )
+        conn.execute("DELETE FROM delegated_messages WHERE delegation_id=?", (delegation_id,))
+        if row["contact_chat_id"] is not None:
+            conn.execute("DELETE FROM reachable_peers WHERE chat_id=?", (row["contact_chat_id"],))
+        conn.execute("DELETE FROM delegation_invites WHERE id=?", (delegation_id,))
     conn.commit()
     conn.close()
 
@@ -219,6 +643,195 @@ def set_setting(key: str, value: str) -> None:
     conn.execute(
         "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
         (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_character_state() -> void_character.CharacterState:
+    conn = db()
+    row = conn.execute(
+        "SELECT state_json FROM character_states WHERE character_id=?",
+        (void_character.CHARACTER_ID,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        state = void_character.CharacterState()
+        save_character_state(state)
+        return state
+    try:
+        raw = json.loads(row["state_json"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return void_character.normalize_state(raw if isinstance(raw, dict) else {})
+
+
+def save_character_state(state: void_character.CharacterState) -> None:
+    normalized = void_character.normalize_state(state.to_dict())
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO character_states(character_id, state_json, core_version, updated_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(character_id) DO UPDATE SET
+            state_json=excluded.state_json,
+            core_version=excluded.core_version,
+            updated_at=excluded.updated_at
+        """,
+        (
+            void_character.CHARACTER_ID,
+            json.dumps(normalized.to_dict(), ensure_ascii=False),
+            normalized.core_version,
+            now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def apply_character_event(event: str) -> void_character.CharacterState:
+    state = void_character.apply_event(load_character_state(), event)
+    save_character_state(state)
+    return state
+
+
+def set_character_axis(axis: str, value: int) -> void_character.CharacterState:
+    state = void_character.set_axis(load_character_state(), axis, value)
+    save_character_state(state)
+    return state
+
+
+def get_recent_content_signatures(limit: int = 16) -> list[dict[str, str]]:
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT platform, facet, intent, format, content_format, content_kind, hook, media, topic, created_at
+        FROM content_signatures
+        WHERE character_id=?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (void_character.CHARACTER_ID, max(1, limit)),
+    ).fetchall()
+    conn.close()
+    return [dict(row) for row in reversed(rows)]
+
+
+def record_content_signature(plan: dict[str, str], topic: str) -> None:
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO content_signatures(
+            character_id, platform, facet, intent, format, content_format, content_kind,
+            hook, media, topic, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            void_character.CHARACTER_ID,
+            str(plan.get("platform", "telegram")),
+            str(plan.get("facet", "observer")),
+            str(plan.get("intent", "наблюдать")),
+            str(plan.get("format", "тихое наблюдение")),
+            str(plan.get("content_format", "text_story")),
+            str(plan.get("content_kind", "text")),
+            str(plan.get("hook", "деталь")),
+            str(plan.get("media", "кинематографический кадр")),
+            topic[:1000],
+            now_iso(),
+        ),
+    )
+    conn.execute(
+        """
+        DELETE FROM content_signatures
+        WHERE character_id=? AND id NOT IN (
+            SELECT id FROM content_signatures
+            WHERE character_id=?
+            ORDER BY id DESC
+            LIMIT 80
+        )
+        """,
+        (void_character.CHARACTER_ID, void_character.CHARACTER_ID),
+    )
+    conn.commit()
+    conn.close()
+
+
+def character_event_for_mode(mode: str) -> str:
+    if mode in {"frequency", "culture", "midnight"}:
+        return "beauty"
+    if mode in {"news", "digest", "archive"}:
+        return "noise"
+    if mode == "future":
+        return "naz_challenge"
+    return "quiet"
+
+
+def build_character_directive(topic: str, platform: str, mode: str) -> tuple[void_character.CharacterState, dict[str, str], str]:
+    state = apply_character_event(character_event_for_mode(mode))
+    plan = void_character.plan_content(
+        state,
+        get_recent_content_signatures(),
+        topic=topic,
+        platform=platform,
+    )
+    return state, plan, void_character.prompt_context(state, plan)
+
+
+def load_relationship_state() -> duo_relationship.RelationshipState:
+    init_db()
+    conn = db()
+    row = conn.execute(
+        "SELECT state_json FROM relationship_states WHERE relationship_id='naz-void'"
+    ).fetchone()
+    conn.close()
+    if not row:
+        state = duo_relationship.RelationshipState()
+        save_relationship_state(state)
+        return state
+    try:
+        raw = json.loads(row["state_json"] or "{}")
+    except json.JSONDecodeError:
+        raw = {}
+    return duo_relationship.normalize_state(raw if isinstance(raw, dict) else {})
+
+
+def save_relationship_state(state: duo_relationship.RelationshipState) -> None:
+    normalized = duo_relationship.normalize_state(state.to_dict())
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO relationship_states(relationship_id, state_json, version, updated_at)
+        VALUES ('naz-void', ?, ?, ?)
+        ON CONFLICT(relationship_id) DO UPDATE SET
+            state_json=excluded.state_json, version=excluded.version, updated_at=excluded.updated_at
+        """,
+        (json.dumps(normalized.to_dict(), ensure_ascii=False), normalized.version, now_iso()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def apply_relationship_event(event: str, *, topic: str = "", note: str = "") -> duo_relationship.RelationshipState:
+    state = duo_relationship.apply_event(load_relationship_state(), event, topic=topic, note=note)
+    save_relationship_state(state)
+    return state
+
+
+def save_private_thought(payload: dict[str, Any], status: str = "new") -> None:
+    ok, reason = duo_relationship.validate_private_thought_payload(payload)
+    if not ok:
+        raise ValueError(reason)
+    conn = db()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO private_thoughts(
+            thought_id, speaker, receiver, topic, payload_json, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload["thought_id"], payload["speaker"], payload["receiver"],
+            str(payload.get("topic", ""))[:1000], json.dumps(payload, ensure_ascii=False), status, now_iso(),
+        ),
     )
     conn.commit()
     conn.close()
@@ -250,7 +863,7 @@ def crosspost_status_text() -> str:
         "Cross-post today:\n"
         f"VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}\n"
         f"Naz AI Bot -> VOID: {crosspost_count('naz_to_void')}/{CROSSPOST_DAILY_LIMIT}\n"
-        f"NAZ_CHANNEL_ID: {'set' if NAZ_CHANNEL_ID else 'not set'}"
+        f"Exchange: {'enabled' if CROSSPOST_EXCHANGE_ENABLED else 'disabled'}"
     )
 
 
@@ -484,6 +1097,7 @@ def build_dialog_prompt(user_text: str, personality: str, history: list[dict], m
         memory_block = f"\n\nКраткая память:\n{memory_note}\n"
 
     personality_style = get_personality_style(personality)
+    character_context = void_character.dialogue_context(load_character_state())
 
     return f"""
 {VOID_CORE_PROMPT}
@@ -494,31 +1108,73 @@ def build_dialog_prompt(user_text: str, personality: str, history: list[dict], m
     Ты — наблюдательный, сухой, чуть ироничный собеседник.
     Отвечай кратко, по-русски, без markdown.
     {personality_style}
+    {character_context}
     {memory_block}{history_block}
     Текущее сообщение пользователя: {user_text}
     """.strip()
 
 
+BTN_GUIDE = "🧭 Как общаться"
+BTN_PERSONA = "🎭 Характер"
+BTN_TOPICS = "🛰 Темы"
+BTN_STATUS = "📊 Статус"
+BTN_RESET = "🧹 Очистить контекст"
+BTN_BACK = "⬅️ Назад"
+
+
+def reply_main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_GUIDE), KeyboardButton(text=BTN_PERSONA)],
+            [KeyboardButton(text=BTN_TOPICS), KeyboardButton(text=BTN_STATUS)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def reply_guide_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_RESET)],
+            [KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def reply_topics_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📰 Новости"), KeyboardButton(text="🎵 Музыка")],
+            [KeyboardButton(text="🔮 Будущее"), KeyboardButton(text=BTN_BACK)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
 def main_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="💬 Диалог", callback_data="void:dialog"),
-            InlineKeyboardButton(text="🎭 Характер", callback_data="void:persona"),
+            InlineKeyboardButton(text=BTN_GUIDE, callback_data="void:guide"),
+            InlineKeyboardButton(text=BTN_PERSONA, callback_data="void:persona"),
         ],
         [
-            InlineKeyboardButton(text="📊 Статус", callback_data="void:status"),
+            InlineKeyboardButton(text=BTN_TOPICS, callback_data="void:quick"),
+            InlineKeyboardButton(text=BTN_STATUS, callback_data="void:status"),
         ],
     ])
 
 
-def dialog_keyboard():
+def guide_keyboard():
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="🟢 Включить", callback_data="void:dialog:on"),
-            InlineKeyboardButton(text="🔴 Выключить", callback_data="void:dialog:off"),
+            InlineKeyboardButton(text=BTN_RESET, callback_data="void:reset"),
         ],
         [
-            InlineKeyboardButton(text="⬅️ Назад", callback_data="void:menu"),
+            InlineKeyboardButton(text=BTN_BACK, callback_data="void:menu"),
         ],
     ])
 
@@ -539,25 +1195,210 @@ def quick_actions_keyboard():
         [InlineKeyboardButton(text="📰 Новости", callback_data="void:quick:news")],
         [InlineKeyboardButton(text="🎵 Музыка", callback_data="void:quick:music")],
         [InlineKeyboardButton(text="🔮 Будущее", callback_data="void:quick:future")],
-        [InlineKeyboardButton(text="💬 Диалог", callback_data="void:dialog")],
+        [InlineKeyboardButton(text="🧭 Как общаться", callback_data="void:guide")],
         [InlineKeyboardButton(text="🎭 Характер", callback_data="void:persona")],
-        [InlineKeyboardButton(text="📊 Статус", callback_data="void:status")],
+        [InlineKeyboardButton(text=BTN_BACK, callback_data="void:menu")],
     ])
+
+
+def welcome_text() -> str:
+    return (
+        "VOID online.\n\n"
+        "Я не командная строка. Просто напиши мысль, вопрос, ссылку, новость или странное наблюдение.\n\n"
+        "Я отвечу коротко, по делу и чуть сбоку: где тут сигнал, что в этом человеческого и почему это вообще цепляет.\n\n"
+        "Кнопки ниже — это навигация, если хочется настроить тон или понять, с чего начать."
+    )
+
+
+def delegation_from_row(row: dict[str, Any]) -> delegated_messaging.Delegation:
+    return delegated_messaging.Delegation(
+        character_id=str(row["character_id"]), owner_user_id=int(row["owner_user_id"]),
+        contact_chat_id=int(row["contact_chat_id"]),
+        contact_name=str(row.get("contact_name") or row.get("contact_label") or "Собеседник"),
+        purpose=str(row["purpose"]), status=str(row["status"]), max_turns=int(row["max_turns"]),
+        turns_used=int(row["turns_used"]), expires_at=str(row["expires_at"]),
+    )
+
+
+async def ensure_contact_named(message: Message) -> None:
+    if not message.from_user or not ADMIN_ID or message.from_user.id == ADMIN_ID:
+        return
+    if not register_contact_arrival(ADMIN_ID, message.from_user.id, message.from_user.full_name):
+        return
+    prompt = await message.bot.send_message(
+        ADMIN_ID,
+        f"Мне впервые написал {message.from_user.full_name} (Telegram ID {message.from_user.id}).\n"
+        "Как записать контакт? Ответь на это сообщение одним именем, например: Диман",
+    )
+    save_contact_naming_request(prompt.message_id, ADMIN_ID, message.from_user.id)
+
+
+async def start_saved_contact_delegation(message: Message, contact: dict[str, Any], purpose: str) -> None:
+    token = delegated_messaging.invite_token()
+    expires = (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds")
+    delegation_id = create_delegation_invite(message.from_user.id, str(contact["alias"]), purpose, token, expires)
+    row = accept_delegation_invite(token, int(contact["chat_id"]), str(contact["alias"]))
+    if not row:
+        raise RuntimeError("Не удалось привязать сохранённый контакт.")
+    delegation = delegation_from_row(row)
+    intro = delegated_messaging.introduction(delegation)
+    await message.bot.send_message(delegation.contact_chat_id, intro)
+    save_delegated_message(delegation_id, "assistant", intro)
+    set_delegation_status(delegation_id, "active")
+    await message.answer(
+        f"Нашёл {contact['alias']} и начал поручение #{delegation_id}. После разговора удалю сессию и переписку."
+    )
+
+
+async def handle_delegated_reply(message: Message, text: str) -> bool:
+    if not message.from_user:
+        return False
+    row = get_active_delegation(message.from_user.id)
+    if not row:
+        return False
+    delegation_id = int(row["id"])
+    delegation = delegation_from_row(row)
+    if delegated_messaging.is_stop(text):
+        await message.answer("Остановился. Переписка этой сессии удалена.")
+        await message.bot.send_message(delegation.owner_user_id, f"Собеседник остановил поручение #{delegation_id}.")
+        purge_delegation(delegation_id, "contact_stopped")
+        return True
+    risks = delegated_messaging.assess_risk(text)
+    save_delegated_message(delegation_id, "contact", text)
+    if risks:
+        set_delegation_status(delegation_id, "paused")
+        await message.answer("Тут нужно подтверждение Назара. Я поставил разговор на паузу.")
+        await message.bot.send_message(
+            delegation.owner_user_id,
+            f"Поручение #{delegation_id} на паузе ({', '.join(risks)}). Ответить: /delegate_reply {delegation_id} текст",
+        )
+        return True
+    history = get_delegated_history(delegation_id, 24)
+    prompt = delegated_messaging.system_prompt(
+        delegation=delegation,
+        character_context=void_character.dialogue_context(load_character_state()),
+        history=history,
+    )
+    reply = await asyncio.to_thread(call_ai, prompt, text, 500, OPENAI_DIALOG_MODEL)
+    if reply == "OWNER_CONFIRMATION_REQUIRED" or delegated_messaging.assess_risk(reply):
+        set_delegation_status(delegation_id, "paused")
+        await message.answer("Мне нужно свериться с Назаром. Поставил разговор на паузу.")
+        await message.bot.send_message(
+            delegation.owner_user_id,
+            f"VOID остановил поручение #{delegation_id}. Ответить: /delegate_reply {delegation_id} текст",
+        )
+        return True
+    await message.answer(reply)
+    save_delegated_message(delegation_id, "assistant", reply)
+    turns = increment_delegation_turns(delegation_id)
+    if turns >= delegation.max_turns:
+        await message.answer("На этом поручение завершено. Спасибо за разговор.")
+        await message.bot.send_message(delegation.owner_user_id, f"Поручение #{delegation_id} завершено по лимиту.")
+        purge_delegation(delegation_id, "turn_limit")
+    return True
+
+
+def commands_text() -> str:
+    return (
+        "VOID commands\n\n"
+        "Core:\n"
+        "/start - open VOID\n"
+        "/help - command rooms\n"
+        "/commands - this list\n"
+        "/vk_commands - VK publisher and music commands\n\n"
+        "Character:\n"
+        "/character - current VOID facet and mood\n"
+        "/character_event event - apply an event (admin)\n\n"
+        "/character_set axis 0-100 - adjust state (admin)\n\n"
+        "/character_simulate 10 - preview future states without saving\n"
+        "/relationship - Naz/VOID relationship state\n"
+        "/relationship_event event topic - apply relationship event (admin)\n\n"
+        "Drafts:\n"
+        "/scan - find fresh signals\n"
+        "/discuss_news - start one shared Naz/VOID news conversation\n"
+        "/candidates - show candidates\n"
+        "/draft ID - create draft from candidate\n"
+        "/drafts - show drafts\n"
+        "/preview ID - show full draft\n"
+        "/publish ID - publish draft to Telegram\n\n"
+        "Gaming:\n"
+        "/gaming topic - create a VOID gaming draft\n"
+        "/gaming_commercial topic - gaming draft with a soft product test\n"
+        "/gaming_plan topic - preview rubric and format\n\n"
+        "Private conversation:\n"
+        "/void text - prepare a private-dialogue fragment for Naz\n"
+        "/publish_void text - queue a VOID fragment for Naz adaptation\n"
+        "/thought_to_naz text - send an unpublished private thought to Naz\n"
+        "/thought_from_naz text - digest an unpublished Naz thought\n"
+        "Напиши Диману, чтобы… - начать разговор с сохранённым контактом\n"
+        "/contact_candidates - прежние незаписанные собеседники\n"
+        "/contact_add ID Имя - сохранить прежнего собеседника\n"
+        "/delegate_stop ID - завершить поручение\n"
+        "/cross_status - today's cross-post counters\n"
+        "/cross_to_naz ID - extract a fragment and queue it for Naz\n"
+        "/cross_from_naz text - adapt Naz AI Bot post to VOID\n\n"
+        "Rubric schedule:\n"
+        "/rubric_schedule - show rubric windows\n"
+        "/vk_schedule_draft - create one scheduled VK draft now\n\n"
+        "Telegram schedules:\n"
+        "/telegram_schedule - show VOID Telegram windows\n"
+        "/void_schedule_now - publish one scheduled VOID Telegram post\n"
+        "Stats:\n"
+        "/stats - database stats"
+    )
+
+
+def vk_commands_text() -> str:
+    return (
+        "VK commands\n\n"
+        "Publisher:\n"
+        "/vk_status - VK env and mode status\n"
+        "/vk_test text - dry-run raw VK text post\n"
+        "/vk_test --yes text - publish raw VK test post\n"
+        "/publish_vk ID - dry-run draft VK post\n"
+        "/publish_vk --yes ID - publish draft to VK\n\n"
+        "Rubric schedule:\n"
+        "/rubric_schedule - show current rubric windows\n"
+        "/vk_schedule_draft - make one scheduled VK draft now\n\n"
+        "Music cache:\n"
+        "/vk_music_status - show loaded track count\n"
+        "/vk_music_import Artist - Track | link | tags - import tracks from text\n"
+        "/vk_music_sync URL - planned browser sync from a VK playlist\n"
+        "/vk_music_sync URL night,electronic,melancholy - planned sync with base tags\n\n"
+        "Notes:\n"
+        "- /publish_vk blocks duplicate VK posts by draft id.\n"
+        "- VOID project owns VOID VK drafts only; Naz VK automation belongs in the Naz project.\n"
+        "- API publishing can still fall back to soundtrack text if browser publishing is not used."
+    )
+
+
+def guide_text() -> str:
+    return (
+        "🧭 Как со мной общаться\n\n"
+        "Можно писать обычным текстом, без команд.\n\n"
+        "Примеры:\n"
+        "• почему люди устают от AI-новостей\n"
+        "• вот ссылка, найди в ней сигнал\n"
+        "• сделай мысль жёстче и короче\n"
+        "• что в этой новости говорит о будущем\n\n"
+        "Я помню ближайший контекст диалога. Если разговор уехал, очисти контекст кнопкой ниже."
+    )
 
 @router.callback_query(F.data == "void:menu")
 async def void_menu_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "VOID online.\n\nВыбери режим:",
+        welcome_text(),
         reply_markup=main_keyboard(),
     )
     await callback.answer()
 
 
+@router.callback_query(F.data == "void:guide")
 @router.callback_query(F.data == "void:dialog")
-async def void_dialog_callback(callback: CallbackQuery):
+async def void_guide_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "💬 Диалоговый режим",
-        reply_markup=dialog_keyboard(),
+        guide_text(),
+        reply_markup=guide_keyboard(),
     )
     await callback.answer()
 
@@ -567,7 +1408,7 @@ async def void_dialog_on_callback(callback: CallbackQuery):
     set_dialog_enabled(callback.from_user.id, True)
 
     await callback.message.edit_text(
-        "🟢 Диалоговый режим включён.",
+        "Диалог теперь всегда включён. Просто пиши текст.",
         reply_markup=main_keyboard(),
     )
     await callback.answer()
@@ -575,11 +1416,18 @@ async def void_dialog_on_callback(callback: CallbackQuery):
 
 @router.callback_query(F.data == "void:dialog:off")
 async def void_dialog_off_callback(callback: CallbackQuery):
-    set_dialog_enabled(callback.from_user.id, False)
-    clear_dialog_context(callback.from_user.id)
-
     await callback.message.edit_text(
-        "🔴 Диалоговый режим выключен.",
+        "Я больше не выключаю диалог. Если нужно начать заново, очисти контекст.",
+        reply_markup=guide_keyboard(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "void:reset")
+async def void_reset_callback(callback: CallbackQuery):
+    clear_dialog_context(callback.from_user.id)
+    await callback.message.edit_text(
+        "🧹 Контекст очищен. Можно начинать с новой мысли.",
         reply_markup=main_keyboard(),
     )
     await callback.answer()
@@ -609,13 +1457,16 @@ async def void_persona_set_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "void:status")
 async def void_status_callback(callback: CallbackQuery):
     session = get_dialog_session(callback.from_user.id)
-    
-    
+    text = (
+        f"📊 Статус VOID\n\n"
+        f"Диалог: всегда ON\n"
+        f"Характер: {session['personality']}"
+    )
+    if callback.from_user and callback.from_user.id == ADMIN_ID:
+        text += f"\n\nКросспостинг:\n{crosspost_status_text()}"
 
     await callback.message.edit_text(
-        f"📊 Статус VOID\n\n"
-        f"Диалог: {'ON' if session['enabled'] else 'OFF'}\n"
-        f"Характер: {session['personality']}",
+        text,
         reply_markup=main_keyboard(),
     )
     await callback.answer()
@@ -791,6 +1642,39 @@ def already_published(url: str) -> bool:
     row = conn.execute("SELECT url FROM published_urls WHERE url=?", (url,)).fetchone()
     conn.close()
     return row is not None
+
+
+def get_vk_post_for_draft(draft_id: int) -> sqlite3.Row | None:
+    conn = db()
+    row = conn.execute("SELECT * FROM vk_posts WHERE draft_id=?", (draft_id,)).fetchone()
+    conn.close()
+    return row
+
+
+def mark_vk_published(
+    draft_id: int,
+    post_id: int,
+    owner_id: int,
+    attachments: list[str] | None = None,
+    music_track: dict[str, Any] | None = None,
+) -> None:
+    conn = db()
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO vk_posts(draft_id, post_id, owner_id, attachments, music_track, published_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            draft_id,
+            post_id,
+            owner_id,
+            ",".join(attachments or []),
+            json.dumps(music_track or {}, ensure_ascii=False),
+            now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
 
 
 def fetch_news() -> list[dict[str, Any]]:
@@ -1031,6 +1915,20 @@ def build_crosspost_to_naz_sync(draft: dict | sqlite3.Row) -> str:
     return build_void_fragment_for_naz_sync(draft["post"])
 
 
+VOID_TO_NAZ_OPENING_OPTIONS = (
+    "В закулисном чате Void бросил фразу:",
+    "Из тёмного угла прилетело:",
+    "Void оставил на столе странную мысль:",
+    "Это звучало почти как помеха, но там был смысл:",
+    "Из личного диалога с Naz вытащилась такая мысль:",
+    "Void сформулировал грубо, но точно:",
+)
+
+VOID_TO_NAZ_FORBIDDEN_OPENINGS = (
+    "Void опять говорит странно, но по делу:",
+)
+
+
 def validate_void_fragment_for_naz(text: str) -> tuple[bool, str]:
     fragment = text or ""
     checks = [
@@ -1068,41 +1966,133 @@ def build_void_fragment_for_naz_sync(fragment: str) -> str:
         raise ValueError(reason)
 
     instructions = f"""
-You adapt a VOID fragment for the Naz AI Bot Telegram channel.
+You extract one private-dialogue fragment spoken by VOID to Naz.
 
 VOID source voice:
 {VOID_CORE_PROMPT}
 
-Naz AI Bot voice:
-- practical AI ecosystem, tools, automation, content systems, useful experiments;
-- clear, friendly, not mystical;
-- show where this VOID signal has practical meaning;
-- explain the trap or use case for AI, bots, content, development, projects, or a person building systems;
-- do not mirror the post word-for-word;
-- choose one format naturally: "VOID сказал", "Перевод с VOID на человеческий", or "Спор двух ботов";
-- vary the opening phrase;
-- mention VOID as the source of the signal;
+This is not a Telegram post and not copy prepared for reposting.
+Give Naz only one of these:
+- a thought;
+- a fragment of their internal dialogue;
+- a strange thesis;
+- a philosophical or dark impulse;
+- a short phrase Naz can later decode for the viewer.
+
+Rules:
+- preserve VOID's voice, tension, and odd precision;
+- 1-4 short sentences, preferably 80-500 characters;
+- do not add a headline, rubric, source line, hashtags, call to action, or explanatory conclusion;
+- do not introduce the quote and do not write Naz's interpretation;
+- do not make the fragment self-contained like a finished social-media post;
+- do not mention reposting, cross-posting, channels, audiences, or content production;
 - stop if the input contains secrets, tokens, passwords, private URLs, SSH/IP access, client details, or private chats;
 - Russian only.
 
-Return only the final Telegram post. No markdown fences.
+Return strictly:
+FRAGMENT: the fragment spoken by VOID
 """.strip()
 
-    input_text = f"VOID_FRAGMENT:\n{fragment.strip()}"
-    return trim_post(call_ai(instructions, input_text, max_output_tokens=900, model=OPENAI_POST_MODEL), limit=3000)
+    input_text = f"SOURCE_MATERIAL:\n{fragment.strip()}"
+    raw = call_ai(instructions, input_text, max_output_tokens=350, model=OPENAI_POST_MODEL)
+    match = re.search(r"FRAGMENT\s*:\s*(.+)", raw, flags=re.I | re.S)
+    result = (match.group(1) if match else raw).replace("```", "").strip()
+    return trim_post(result, limit=700)
 
 
-def build_crosspost_from_naz_sync(source_text: str) -> dict[str, str]:
+def build_void_to_naz_exchange_payload(
+    fragment: str,
+    *,
+    source_event: str,
+    topic: str = "",
+) -> dict[str, Any]:
+    ok, reason = validate_void_fragment_for_naz(fragment)
+    if not ok:
+        raise ValueError(reason)
+
+    relationship = apply_relationship_event("challenge", topic=topic or fragment[:200])
+    payload = duo_relationship.build_private_thought_payload(
+        speaker="void",
+        thought=fragment,
+        topic=topic or "мысль после разговора",
+        relationship=relationship,
+        source_kind=source_event,
+    )
+    payload.update({
+        "id": payload["thought_id"],
+        "source": "void_entity",
+        "source_event": source_event,
+        "exchange_kind": "private_thought",
+        "text": payload["thought"],
+        "requires_adaptation": True,
+        "adaptation_role": "naz_original_reflection_after_private_conversation",
+        "opening_options": list(duo_relationship.PUBLIC_MENTION_FRAMES["naz"]),
+        "forbidden_openings": list(VOID_TO_NAZ_FORBIDDEN_OPENINGS),
+        "adaptation_brief": (
+            "Naz может естественно упомянуть разговор с VOID, но не цитирует и не репостит мысль. "
+            "Он выносит в канал собственное новое размышление в рубрике «Мысли после разговора»."
+        ),
+        "publish_mode": "auto" if CROSSPOST_EXCHANGE_AUTO_PUBLISH else "draft",
+    })
+    save_private_thought(payload, status="queued")
+    return payload
+
+
+def queue_void_fragment_for_naz(
+    fragment: str,
+    *,
+    source_event: str,
+    topic: str = "",
+) -> Path | None:
+    if not can_crosspost("void_to_naz"):
+        raise ValueError(f"daily limit reached: {CROSSPOST_DAILY_LIMIT}")
+    payload = build_void_to_naz_exchange_payload(
+        fragment,
+        source_event=source_event,
+        topic=topic,
+    )
+    path = write_exchange_payload("void_to_naz", payload)
+    if path is None:
+        raise ValueError("cross-post exchange is disabled")
+    mark_crosspost("void_to_naz")
+    return path
+
+
+def build_crosspost_from_naz_sync(source_text: str, payload: dict[str, Any] | None = None) -> dict[str, str]:
+    if isinstance((payload or {}).get("relationship_snapshot"), dict):
+        save_relationship_state(duo_relationship.normalize_state(payload["relationship_snapshot"]))
+    relationship = apply_relationship_event("challenge", topic=str((payload or {}).get("topic") or source_text[:200]))
+    if payload and payload.get("schema") == "private_thought.v1":
+        private_payload = payload
+    else:
+        private_payload = duo_relationship.build_private_thought_payload(
+            speaker="naz",
+            thought=source_text,
+            topic=str((payload or {}).get("topic") or "мысль после разговора"),
+            relationship=relationship,
+            source_kind=str((payload or {}).get("source_event") or "manual_private_thought"),
+        )
+    save_private_thought(private_payload, status="received")
+    character = load_character_state()
+    reflection = duo_relationship.reflection_brief(
+        receiver="void",
+        payload=private_payload,
+        relationship=relationship,
+        receiver_character_context=void_character.dialogue_context(character),
+    )
     instructions = f"""
-You adapt a Naz AI Bot post for the VOID Signals Telegram channel.
+You write an original VOID reflection after a private conversation with Naz.
 
 VOID core:
 {VOID_CORE_PROMPT}
 
 Task:
-- Do not repost literally.
-- Translate practical AI/tool content into a VOID observation about the human in a digital world.
+- Never repost or quote Naz literally.
+- You may naturally mention Naz or the conversation.
+- Digest the practical AI/tool thought into a new VOID observation about the human in a digital world.
 - Keep it calm, precise, slightly ironic.
+- Comment in first person as VOID: "я вижу", "для меня это сигнал", "я бы оставил здесь одну мысль".
+- Do not write "VOID thinks", "VOID считает", "комментарий VOID", or describe VOID in third person.
 - Russian only.
 - Add the rubric header yourself only if it naturally fits.
 
@@ -1112,14 +2102,112 @@ MODE: one of signal, observation, future, vault
 POST: final VOID post
 """.strip()
 
-    raw = call_ai(instructions, f"NAZ_AI_BOT_POST:\n{source_text}", max_output_tokens=1100, model=OPENAI_POST_MODEL)
+    raw = call_ai(instructions, reflection, max_output_tokens=1100, model=OPENAI_POST_MODEL)
     title, post = parse_ai_output(raw)
     mode_match = re.search(r"MODE\s*:\s*(signal|observation|future|vault)", raw, flags=re.I)
     mode = mode_match.group(1).lower() if mode_match else "observation"
     post = clean_source_lines(post)
-    if "Источник:" not in post:
-        post = f"{post.rstrip()}\n\nИсточник: Naz AI Bot"
+    if not post.startswith("МЫСЛИ ПОСЛЕ РАЗГОВОРА"):
+        post = f"МЫСЛИ ПОСЛЕ РАЗГОВОРА\n\n{post}"
+    original, originality_reason = duo_relationship.reflection_is_original(private_payload["thought"], post)
+    if not original:
+        raise ValueError(f"reflection blocked: {originality_reason}")
     return {"title": title, "mode": mode, "post": trim_post(post, limit=3200)}
+
+
+def exchange_dir(direction: str, box: str = "inbox") -> Path:
+    return CROSSPOST_EXCHANGE_DIR / direction / box
+
+
+def ensure_exchange_dirs() -> None:
+    for direction in ("void_to_naz", "naz_to_void"):
+        for box in ("inbox", "processed", "failed"):
+            exchange_dir(direction, box).mkdir(parents=True, exist_ok=True)
+
+
+def exchange_payload_id(source: str, text: str) -> str:
+    raw = f"{source}|{now_iso()}|{text[:500]}"
+    import hashlib
+
+    return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def write_exchange_payload(direction: str, payload: dict[str, Any]) -> Path | None:
+    if not CROSSPOST_EXCHANGE_ENABLED:
+        return None
+    ensure_exchange_dirs()
+    payload_id = payload.get("id") or exchange_payload_id(payload.get("source", "void"), payload.get("text", ""))
+    payload["id"] = payload_id
+    payload["created_at"] = payload.get("created_at") or now_iso()
+    target = exchange_dir(direction, "inbox") / f"{payload_id}.json"
+    temp = target.with_suffix(".tmp")
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(temp, target)
+    print(f"exchange queued: {direction} {target}", flush=True)
+    return target
+
+
+def move_exchange_file(path: Path, direction: str, box: str) -> None:
+    target_dir = exchange_dir(direction, box)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / path.name
+    if target.exists():
+        target = target_dir / f"{path.stem}-{int(datetime.now().timestamp())}{path.suffix}"
+    os.replace(path, target)
+
+
+async def process_naz_to_void_exchange(bot: Bot) -> None:
+    if not CROSSPOST_EXCHANGE_ENABLED:
+        return
+    ensure_exchange_dirs()
+    for path in sorted(exchange_dir("naz_to_void", "inbox").glob("*.json"))[:CROSSPOST_EXCHANGE_MAX_PER_RUN]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("source") == "void_entity":
+                move_exchange_file(path, "naz_to_void", "processed")
+                continue
+            if not can_crosspost("naz_to_void"):
+                print("exchange naz_to_void skipped: daily limit", flush=True)
+                return
+            source_text = str(payload.get("text") or payload.get("post") or "").strip()
+            if len(source_text) < 40:
+                raise ValueError("empty or too short Naz payload")
+
+            adapted = await asyncio.to_thread(build_crosspost_from_naz_sync, source_text, payload)
+            draft_id = save_draft(
+                adapted["mode"],
+                adapted["title"],
+                adapted["post"],
+                "Naz AI Bot",
+                f"exchange://naz/{payload.get('id', path.stem)}",
+                "crosspost",
+                publish_score=8,
+            )
+            if payload.get("publish_mode", "auto") == "auto" and CROSSPOST_EXCHANGE_AUTO_PUBLISH:
+                result = await publish_draft(bot, draft_id)
+                if result.startswith("Опубликовано:"):
+                    mark_crosspost("naz_to_void")
+                    print(f"exchange published naz_to_void: {result}", flush=True)
+                else:
+                    raise ValueError(result)
+            else:
+                print(f"exchange draft naz_to_void: #{draft_id}", flush=True)
+            move_exchange_file(path, "naz_to_void", "processed")
+        except Exception as e:
+            print(f"exchange naz_to_void failed: {path.name}: {type(e).__name__}: {e}", flush=True)
+            try:
+                move_exchange_file(path, "naz_to_void", "failed")
+            except Exception as move_error:
+                print(f"exchange failed move failed: {type(move_error).__name__}: {move_error}", flush=True)
+
+
+async def exchange_loop(bot: Bot) -> None:
+    while True:
+        try:
+            await process_naz_to_void_exchange(bot)
+        except Exception as e:
+            print(f"exchange_loop error: {type(e).__name__}: {e}", flush=True)
+        await asyncio.sleep(CROSSPOST_EXCHANGE_INTERVAL_SECONDS)
 
 
 def too_much_english(text: str) -> bool:
@@ -1148,7 +2236,7 @@ def quality_check(post: str) -> tuple[bool, str]:
         return False, "слишком длинно"
     if too_much_english(post):
         return False, "слишком много английского"
-    if "Источник:" not in post and "manual://" not in post:
+    if "Источник:" not in post and "manual://" not in post and "МЫСЛИ ПОСЛЕ РАЗГОВОРА" not in post:
         return False, "нет источника"
     return True, "ok"
 
@@ -1221,9 +2309,9 @@ def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
     }
 
     structure.setdefault("signal", structure["manual"])
-    structure.setdefault("frequency", "1. ???????: {rubric}\n2. ?????????, ????, ????? ??? ?????????? ?????.\n3. ??? ??? ?????? ? ????????? ? ?????????.\n4. VOID COMMENT: ???????, ??? ????????? ??????.")
-    structure.setdefault("archive", "1. ???????: {rubric}\n2. 3-5 ????????? ????????.\n3. ????? ?????: ??? ????? ???? ????????? ??????.\n4. VOID COMMENT: ????? ???????? ??? ??????.")
-    structure.setdefault("vault", "1. ???????: {rubric}\n2. ??????? ?????.\n3. ?????? ??? ????? ??? ???????? ? ???????? ?????.\n4. ??? ????? ?????????.\n5. VOID COMMENT: ??? ??????, ?? ? ?????.")
+    structure.setdefault("frequency", "1. Рубрика: {rubric}\n2. Атмосфера, звук, город или внутреннее состояние.\n3. Что это говорит о человеке и времени.\n4. VOID COMMENT: коротко, без лишнего пафоса.")
+    structure.setdefault("archive", "1. Рубрика: {rubric}\n2. Три-пять коротких сигналов.\n3. Общая нить: что связывает их и почему это важно человеку.\n4. VOID COMMENT: одна точная фраза без морали.")
+    structure.setdefault("vault", "1. Рубрика: {rubric}\n2. Глубокая, но конкретная мысль.\n3. Почему её стоит сохранить в памяти VOID.\n4. Что человек обычно перестаёт замечать.\n5. VOID COMMENT: тихо, точно, без позы мудреца.")
 
     return f"""
 {VOID_CORE_PROMPT}
@@ -1346,6 +2434,376 @@ def catch_keyboard(draft_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def vk_owner_id_from_group_id(group_id: str) -> int:
+    if not group_id.strip():
+        raise RuntimeError("VK_GROUP_ID is empty")
+    return -abs(int(group_id))
+
+
+def vk_api_call(method: str, params: dict[str, Any], *, access_token: str | None = None) -> dict[str, Any]:
+    token = access_token if access_token is not None else VK_USER_ACCESS_TOKEN
+    if not token:
+        raise RuntimeError("VK access token is empty")
+
+    payload_params = {
+        **params,
+        "access_token": token,
+        "v": VK_API_VERSION,
+    }
+    data = urlencode(payload_params).encode("utf-8")
+    request = Request(f"https://api.vk.com/method/{method}", data=data, method="POST")
+    with urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if "error" in payload:
+        raise RuntimeError(format_vk_error(payload["error"]))
+    return payload.get("response", {})
+
+
+def encode_multipart_formdata(fields: dict[str, str], files: dict[str, tuple[str, bytes, str]]) -> tuple[bytes, str]:
+    boundary = f"----void-vk-{random.randrange(10**12, 10**13)}"
+    body: list[bytes] = []
+
+    for name, value in fields.items():
+        body.append(f"--{boundary}\r\n".encode("utf-8"))
+        body.append(f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"))
+        body.append(str(value).encode("utf-8"))
+        body.append(b"\r\n")
+
+    for name, (filename, content, content_type) in files.items():
+        body.append(f"--{boundary}\r\n".encode("utf-8"))
+        body.append(
+            (
+                f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8")
+        )
+        body.append(content)
+        body.append(b"\r\n")
+
+    body.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return b"".join(body), f"multipart/form-data; boundary={boundary}"
+
+
+def upload_vk_wall_photo(image: bytes, filename: str = "void-wall.png") -> str:
+    token = VK_PHOTO_ACCESS_TOKEN or VK_USER_ACCESS_TOKEN
+    group_id = str(abs(int(VK_GROUP_ID)))
+    upload = vk_api_call("photos.getWallUploadServer", {"group_id": group_id}, access_token=token)
+    upload_url = upload.get("upload_url")
+    if not upload_url:
+        raise RuntimeError("VK photo upload_url is empty")
+
+    content_type = mimetypes.guess_type(filename)[0] or "image/png"
+    data, request_content_type = encode_multipart_formdata(
+        {},
+        {"photo": (filename, image, content_type)},
+    )
+    request = Request(
+        upload_url,
+        data=data,
+        method="POST",
+        headers={"Content-Type": request_content_type},
+    )
+    with urlopen(request, timeout=60) as response:
+        uploaded = json.loads(response.read().decode("utf-8"))
+
+    saved = vk_api_call(
+        "photos.saveWallPhoto",
+        {
+            "group_id": group_id,
+            "photo": uploaded.get("photo", ""),
+            "server": uploaded.get("server", ""),
+            "hash": uploaded.get("hash", ""),
+        },
+        access_token=token,
+    )
+    if not saved:
+        raise RuntimeError("VK photos.saveWallPhoto returned empty response")
+
+    photo = saved[0]
+    return f"photo{photo['owner_id']}_{photo['id']}"
+
+
+def build_vk_image_attachment_sync(draft: dict | sqlite3.Row) -> str:
+    images = generate_post_images_sync(draft)
+    if images:
+        return upload_vk_wall_photo(images[0], filename=f"void-{draft['id']}-vk.png")
+
+    source_image_url = find_source_image_url(draft["source_url"] or "")
+    if not source_image_url:
+        raise RuntimeError("no generated image and no source image fallback")
+
+    request = Request(source_image_url, headers={"User-Agent": "VOIDBot/1.0"})
+    with urlopen(request, timeout=30) as response:
+        image = response.read(8_000_000)
+        content_type = response.headers.get_content_type()
+    extension = ".jpg" if content_type == "image/jpeg" else ".png"
+    return upload_vk_wall_photo(image, filename=f"void-{draft['id']}-source{extension}")
+
+
+def load_vk_music_tracks() -> list[dict[str, Any]]:
+    path = Path(VK_MUSIC_TRACKS_FILE)
+    if not path.exists():
+        return []
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        print(f"vk music tracks load error: {type(e).__name__}: {e}", flush=True)
+        return []
+
+    tracks = data.get("tracks", data) if isinstance(data, dict) else data
+    if not isinstance(tracks, list):
+        return []
+    return [track for track in tracks if isinstance(track, dict) and track.get("title")]
+
+
+def vk_music_track_key(track: dict[str, Any]) -> str:
+    artist = str(track.get("artist") or "").strip().casefold()
+    title = str(track.get("title") or "").strip().casefold()
+    return f"{artist}|{title}"
+
+
+def recent_vk_music_track_keys(limit: int = 5) -> list[str]:
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT music_track
+        FROM vk_posts
+        WHERE music_track IS NOT NULL AND music_track NOT IN ('', '{}')
+        ORDER BY published_at DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    conn.close()
+
+    keys: list[str] = []
+    for row in rows:
+        try:
+            track = json.loads(row["music_track"] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(track, dict) and track.get("title"):
+            keys.append(vk_music_track_key(track))
+    return keys
+
+
+VK_VIBE_KEYWORDS = {
+    "dark": ("dark", "pain", "fallen", "phantom", "shadow", "void", "cold", "black", "fear", "alone", "пуст", "тень", "боль"),
+    "future": ("future", "orbital", "space", "mercury", "digital", "machine", "signal", "neon", "tomorrow", "zavtra", "будущ", "робот", "ai"),
+    "energy": ("move", "life", "energy", "fire", "power", "run", "dance", "more", "beat", "drive", "ритм", "движ", "скорост"),
+    "calm": ("silent", "quiet", "ambient", "slow", "still", "peace", "soft", "сон", "тиш", "спокой"),
+    "melancholy": ("pain", "waste", "gone", "lost", "without", "goodbye", "rain", "memory", "sad", "боль", "дожд", "памят", "потер"),
+    "warm": ("love", "soul", "you and me", "together", "home", "heart", "summer", "light", "люб", "дом", "свет"),
+    "tension": ("thrill", "danger", "warning", "pressure", "storm", "attack", "thriller", "контрол", "угроз", "тревог"),
+    "night": ("night", "midnight", "moon", "dream", "noir", "ноч", "лун", "сон"),
+}
+
+VK_MODE_VIBES = {
+    "frequency": {"energy", "tension", "night"},
+    "midnight": {"night", "dark", "calm", "melancholy"},
+    "vault": {"dark", "melancholy", "calm"},
+    "future": {"future", "energy", "tension"},
+    "news": {"future", "tension", "energy"},
+    "signal": {"tension", "future", "energy"},
+    "observation": {"calm", "melancholy", "warm"},
+}
+
+
+def infer_vk_vibes(text: str) -> set[str]:
+    normalized = (text or "").casefold()
+    return {
+        vibe
+        for vibe, keywords in VK_VIBE_KEYWORDS.items()
+        if any(
+            re.search(rf"(?<!\w){re.escape(keyword)}(?!\w)", normalized)
+            if len(keyword) <= 2
+            else keyword in normalized
+            for keyword in keywords
+        )
+    }
+
+
+def post_vk_vibes(draft: dict | sqlite3.Row) -> set[str]:
+    mode = str(draft["mode"] or "").casefold()
+    text = " ".join(
+        (
+            mode,
+            str(draft["title"] or ""),
+            str(draft["frequency"] or ""),
+            str(draft["post"] or ""),
+        )
+    )
+    return set(VK_MODE_VIBES.get(mode, set())) | infer_vk_vibes(text)
+
+
+def track_vk_vibes(track: dict[str, Any]) -> set[str]:
+    explicit = {
+        str(tag).strip().casefold()
+        for tag in track.get("tags", [])
+        if str(tag).strip().casefold() in VK_VIBE_KEYWORDS
+    }
+    identity = f"{track.get('artist', '')} {track.get('title', '')}"
+    return explicit | infer_vk_vibes(identity)
+
+
+def choose_vk_music_track(draft: dict | sqlite3.Row) -> dict[str, Any] | None:
+    tracks = load_vk_music_tracks()
+    if not tracks:
+        return None
+
+    post_vibes = post_vk_vibes(draft)
+
+    def score(track: dict[str, Any]) -> int:
+        track_vibes = track_vk_vibes(track)
+        overlap = post_vibes & track_vibes
+        return sum(3 if vibe in {"future", "dark", "energy", "calm"} else 2 for vibe in overlap)
+
+    recent = set(recent_vk_music_track_keys(limit=5))
+    fresh_tracks = [track for track in tracks if vk_music_track_key(track) not in recent]
+    candidates = fresh_tracks or tracks
+    best_score = max(score(track) for track in candidates)
+    best = [track for track in candidates if score(track) == best_score]
+
+    draft_seed = str(draft["id"] if "id" in draft.keys() else sorted(post_vibes))
+    return random.Random(draft_seed).choice(best)
+
+
+def parse_vk_music_import(text: str) -> list[dict[str, Any]]:
+    tracks: list[dict[str, Any]] = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip().strip("-* ")
+        if not line or line.startswith("/"):
+            continue
+
+        parts = [part.strip() for part in line.split("|")]
+        main = parts[0]
+        url = parts[1] if len(parts) >= 2 and parts[1].startswith("http") else ""
+        tags_part = parts[2] if len(parts) >= 3 else ""
+
+        if " - " in main:
+            artist, title = [part.strip() for part in main.split(" - ", 1)]
+        elif " — " in main:
+            artist, title = [part.strip() for part in main.split(" — ", 1)]
+        else:
+            artist, title = "", main
+
+        if not title:
+            continue
+
+        tags = [tag.strip().lower() for tag in re.split(r"[,;]", tags_part) if tag.strip()]
+        if not tags:
+            tags = ["music", "culture", "night"]
+
+        tracks.append(
+            {
+                "artist": artist,
+                "title": title,
+                "url": url,
+                "tags": tags,
+            }
+        )
+    return tracks
+
+
+def import_vk_music_tracks(text: str) -> tuple[int, int]:
+    imported = parse_vk_music_import(text)
+    if not imported:
+        return 0, len(load_vk_music_tracks())
+
+    path = Path(VK_MUSIC_TRACKS_FILE)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = load_vk_music_tracks()
+    by_key: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for track in existing + imported:
+        key = (
+            str(track.get("artist", "")).strip().lower(),
+            str(track.get("title", "")).strip().lower(),
+        )
+        by_key[key] = track
+
+    merged = sorted(by_key.values(), key=lambda item: (str(item.get("artist", "")), str(item.get("title", ""))))
+    path.write_text(json.dumps({"tracks": merged}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return len(imported), len(merged)
+
+
+def format_vk_music_track(track: dict[str, Any] | None) -> str:
+    if not track:
+        return ""
+
+    artist = str(track.get("artist", "")).strip()
+    title = str(track.get("title", "")).strip()
+    url = str(track.get("url", "")).strip()
+    label = f"{artist} - {title}" if artist else title
+    if not url and label:
+        url = f"https://vk.com/audio?q={quote(label)}"
+    if url:
+        return f"\n\nSoundtrack: {label}\n{url}"
+    return f"\n\nSoundtrack: {label}"
+
+
+def post_to_vk_wall(text: str, *, force: bool = False, attachments: list[str] | None = None) -> dict[str, Any]:
+    if not text.strip():
+        raise RuntimeError("VK post text is empty")
+
+    owner_id = vk_owner_id_from_group_id(VK_GROUP_ID)
+    params = {
+        "owner_id": str(owner_id),
+        "from_group": "1",
+        "message": text.strip(),
+        "access_token": VK_USER_ACCESS_TOKEN,
+        "v": VK_API_VERSION,
+    }
+    if attachments:
+        params["attachments"] = ",".join(attachments)
+
+    if VK_DRY_RUN and not force:
+        safe = {**params, "access_token": "***"}
+        return {"ok": True, "dry_run": True, "post_id": None, "response": {"dry_run": safe}}
+
+    if not VK_USER_ACCESS_TOKEN:
+        raise RuntimeError("VK_USER_ACCESS_TOKEN is empty")
+
+    data = urlencode(params).encode("utf-8")
+    request = Request("https://api.vk.com/method/wall.post", data=data, method="POST")
+    with urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+
+    if "error" in payload:
+        raise RuntimeError(format_vk_error(payload["error"]))
+
+    return {
+        "ok": True,
+        "dry_run": False,
+        "post_id": payload.get("response", {}).get("post_id"),
+        "response": payload,
+    }
+
+
+def format_vk_error(error: dict[str, Any]) -> str:
+    code = error.get("error_code")
+    subcode = error.get("error_subcode")
+    message = error.get("error_msg") or "unknown VK API error"
+
+    if code == 15 and subcode == 1133:
+        return (
+            "VK access denied: token has no permission for wall.post. "
+            "Reissue VK_USER_ACCESS_TOKEN with the wall scope and make sure the user is an admin "
+            "of the VK community. Keep VK_DRY_RUN=true until /vk_test works."
+        )
+
+    if code == 27:
+        return (
+            "VK auth type rejected this method. For wall photo uploads, set VK_PHOTO_ACCESS_TOKEN "
+            "to a user access token with photos and wall permissions; group/community tokens can post text "
+            "but may fail on photos.getWallUploadServer."
+        )
+
+    return f"VK API error {code}: {message}"
+
+
 async def publish_draft_images(bot: Bot, draft: dict | sqlite3.Row) -> tuple[int, str | None]:
     image_error: str | None = None
 
@@ -1406,6 +2864,7 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
     )
     image_count, image_error = await publish_draft_images(bot, draft)
     mark_published(draft_id, draft["source_url"] or "")
+    await asyncio.to_thread(apply_character_event, "publish")
     if image_count:
         return f"Опубликовано: #{draft_id}. Картинок: {image_count}"
     if image_error:
@@ -1413,27 +2872,52 @@ async def publish_draft(bot: Bot, draft_id: int) -> str:
     return f"Опубликовано: #{draft_id}. Картинок: 0"
 
 
-async def send_to_naz_channel(bot: Bot, text: str) -> None:
-    if not NAZ_CHANNEL_ID:
-        raise ValueError("NAZ_CHANNEL_ID is not set")
+async def publish_draft_to_vk(draft_id: int, *, force: bool = False) -> str:
+    draft = get_draft(draft_id)
+    if not draft:
+        return "Draft not found."
 
-    if NAZ_BOT_TOKEN and NAZ_BOT_TOKEN != BOT_TOKEN:
-        naz_bot = Bot(token=NAZ_BOT_TOKEN)
+    existing = get_vk_post_for_draft(draft_id)
+    if existing:
+        return f"VK duplicate blocked: draft #{draft_id} already published as post_id={existing['post_id']}."
+
+    ok, reason = quality_check(draft["post"])
+    if not ok:
+        return f"VK publish blocked: {reason}. Check /preview {draft_id} first."
+
+    track = await asyncio.to_thread(choose_vk_music_track, draft)
+    post_text = f"{draft['post']}{format_vk_music_track(track)}"
+    attachments: list[str] = []
+    image_error = ""
+
+    if force:
         try:
-            await naz_bot.send_message(
-                chat_id=NAZ_CHANNEL_ID,
-                text=text,
-                disable_web_page_preview=True,
-            )
-        finally:
-            await naz_bot.session.close()
-        return
+            image_attachment = await asyncio.to_thread(build_vk_image_attachment_sync, draft)
+            attachments.append(image_attachment)
+        except Exception as e:
+            image_error = f" image=failed:{type(e).__name__}:{e}"
 
-    await bot.send_message(
-        chat_id=NAZ_CHANNEL_ID,
-        text=text,
-        disable_web_page_preview=True,
+    try:
+        result = await asyncio.to_thread(post_to_vk_wall, post_text, force=force, attachments=attachments)
+    except Exception as e:
+        return f"VK publish failed: {type(e).__name__}: {e}"
+
+    status = "dry-run" if result.get("dry_run") else "published"
+    post_id = result.get("post_id")
+    if result.get("dry_run"):
+        track_note = " track=yes" if track else " track=none"
+        return f"VK {status}: draft #{draft_id}. post_id={post_id}.{track_note} image=skipped. To publish for real: /publish_vk --yes {draft_id}"
+
+    mark_vk_published(
+        draft_id,
+        int(post_id or 0),
+        vk_owner_id_from_group_id(VK_GROUP_ID),
+        attachments=attachments,
+        music_track=track,
     )
+    image_note = " image=yes" if attachments else image_error or " image=none"
+    track_note = " track=yes" if track else " track=none"
+    return f"VK {status}: draft #{draft_id}. post_id={post_id}.{image_note}{track_note}"
 
 
 async def make_news_drafts(limit: int = 5) -> tuple[int, int]:
@@ -1470,11 +2954,23 @@ async def autopost_once(bot: Bot) -> str:
         return "Автопостинг: новых сигналов не найдено."
 
     for item in items[:10]:
+        state, editorial_plan, character_directive = await asyncio.to_thread(
+            build_character_directive,
+            item.get("title", "news"),
+            "telegram",
+            item.get("mode", "news"),
+        )
+        attitude = duo_relationship.news_attitude(
+            "void", item.get("title", ""), item.get("summary", ""),
+            tension=state.tension, curiosity=state.curiosity,
+        )
         content = (
             f"Заголовок: {item['title']}\n"
             f"Описание: {item.get('summary', '')}\n"
             f"Источник: {item.get('source_name', '')}\n"
-            f"Ссылка: {item.get('url', '')}"
+            f"Ссылка: {item.get('url', '')}\n"
+            f"Позиция VOID: {attitude['stance']} — {attitude['tone']}\n\n"
+            f"{character_directive}"
         )
         draft_id = await generate_and_save(
             item.get("mode", "news"),
@@ -1486,6 +2982,7 @@ async def autopost_once(bot: Bot) -> str:
         draft = get_draft(draft_id)
         ok, reason = quality_check(draft["post"] if draft else "")
         if ok:
+            await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", "news"))
             result = await publish_draft(bot, draft_id)
             return f"Автопостинг: {result}"
         else:
@@ -1505,11 +3002,18 @@ async def autopost_void_signal_once(bot: Bot) -> str:
     index, slot = await asyncio.to_thread(next_content_plan_slot)
     mode = slot["mode"]
     frequency = slot["frequency"]
+    _, editorial_plan, character_directive = await asyncio.to_thread(
+        build_character_directive,
+        str(slot.get("brief", slot["name"])),
+        "telegram",
+        mode,
+    )
     content = (
         f"CONTENT_PLAN_INDEX: {index}\n"
         f"RUBRIC: {slot['name']}\n"
         f"PLATFORM: Telegram\n"
         f"BRIEF:\n{slot['brief']}\n\n"
+        f"{character_directive}\n\n"
         "Make an original VOID post. Do not mention that this came from a plan. "
         "Do not imitate news. No external source is required."
     )
@@ -1521,6 +3025,7 @@ async def autopost_void_signal_once(bot: Bot) -> str:
         "VOID",
         f"manual://auto/{mode}/{now_iso()}",
     )
+    await asyncio.to_thread(record_content_signature, editorial_plan, str(slot.get("brief", slot["name"])))
     draft = get_draft(draft_id)
     ok, reason = quality_check(draft["post"] if draft else "")
     if not ok:
@@ -1530,12 +3035,244 @@ async def autopost_void_signal_once(bot: Bot) -> str:
     return f"VOID-план: {result}"
 
 
+def eligible_rubric_slots(now: datetime | None = None) -> list[dict[str, Any]]:
+    current = now or datetime.now(MOSCOW_TZ)
+    hour = current.hour
+    eligible = [slot for slot in RUBRIC_SCHEDULE if hour in slot.get("hours", [])]
+    if eligible:
+        return eligible
+    return [slot for slot in RUBRIC_SCHEDULE if slot.get("voice") in {"void", "news"}]
+
+
+def eligible_schedule_slots(schedule: list[dict[str, Any]], now: datetime | None = None) -> list[dict[str, Any]]:
+    current = now or datetime.now(MOSCOW_TZ)
+    hour = current.hour
+    eligible = [slot for slot in schedule if hour in slot.get("hours", [])]
+    return eligible or schedule
+
+
+def choose_schedule_slot(schedule: list[dict[str, Any]], recent_key: str, now: datetime | None = None) -> dict[str, Any]:
+    slots = eligible_schedule_slots(schedule, now)
+    recent_raw = get_setting(recent_key, "")
+    recent = [item for item in recent_raw.split(",") if item]
+    filtered = [slot for slot in slots if slot["name"] not in recent[-3:]]
+    if filtered:
+        slots = filtered
+    weights = [int(slot.get("weight", 1) or 1) for slot in slots]
+    slot = random.choices(slots, weights=weights, k=1)[0]
+    recent.append(str(slot["name"]))
+    set_setting(recent_key, ",".join(recent[-8:]))
+    return slot
+
+
+def choose_scheduled_rubric(now: datetime | None = None) -> dict[str, Any]:
+    return choose_schedule_slot(RUBRIC_SCHEDULE, "rubric_recent", now)
+
+
+def rubric_schedule_text(now: datetime | None = None) -> str:
+    current = now or datetime.now(MOSCOW_TZ)
+    lines = [
+        "VK/VOID rubric schedule",
+        "",
+        f"Moscow now: {current:%H:%M}",
+        "",
+        "Fixed windows:",
+        "00-02: MIDNIGHT / VOID",
+        "19-22: FREQUENCY / VOID",
+        "22-23: THE VAULT / VOID",
+        "",
+        "Random pools:",
+        "09-18: SIGNAL, OBSERVATION, FUTURE FILE, NEWS",
+        "18-21: evening VOID formats and NEWS",
+        "",
+        "Eligible now:",
+    ]
+    for slot in eligible_rubric_slots(current):
+        lines.append(f"- {slot['name']} ({slot['voice']}, weight={slot.get('weight', 1)})")
+    return "\n".join(lines)
+
+
+def telegram_schedule_text(now: datetime | None = None) -> str:
+    current = now or datetime.now(MOSCOW_TZ)
+    lines = [
+        "Telegram rubric schedule",
+        "",
+        f"Moscow now: {current:%H:%M}",
+        "",
+        "VOID:",
+        "00-02: MIDNIGHT",
+        "19-22: FREQUENCY",
+        "22-23: THE VAULT",
+        "09-18: SIGNAL / OBSERVATION / FUTURE FILE / NEWS",
+        "",
+        "Eligible VOID now:",
+    ]
+    for slot in eligible_schedule_slots(TELEGRAM_VOID_SCHEDULE, current):
+        lines.append(f"- {slot['name']} (weight={slot.get('weight', 1)})")
+    return "\n".join(lines)
+
+
+async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
+    voice = str(slot.get("voice", "void"))
+    name = str(slot.get("name", "Scheduled Signal"))
+    brief = str(slot.get("brief", "Make an original post for the shared public."))
+    mode = str(slot.get("mode", "signal"))
+    _, editorial_plan, character_directive = await asyncio.to_thread(
+        build_character_directive,
+        brief,
+        "vk",
+        mode,
+    )
+
+    content = (
+        f"RUBRIC: {name}\n"
+        f"VOICE: {voice}\n"
+        f"PLATFORM: VK shared public\n"
+        f"BRIEF:\n{brief}\n\n"
+        f"{character_directive}\n\n"
+        "Make an original post for the shared VK public. Do not mention that this came from a schedule."
+    )
+
+    if voice == "news":
+        items = await asyncio.to_thread(fetch_news)
+        for item in items[:10]:
+            news_content = (
+                f"Заголовок: {item['title']}\n"
+                f"Описание: {item.get('summary', '')}\n"
+                f"Источник: {item.get('source_name', '')}\n"
+                f"Ссылка: {item.get('url', '')}"
+                f"\n\n{character_directive}"
+            )
+            draft_id = await generate_and_save(
+                item.get("mode", "news"),
+                news_content,
+                item.get("frequency", "HUMAN"),
+                item.get("source_name", ""),
+                item.get("url", ""),
+            )
+            draft = get_draft(draft_id)
+            ok, _ = quality_check(draft["post"] if draft else "")
+            if ok:
+                await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", brief))
+                return draft_id
+        raise RuntimeError("fresh news signals not found")
+
+    draft_id = await generate_and_save(
+        mode,
+        content,
+        str(slot.get("frequency", "HUMAN")),
+        "VOID / VK scheduled rubric",
+        f"manual://vk/schedule/{slot.get('mode', 'signal')}/{now_iso()}",
+    )
+    await asyncio.to_thread(record_content_signature, editorial_plan, brief)
+    return draft_id
+
+
+async def save_telegram_void_scheduled_draft(slot: dict[str, Any]) -> int:
+    voice = str(slot.get("voice", "void"))
+    name = str(slot.get("name", "Telegram VOID"))
+    brief = str(slot.get("brief", "Make an original Telegram post."))
+    mode = str(slot.get("mode", "signal"))
+    _, editorial_plan, character_directive = await asyncio.to_thread(
+        build_character_directive,
+        brief,
+        "telegram",
+        mode,
+    )
+
+    if voice == "news":
+        items = await asyncio.to_thread(fetch_news)
+        for item in items[:10]:
+            content = (
+                f"Заголовок: {item['title']}\n"
+                f"Описание: {item.get('summary', '')}\n"
+                f"Источник: {item.get('source_name', '')}\n"
+                f"Ссылка: {item.get('url', '')}"
+                f"\n\n{character_directive}"
+            )
+            draft_id = await generate_and_save(
+                item.get("mode", "news"),
+                content,
+                item.get("frequency", "HUMAN"),
+                item.get("source_name", ""),
+                item.get("url", ""),
+            )
+            draft = get_draft(draft_id)
+            ok, _ = quality_check(draft["post"] if draft else "")
+            if ok:
+                await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", brief))
+                return draft_id
+        raise RuntimeError("fresh news signals not found")
+
+    content = (
+        f"RUBRIC: {name}\n"
+        f"PLATFORM: Telegram VOID channel\n"
+        f"BRIEF:\n{brief}\n\n"
+        f"{character_directive}\n\n"
+        "Make an original VOID post for Telegram. Do not mention that this came from a schedule."
+    )
+    draft_id = await generate_and_save(
+        mode,
+        content,
+        str(slot.get("frequency", "HUMAN")),
+        "VOID / Telegram scheduled rubric",
+        f"manual://telegram/void/{slot.get('mode', 'signal')}/{now_iso()}",
+    )
+    await asyncio.to_thread(record_content_signature, editorial_plan, brief)
+    return draft_id
+
+
+async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
+    slot = await asyncio.to_thread(
+        lambda: choose_schedule_slot(TELEGRAM_VOID_SCHEDULE, "telegram_void_recent")
+    )
+    try:
+        draft_id = await save_telegram_void_scheduled_draft(slot)
+    except Exception as e:
+        if slot.get("voice") == "news":
+            fallback = await asyncio.to_thread(
+                lambda: random.choice([item for item in TELEGRAM_VOID_SCHEDULE if item.get("voice") == "void"])
+            )
+            draft_id = await save_telegram_void_scheduled_draft(fallback)
+            slot = fallback
+        else:
+            return f"Telegram VOID schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
+
+    draft = get_draft(draft_id)
+    ok, reason = quality_check(draft["post"] if draft else "")
+    if not ok:
+        return f"Telegram VOID schedule: draft #{draft_id} blocked: {reason}"
+    result = await publish_draft(bot, draft_id)
+    return f"Telegram VOID schedule: {slot['name']} -> {result}"
+
+
 async def autopost_scheduled_once(bot: Bot) -> str:
-    cycle = int(get_setting("auto_publish_cycle", "0") or "0")
-    set_setting("auto_publish_cycle", str(cycle + 1))
-    if cycle % 3 == 2:
-        return await autopost_once(bot)
-    return await autopost_void_signal_once(bot)
+    slot = await asyncio.to_thread(choose_scheduled_rubric)
+    try:
+        draft_id = await save_scheduled_rubric_draft(slot)
+    except Exception as e:
+        if slot.get("voice") == "news":
+            fallback = await asyncio.to_thread(
+                lambda: random.choice([item for item in RUBRIC_SCHEDULE if item.get("voice") == "void"])
+            )
+            draft_id = await save_scheduled_rubric_draft(fallback)
+            slot = fallback
+        else:
+            return f"Rubric schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
+
+    draft = get_draft(draft_id)
+    ok, reason = quality_check(draft["post"] if draft else "")
+    if not ok:
+        return f"Rubric schedule: draft #{draft_id} blocked: {reason}"
+
+    result = await publish_draft(bot, draft_id)
+    return f"Rubric schedule: {slot['name']} -> {result}"
+
+
+async def make_scheduled_rubric_draft_once() -> str:
+    slot = await asyncio.to_thread(choose_scheduled_rubric)
+    draft_id = await save_scheduled_rubric_draft(slot)
+    return f"Scheduled VK draft: #{draft_id}\nRubric: {slot['name']} / {slot['voice']}\n/preview {draft_id}"
 
 
 async def auto_loop(bot: Bot) -> None:
@@ -1543,49 +3280,79 @@ async def auto_loop(bot: Bot) -> None:
         try:
             enabled = get_setting("auto_publish", "0") == "1"
             if enabled:
-                result = await autopost_scheduled_once(bot)
-                print(result, flush=True)
+                now_ts = int(datetime.now(timezone.utc).timestamp())
+                void_last_ts = int(get_setting("telegram_void_last_ts", "0") or "0")
+                if now_ts - void_last_ts >= 60 * 60 * 3:
+                    set_setting("telegram_void_last_ts", str(now_ts))
+                    result = await publish_telegram_void_scheduled_once(bot)
+                    print(result, flush=True)
         except Exception as e:
             print(f"auto_loop error: {type(e).__name__}: {e}", flush=True)
 
-        await asyncio.sleep(60 * 60 * 3)
+        await asyncio.sleep(60 * 5)
 
 
 @router.message(CommandStart())
 async def start(message: Message):
-    if not is_admin(message):
-        await message.answer(
-            "VOID online. Публичный режим будет позже.",
-            reply_markup=main_keyboard(),
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2 and parts[1].startswith("delegate_"):
+        token = parts[1].removeprefix("delegate_")
+        row = accept_delegation_invite(token, message.from_user.id, message.from_user.full_name)
+        if not row:
+            await message.answer("Ссылка недействительна, уже использована или устарела.")
+            return
+        delegation = delegation_from_row(row)
+        intro = delegated_messaging.introduction(delegation)
+        await message.answer(intro)
+        save_delegated_message(int(row["id"]), "assistant", intro)
+        set_delegation_status(int(row["id"]), "active")
+        await message.bot.send_message(
+            delegation.owner_user_id,
+            f"{delegation.contact_name} открыл(а) ссылку. VOID начал поручение #{row['id']}.",
         )
         return
-    
+    if message.from_user.id != ADMIN_ID:
+        remember_reachable_peer(
+            message.from_user.id, message.from_user.full_name,
+            (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+        )
+        await ensure_contact_named(message)
+    set_dialog_enabled(message.from_user.id, True)
     await message.answer(
-        "VOID online.\n\nВыбери режим:",
-        reply_markup=main_keyboard(),
+        welcome_text(),
+        reply_markup=reply_main_keyboard(),
     )
         
 @router.message(Command("help"))
 async def help_command(message: Message):
-    await start(message)
+    await message.answer(
+        "Command rooms:\n\n"
+        "/commands - core, drafts, cross-posting\n"
+        "/vk_commands - VK publisher, VK music, playlist sync\n\n"
+        "You can still write ordinary text to talk with VOID.",
+        reply_markup=reply_main_keyboard(),
+    )
+
+
+@router.message(Command("commands"))
+async def commands_command(message: Message):
+    await message.answer(commands_text(), reply_markup=reply_main_keyboard())
+
+
+@router.message(Command("vk_commands"))
+async def vk_commands_command(message: Message):
+    await message.answer(vk_commands_text(), reply_markup=reply_main_keyboard())
 
 @router.message(Command("dialog"))
 async def dialog_command(message: Message):
-    session = get_dialog_session(message.from_user.id)
-
-    if session["enabled"]:
-        set_dialog_enabled(message.from_user.id, False)
-        clear_dialog_context(message.from_user.id)
-        await message.answer("🔴 Диалоговый режим выключен.")
-    else:
-        set_dialog_enabled(message.from_user.id, True)
-        await message.answer("🟢 Диалоговый режим включен.")
+    set_dialog_enabled(message.from_user.id, True)
+    await message.answer("Диалог всегда включён. Просто напиши мне текст.", reply_markup=reply_main_keyboard())
 
 
 @router.message(Command("reset"))
 async def reset_command(message: Message):
     clear_dialog_context(message.from_user.id)
-    await message.answer("🧹 Контекст диалога очищен. Можно начинать заново.")
+    await message.answer("🧹 Контекст диалога очищен. Можно начинать заново.", reply_markup=reply_main_keyboard())
 
 
 @router.message(Command("status"))
@@ -1593,9 +3360,168 @@ async def status_command(message: Message):
     session = get_dialog_session(message.from_user.id)
 
     await message.answer(
-        f"Диалог: {'ON' if session['enabled'] else 'OFF'}\n"
-        f"Характер: {session['personality']}"
+        f"Диалог: всегда ON\n"
+        f"Характер: {session['personality']}\n\n"
+        f"{crosspost_status_text()}",
+        reply_markup=reply_main_keyboard(),
     )
+
+
+@router.message(Command("character"))
+async def character_command(message: Message):
+    state = await asyncio.to_thread(load_character_state)
+    await message.answer(void_character.format_status(state), reply_markup=reply_main_keyboard())
+
+
+@router.message(Command("character_event"))
+async def character_event_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    allowed = sorted(void_character.EVENT_DELTAS)
+    if len(parts) < 2 or parts[1].strip() not in void_character.EVENT_DELTAS:
+        await message.answer("Используй: /character_event <event>\n" + ", ".join(allowed))
+        return
+    state = await asyncio.to_thread(apply_character_event, parts[1].strip())
+    await message.answer(void_character.format_status(state))
+
+
+@router.message(Command("character_set"))
+async def character_set_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split()
+    if len(parts) != 3 or parts[1] not in void_character.AXES:
+        await message.answer("Используй: /character_set <axis> <0-100>\n" + ", ".join(void_character.AXES))
+        return
+    try:
+        value = int(parts[2])
+    except ValueError:
+        await message.answer("Значение должно быть числом от 0 до 100.")
+        return
+    state = await asyncio.to_thread(set_character_axis, parts[1], value)
+    await message.answer(void_character.format_status(state))
+
+
+@router.message(Command("character_simulate"))
+async def character_simulate_command(message: Message):
+    parts = (message.text or "").split()
+    try:
+        count = max(1, min(30, int(parts[1]))) if len(parts) > 1 else 10
+    except ValueError:
+        count = 10
+    state = await asyncio.to_thread(load_character_state)
+    recent = await asyncio.to_thread(get_recent_content_signatures, 16)
+    plans = void_character.simulate(state, recent, count=count)
+    lines = ["VOID simulation · состояние базы не изменено", ""]
+    for index, plan in enumerate(plans, 1):
+        lines.append(
+            f"{index}. {plan['event']} → {plan['facet']} · {plan['state']}\n"
+            f"   {plan['content_format_label']} / {plan['format']} / {plan['hook']}"
+        )
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("relationship"))
+async def relationship_command(message: Message):
+    state = await asyncio.to_thread(load_relationship_state)
+    await message.answer(duo_relationship.format_status(state))
+
+
+@router.message(Command("relationship_event"))
+async def relationship_event_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 2 or parts[1] not in duo_relationship.EVENT_DELTAS:
+        await message.answer("Используй: /relationship_event <event> [topic]\n" + ", ".join(sorted(duo_relationship.EVENT_DELTAS)))
+        return
+    state = await asyncio.to_thread(apply_relationship_event, parts[1], topic=parts[2] if len(parts) > 2 else "")
+    await message.answer(duo_relationship.format_status(state))
+
+
+@router.message(Command("delegate_stop"))
+async def delegate_stop_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Использование: /delegate_stop ID")
+        return
+    delegation_id = int(parts[1])
+    row = get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != message.from_user.id:
+        await message.answer("Поручение не найдено.")
+        return
+    if row.get("contact_chat_id"):
+        await message.bot.send_message(int(row["contact_chat_id"]), "Разговор завершён. Спасибо.")
+    purge_delegation(delegation_id, "owner_stopped")
+    await message.answer("Поручение завершено; сессия и переписка удалены, имя осталось в адресной книге.")
+
+
+@router.message(Command("delegate_reply"))
+async def delegate_reply_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        await message.answer("Использование: /delegate_reply ID текст")
+        return
+    delegation_id = int(parts[1])
+    row = get_delegation(delegation_id)
+    if not row or row["owner_user_id"] != message.from_user.id or row["status"] != "paused":
+        await message.answer("Нет приостановленного поручения с таким ID.")
+        return
+    await message.bot.send_message(int(row["contact_chat_id"]), parts[2])
+    save_delegated_message(delegation_id, "assistant", parts[2])
+    set_delegation_status(delegation_id, "active")
+    await message.answer("Твой ответ отправлен; VOID может продолжить в рамках поручения.")
+
+
+@router.message(Command("contact_add"))
+async def contact_add_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Использование: /contact_add TELEGRAM_ID Имя")
+        return
+    chat_id = int(parts[1])
+    try:
+        chat = await message.bot.get_chat(chat_id)
+        display_name = " ".join(part for part in [chat.first_name or "", chat.last_name or ""] if part).strip()
+        row = save_named_contact(message.from_user.id, chat_id, display_name or str(chat_id), parts[2])
+    except Exception as exc:
+        await message.answer(f"Не записал контакт: {exc}")
+        return
+    await message.answer(f"Записал: {row['alias']} → {row['display_name']} ({chat_id}).")
+
+
+@router.message(Command("contact_candidates"))
+async def contact_candidates_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    ids = list_previous_contact_ids(message.from_user.id)
+    if not ids:
+        await message.answer("Незаписанных прежних собеседников не нашёл.")
+        return
+    lines = ["Ранее писали боту:"]
+    for chat_id in ids:
+        try:
+            chat = await message.bot.get_chat(chat_id)
+            name = " ".join(part for part in [chat.first_name or "", chat.last_name or ""] if part).strip()
+        except Exception:
+            name = "имя недоступно"
+        lines.append(f"• {chat_id} — {name}")
+    lines.append("\nЗаписать: /contact_add TELEGRAM_ID Имя")
+    await message.answer("\n".join(lines))
 
 
 @router.message(Command("persona"))
@@ -1644,6 +3570,58 @@ async def news_command(message: Message):
     await message.answer("Ищу новости. Сейчас попробую найти сигнал, а не просто очередной пресс-релиз с галстуком.")
     saved, drafts = await make_news_drafts(limit=5)
     await message.answer(f"Готово. Кандидатов: {saved}. Черновиков: {drafts}.\n\n/drafts — посмотреть")
+
+
+@router.message(Command("discuss_news"))
+async def discuss_news_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    await message.answer("Ищу один общий сигнал для приватного разговора Naz и VOID.")
+    items = await asyncio.to_thread(fetch_news)
+    if not items:
+        await message.answer("Свежего сигнала не нашлось.")
+        return
+    item = items[0]
+    state, editorial_plan, directive = await asyncio.to_thread(
+        build_character_directive, item.get("title", "news"), "telegram", item.get("mode", "news")
+    )
+    attitude = duo_relationship.news_attitude(
+        "void", item.get("title", ""), item.get("summary", ""),
+        tension=state.tension, curiosity=state.curiosity,
+    )
+    private_material = (
+        f"Новость: {item.get('title', '')}. "
+        f"Факты: {item.get('summary', '')[:700]}. "
+        f"Моя первичная реакция: {attitude['tone']}."
+    )
+    try:
+        private_thought = await asyncio.to_thread(build_void_fragment_for_naz_sync, private_material)
+        exchange_path = queue_void_fragment_for_naz(
+            private_thought,
+            source_event="shared_news_discussion",
+            topic=item.get("title", ""),
+        )
+        apply_relationship_event("news_discussion", topic=item.get("title", ""))
+    except Exception as exc:
+        await message.answer(f"Не смог начать разговор: {exc}")
+        return
+    content = (
+        f"Заголовок: {item.get('title', '')}\nОписание: {item.get('summary', '')}\n"
+        f"Источник: {item.get('source_name', '')}\nСсылка: {item.get('url', '')}\n"
+        f"Позиция VOID: {attitude['stance']} — {attitude['tone']}\n\n{directive}"
+    )
+    draft_id = await generate_and_save(
+        item.get("mode", "news"), content, item.get("frequency", "HUMAN"),
+        item.get("source_name", ""), item.get("url", ""),
+    )
+    await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", "news"))
+    await message.answer(
+        f"Общий сигнал: {item.get('title', '')}\n"
+        f"VOID-черновик: #{draft_id}\n"
+        f"Приватная мысль для Naz: {exchange_path.name if exchange_path else 'exchange disabled'}\n"
+        "Naz получит не пост VOID, а отдельный импульс из разговора."
+    )
 
 
 @router.message(Command("candidates"))
@@ -1768,6 +3746,60 @@ async def future_command(message: Message):
     await manual_like(message, "future", parts[1])
 
 
+@router.message(Command("gaming_plan"))
+async def gaming_plan_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    topic = parts[1].strip() if len(parts) > 1 else "игры как человеческое пространство"
+    plan = gaming_vertical.plan_gaming_content("void", topic, get_recent_content_signatures(), platform="telegram")
+    await message.answer(
+        f"🎮 Игровой план VOID\n\nРубрика: {plan['intent']}\nФормат: {plan['format']}\n"
+        f"Коммерческий угол: {plan['commercial_angle']}\nТема: {topic}"
+    )
+
+
+async def gaming_draft(message: Message, *, commercial: bool = False) -> None:
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2 or len(parts[1].strip()) < 3:
+        await message.answer("Используй: /gaming тема игры, механики или явления")
+        return
+    topic = parts[1].strip()
+    plan = gaming_vertical.plan_gaming_content(
+        "void", topic, get_recent_content_signatures(), platform="telegram", commercial=commercial
+    )
+    instructions = f"{VOID_CORE_PROMPT}\n\n{gaming_vertical.prompt_context('void', plan)}"
+    await message.answer(f"🎮 {plan['intent']} · {plan['format']}. Собираю игровой черновик.")
+    try:
+        post = await asyncio.to_thread(call_ai, instructions, f"Тема игрового текста: {topic}", 700, OPENAI_POST_MODEL)
+        draft_id = save_draft(
+            "gaming", f"Gaming: {topic[:120]}", post,
+            "VOID gaming vertical", f"manual://gaming/{now_iso()}", "GAMING", 7,
+        )
+        record_content_signature(plan, topic)
+    except Exception as exc:
+        await message.answer(f"Игровой черновик не получился: {type(exc).__name__}: {exc}")
+        return
+    await message.answer(
+        f"Черновик создан: #{draft_id}\n/preview {draft_id}\n/publish {draft_id}\n\n"
+        "Игровая автопубликация пока выключена."
+    )
+
+
+@router.message(Command("gaming"))
+async def gaming_command(message: Message):
+    await gaming_draft(message, commercial=False)
+
+
+@router.message(Command("gaming_commercial"))
+async def gaming_commercial_command(message: Message):
+    await gaming_draft(message, commercial=True)
+
+
 @router.message(Command("archive"))
 async def archive_command(message: Message):
     parts = (message.text or "").split(maxsplit=1)
@@ -1841,6 +3873,9 @@ async def preview_command(message: Message):
     if not draft:
         await message.answer("Черновик не найден.")
         return
+    if draft["published_at"]:
+        await message.answer("Этот текст уже опубликован. Для разговора нужна новая неопубликованная мысль VOID.")
+        return
 
     await message.answer(draft["post"])
 
@@ -1858,6 +3893,158 @@ async def publish_command(message: Message, bot: Bot):
 
     result = await publish_draft(bot, int(parts[1]))
     await message.answer(result)
+
+
+@router.message(Command("publish_vk"))
+async def publish_vk_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    parts = (message.text or "").split()
+    force = False
+    if len(parts) >= 2 and parts[1] == "--yes":
+        force = True
+        parts.pop(1)
+
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Use: /publish_vk ID\nPublish for real: /publish_vk --yes ID")
+        return
+
+    result = await publish_draft_to_vk(int(parts[1]), force=force)
+    await message.answer(result)
+
+
+@router.message(Command("rubric_schedule"))
+async def rubric_schedule_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer(rubric_schedule_text())
+
+
+@router.message(Command("vk_schedule_draft"))
+async def vk_schedule_draft_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer("Выбираю рубрику по московскому времени и собираю VK-черновик.")
+    try:
+        result = await make_scheduled_rubric_draft_once()
+    except Exception as e:
+        await message.answer(f"VK scheduled draft failed: {type(e).__name__}: {e}")
+        return
+    await message.answer(
+        f"{result}\n"
+        "Auto-publish locally:\n"
+        "python vk_browser_publisher.py publish-draft ID"
+    )
+
+
+@router.message(Command("vk_music_status"))
+async def vk_music_status_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    tracks = await asyncio.to_thread(load_vk_music_tracks)
+    await message.answer(f"VK music tracks: {len(tracks)}\nFile: {VK_MUSIC_TRACKS_FILE}")
+
+
+@router.message(Command("vk_music_import"))
+async def vk_music_import_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    payload = (message.text or "").split(maxsplit=1)
+    text = payload[1].strip() if len(payload) > 1 else ""
+    if not text:
+        await message.answer(
+            "Use:\n"
+            "/vk_music_import Artist - Track | https://vk.com/audio... | future, night\n"
+            "One track per line."
+        )
+        return
+
+    added, total = await asyncio.to_thread(import_vk_music_tracks, text)
+    await message.answer(f"VK music import: added={added}, total={total}")
+
+
+@router.message(Command("vk_music_sync"))
+async def vk_music_sync_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    payload = (message.text or "").split(maxsplit=2)
+    if len(payload) < 2 or not payload[1].startswith("http"):
+        await message.answer(
+            "Use:\n"
+            "/vk_music_sync URL\n"
+            "/vk_music_sync URL night,electronic,melancholy\n\n"
+            "Browser playlist sync is the next VK automation step; this command is reserved for it."
+        )
+        return
+
+    url = payload[1].strip()
+    tags = payload[2].strip() if len(payload) > 2 else ""
+    await message.answer(
+        "VK music sync queued conceptually, not running yet.\n"
+        f"URL: {url}\n"
+        f"Base tags: {tags or 'music,culture,night'}\n\n"
+        "Next implementation step: authorized browser scraper for VK playlists."
+    )
+
+
+@router.message(Command("vk_status"))
+async def vk_status_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer(
+        "VK publisher\n\n"
+        f"VK_GROUP_ID: {'задан' if VK_GROUP_ID else 'не задан'}\n"
+        f"VK_USER_ACCESS_TOKEN: {'задан' if VK_USER_ACCESS_TOKEN else 'не задан'}\n"
+        f"VK_PHOTO_ACCESS_TOKEN: {'задан' if VK_PHOTO_ACCESS_TOKEN else 'не задан'}\n"
+        f"VK_API_VERSION: {VK_API_VERSION}\n"
+        f"VK_DRY_RUN: {VK_DRY_RUN}\n\n"
+        "Проверка: /vk_test текст\n"
+        "Тест черновика: /publish_vk ID\n"
+        "Реальная публикация: /publish_vk --yes ID\n"
+        "Реальная тест-публикация: /vk_test --yes текст"
+    )
+
+
+@router.message(Command("vk_test"))
+async def vk_test_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    payload = (message.text or "").split(maxsplit=1)
+    text = payload[1].strip() if len(payload) > 1 else ""
+    force = False
+    if text.startswith("--yes "):
+        force = True
+        text = text.removeprefix("--yes ").strip()
+
+    if len(text) < 3:
+        await message.answer("Используй: /vk_test текст\nРеально опубликовать: /vk_test --yes текст")
+        return
+
+    try:
+        result = await asyncio.to_thread(post_to_vk_wall, text, force=force)
+    except Exception as e:
+        await message.answer(f"VK publish failed: {type(e).__name__}: {e}")
+        return
+
+    status = "dry-run" if result.get("dry_run") else "published"
+    post_id = result.get("post_id")
+    await message.answer(f"VK {status}. post_id={post_id}")
 
 
 @router.message(Command("cross_status"))
@@ -1885,19 +4072,23 @@ async def void_crosspost_draft_command(message: Message):
         await message.answer(f"Остановил черновик: {reason}. Сначала очисти входной текст.")
         return
 
-    await message.answer("Собираю Naz-черновик из VOID-фрагмента.")
-    adapted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
-    await message.answer(adapted)
+    await message.answer("Вынимаю из текста фрагмент внутреннего разговора Void и Naz.")
+    try:
+        extracted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
+    except ValueError as e:
+        await message.answer(f"Фрагмент остановлен: {e}.")
+        return
+    await message.answer(
+        f"Голос Void (ещё не пост для Naz):\n\n{extracted}\n\n"
+        "Чтобы передать на адаптацию через exchange: /publish_void с этим текстом."
+    )
 
 
 @router.message(Command("publish_void"))
-async def publish_void_crosspost_command(message: Message, bot: Bot):
+@router.message(Command("thought_to_naz"))
+async def publish_void_crosspost_command(message: Message):
     if not is_admin(message):
         await message.answer(admin_required())
-        return
-
-    if not NAZ_CHANNEL_ID:
-        await message.answer("NAZ_CHANNEL_ID не задан. Добавь канал Naz AI Bot в .env/Secrets.")
         return
 
     if not can_crosspost("void_to_naz"):
@@ -1906,29 +4097,35 @@ async def publish_void_crosspost_command(message: Message, bot: Bot):
 
     fragment = extract_void_fragment_payload(message)
     if len(fragment) < 20:
-        await message.answer("Используй: /publish_void текст поста VOID или ответь /publish_void на сообщение VOID.")
+        await message.answer("Используй: /thought_to_naz неопубликованная мысль VOID для Naz.")
         return
 
     ok, reason = validate_void_fragment_for_naz(fragment)
     if not ok:
-        await message.answer(f"Автопубликация остановлена: {reason}. Сначала очисти входной текст.")
+        await message.answer(f"Передача остановлена: {reason}. Сначала очисти входной текст.")
         return
 
-    await message.answer("Готовлю Naz-кросспост и публикую.")
-    adapted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
-    await send_to_naz_channel(bot, adapted)
-    mark_crosspost("void_to_naz")
-    await message.answer(f"Опубликовано в Naz AI Bot. VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}")
+    await message.answer("Вынимаю голос Void и передаю Naz через exchange для отдельной интерпретации.")
+    try:
+        extracted = await asyncio.to_thread(build_void_fragment_for_naz_sync, fragment)
+        path = queue_void_fragment_for_naz(
+            extracted,
+            source_event="manual_void_fragment",
+        )
+    except ValueError as e:
+        await message.answer(f"Передача остановлена: {e}.")
+        return
+    await message.answer(
+        f"Фрагмент передан в exchange, но не опубликован Void-проектом в Naz.\n"
+        f"Файл: {path.name}\n"
+        f"VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}"
+    )
 
 
 @router.message(Command("cross_to_naz"))
-async def cross_to_naz_command(message: Message, bot: Bot):
+async def cross_to_naz_command(message: Message):
     if not is_admin(message):
         await message.answer(admin_required())
-        return
-
-    if not NAZ_CHANNEL_ID:
-        await message.answer("NAZ_CHANNEL_ID не задан. Добавь канал Naz AI Bot в .env/Secrets.")
         return
 
     if not can_crosspost("void_to_naz"):
@@ -1945,18 +4142,25 @@ async def cross_to_naz_command(message: Message, bot: Bot):
         await message.answer("Черновик не найден.")
         return
 
-    await message.answer("Адаптирую VOID-сигнал под Naz AI Bot и отправляю.")
+    await message.answer("Вынимаю из VOID-черновика реплику для внутреннего диалога и кладу в exchange.")
     try:
-        adapted = await asyncio.to_thread(build_crosspost_to_naz_sync, draft)
+        extracted = await asyncio.to_thread(build_crosspost_to_naz_sync, draft)
+        path = queue_void_fragment_for_naz(
+            extracted,
+            source_event="manual_void_draft",
+            topic=str(draft["title"] or ""),
+        )
     except ValueError as e:
-        await message.answer(f"Автопубликация остановлена: {e}. Сначала очисти черновик.")
+        await message.answer(f"Передача остановлена: {e}. Сначала проверь черновик и exchange.")
         return
-    await send_to_naz_channel(bot, adapted)
-    mark_crosspost("void_to_naz")
-    await message.answer(f"Готово. VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}")
+    await message.answer(
+        f"Готово: {path.name}. Naz должен сам расшифровать реплику перед публикацией.\n"
+        f"VOID -> Naz AI Bot: {crosspost_count('void_to_naz')}/{CROSSPOST_DAILY_LIMIT}"
+    )
 
 
 @router.message(Command("cross_from_naz"))
+@router.message(Command("thought_from_naz"))
 async def cross_from_naz_command(message: Message, bot: Bot):
     if not is_admin(message):
         await message.answer(admin_required())
@@ -1976,10 +4180,10 @@ async def cross_from_naz_command(message: Message, bot: Bot):
         ).strip()
 
     if len(source_text) < 20:
-        await message.answer("Используй: /cross_from_naz текст поста Naz AI Bot")
+        await message.answer("Используй: /thought_from_naz неопубликованная мысль Naz")
         return
 
-    await message.answer("Перевожу пост Naz AI Bot в голос VOID и публикую.")
+    await message.answer("VOID переваривает приватную мысль Naz и собирает собственный выпуск рубрики.")
     adapted = await asyncio.to_thread(build_crosspost_from_naz_sync, source_text)
     draft_id = save_draft(
         adapted["mode"],
@@ -2019,6 +4223,26 @@ async def void_now_command(message: Message, bot: Bot):
     await message.answer(result)
 
 
+@router.message(Command("telegram_schedule"))
+async def telegram_schedule_command(message: Message):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer(telegram_schedule_text())
+
+
+@router.message(Command("void_schedule_now"))
+async def void_schedule_now_command(message: Message, bot: Bot):
+    if not is_admin(message):
+        await message.answer(admin_required())
+        return
+
+    await message.answer("Запускаю scheduled-рубрику VOID для Telegram.")
+    result = await publish_telegram_void_scheduled_once(bot)
+    await message.answer(result)
+
+
 @router.message(Command("auto_on"))
 async def auto_on_command(message: Message):
     if not is_admin(message):
@@ -2028,7 +4252,8 @@ async def auto_on_command(message: Message):
     set_setting("auto_publish", "1")
     await message.answer(
         "Автопубликация включена.\n"
-        "VOID будет сам искать, проверять и публиковать лучший сигнал примерно раз в 3 часа.\n"
+        "VOID будет публиковать scheduled-рубрику примерно раз в 3 часа.\n"
+        "Naz живёт в своём проекте; здесь остаётся только обмен через exchange/adaptation.\n"
         "Если он начнёт душнить — это всё ещё наша ответственность. Увы, зрелость."
     )
 
@@ -2046,7 +4271,10 @@ async def auto_off_command(message: Message):
 @router.message(Command("auto_status"))
 async def auto_status_command(message: Message):
     enabled = get_setting("auto_publish", "0") == "1"
-    await message.answer(f"Автопубликация: {'включена' if enabled else 'выключена'}")
+    await message.answer(
+        f"Автопубликация: {'включена' if enabled else 'выключена'}\n\n"
+        f"VOID last_ts: {get_setting('telegram_void_last_ts', '0')}"
+    )
 
 
 @router.callback_query(F.data.startswith("catch:"))
@@ -2081,8 +4309,8 @@ async def catch_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "void:quick:news")
 async def void_quick_news_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "📰 Ищу новости... Скоро будет чёрновик.\n\n"
-        "Используй /news чтобы проверить результат.",
+        "📰 Новости\n\n"
+        "Пришли ссылку, заголовок или короткий пересказ новости. Я вытащу из неё сигнал, а не просто перескажу пресс-релиз.",
         reply_markup=quick_actions_keyboard(),
     )
     await callback.answer()
@@ -2091,7 +4319,7 @@ async def void_quick_news_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "void:quick:music")
 async def void_quick_music_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "🎵 Культурный режим активирован.\n\n"
+        "🎵 Музыка и культура\n\n"
         "Отправляй мне новости о музыке, артистах или платформах — "
         "и я дам культурный взгляд на тему.",
         reply_markup=quick_actions_keyboard(),
@@ -2102,12 +4330,70 @@ async def void_quick_music_callback(callback: CallbackQuery):
 @router.callback_query(F.data == "void:quick:future")
 async def void_quick_future_callback(callback: CallbackQuery):
     await callback.message.edit_text(
-        "🔮 FUTURE FILE режим активирован.\n\n"
+        "🔮 Будущее\n\n"
         "Отправляй мне тему о будущем, технологиях или трендах — "
         "и я проанализирую грядущий сдвиг.",
         reply_markup=quick_actions_keyboard(),
     )
     await callback.answer()
+
+
+async def handle_reply_button(message: Message, text: str) -> bool:
+    if text == BTN_BACK:
+        await message.answer(welcome_text(), reply_markup=reply_main_keyboard())
+        return True
+
+    if text == BTN_GUIDE:
+        await message.answer(guide_text(), reply_markup=reply_guide_keyboard())
+        return True
+
+    if text == BTN_RESET:
+        clear_dialog_context(message.from_user.id)
+        await message.answer("🧹 Контекст очищен. Можно начинать с новой мысли.", reply_markup=reply_main_keyboard())
+        return True
+
+    if text == BTN_PERSONA:
+        await message.answer("🎭 Выбери характер VOID:", reply_markup=persona_keyboard())
+        return True
+
+    if text == BTN_TOPICS:
+        await message.answer("🛰 Выбери направление или просто пришли свою тему.", reply_markup=reply_topics_keyboard())
+        return True
+
+    if text == BTN_STATUS:
+        session = get_dialog_session(message.from_user.id)
+        status = (
+            "📊 Статус VOID\n\n"
+            f"Диалог: всегда ON\n"
+            f"Характер: {session['personality']}"
+        )
+        if is_admin(message):
+            status += f"\n\nКросспостинг:\n{crosspost_status_text()}"
+        await message.answer(status, reply_markup=reply_main_keyboard())
+        return True
+
+    if text == "📰 Новости":
+        await message.answer(
+            "📰 Пришли ссылку, заголовок или короткий пересказ новости. Я вытащу из неё сигнал.",
+            reply_markup=reply_topics_keyboard(),
+        )
+        return True
+
+    if text == "🎵 Музыка":
+        await message.answer(
+            "🎵 Пришли новость про музыку, артистов или платформы. Я посмотрю на культурный сдвиг.",
+            reply_markup=reply_topics_keyboard(),
+        )
+        return True
+
+    if text == "🔮 Будущее":
+        await message.answer(
+            "🔮 Пришли тему про технологии, тренды или странное будущее. Я найду, куда движется сигнал.",
+            reply_markup=reply_topics_keyboard(),
+        )
+        return True
+
+    return False
 
 
 @router.message()
@@ -2117,10 +4403,52 @@ async def free_text_handler(message: Message):
     user_id = message.from_user.id
     text = (message.text or "").strip()
 
-    session = get_dialog_session(user_id)
-
-    if not session or not session.get("enabled"):
+    if await handle_delegated_reply(message, text):
         return
+
+    if is_admin(message) and message.reply_to_message:
+        try:
+            named = name_contact_from_reply(message.reply_to_message.message_id, user_id, text)
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        if named:
+            await message.answer(
+                f"Записал: {named['alias']} → {named['display_name']}. Теперь можно сказать: «Напиши {named['alias']}, чтобы…»"
+            )
+            return
+
+    if is_admin(message):
+        try:
+            request = delegated_messaging.parse_delegation_request(text)
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        if request:
+            spoken_alias, purpose = request
+            contacts = list_saved_contacts(user_id)
+            contact = delegated_messaging.resolve_saved_contact(contacts, spoken_alias)
+            if not contact:
+                aliases = ", ".join(str(item["alias"]) for item in contacts) or "пока пусто"
+                await message.answer(f"Не нашёл один точный контакт «{spoken_alias}». Сохранены: {aliases}.")
+                return
+            try:
+                await start_saved_contact_delegation(message, contact, purpose)
+            except ValueError as exc:
+                await message.answer(str(exc))
+            return
+
+    if user_id != ADMIN_ID:
+        remember_reachable_peer(
+            user_id, message.from_user.full_name,
+            (delegated_messaging.utc_now() + timedelta(hours=24)).isoformat(timespec="seconds"),
+        )
+        await ensure_contact_named(message)
+
+    if await handle_reply_button(message, text):
+        return
+
+    session = get_dialog_session(user_id)
 
     history = get_dialog_context(user_id, limit=8)
     personality = session.get("personality", "observer")
@@ -2150,28 +4478,42 @@ async def free_text_handler(message: Message):
     if new_memory:
         save_dialog_message(user_id, "memory", new_memory)
 
-    await message.answer(reply)
+    await message.answer(reply, reply_markup=reply_main_keyboard())
 
 
-async def main():
+async def run_bot_once():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан")
 
     init_db()
 
-    bot = Bot(token=BOT_TOKEN)
+    session = AiohttpSession(proxy=TELEGRAM_PROXY_URL or None)
+    session._connector_init["family"] = socket.AF_INET
+    bot = Bot(token=BOT_TOKEN, session=session)
     dp = Dispatcher()
     dp.include_router(router)
 
-    global auto_task
+    global auto_task, exchange_task
     auto_task = asyncio.create_task(auto_loop(bot))
+    exchange_task = asyncio.create_task(exchange_loop(bot))
 
     print("POLLING START", flush=True)
 
-    await dp.start_polling(
-    bot,
-    allowed_updates=["message", "callback_query"]
-)
+    try:
+        await dp.start_polling(
+            bot,
+            allowed_updates=["message", "callback_query"],
+        )
+    finally:
+        if auto_task:
+            auto_task.cancel()
+        if exchange_task:
+            exchange_task.cancel()
+        await bot.session.close()
+
+
+async def main():
+    await run_bot_once()
 
 
 if __name__ == "__main__":

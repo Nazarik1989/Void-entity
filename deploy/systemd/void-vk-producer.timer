@@ -1,0 +1,11 @@
+[Unit]
+Description=Create scheduled VOID VK queue jobs
+
+[Timer]
+OnCalendar=*-*-* 00,03,06,09,12,15,18,21:00:00 Europe/Moscow
+Persistent=true
+AccuracySec=1min
+Unit=void-vk-producer.service
+
+[Install]
+WantedBy=timers.target

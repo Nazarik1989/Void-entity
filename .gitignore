@@ -5,7 +5,13 @@ __pycache__/
 *.db
 *.sqlite
 *.sqlite3
+void.db.localbak.*
 logs/
+data/vk_browser_profile/
+data/vk_autopost_profile/
+data/vk_browser_payloads/
+data/*storage_state*.json
+data/vk_publish_queue/
 tmp/
 .DS_Store
 

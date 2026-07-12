@@ -1,0 +1,22 @@
+{
+  "tracks": [
+    {
+      "artist": "Burial",
+      "title": "Archangel",
+      "url": "https://vk.com/audio?q=Burial%20Archangel",
+      "tags": ["night", "city", "memory", "culture", "music"]
+    },
+    {
+      "artist": "Oneohtrix Point Never",
+      "title": "Chrome Country",
+      "url": "https://vk.com/audio?q=Oneohtrix%20Point%20Never%20Chrome%20Country",
+      "tags": ["future", "interface", "technology", "dream", "signal"]
+    },
+    {
+      "artist": "Aphex Twin",
+      "title": "Xtal",
+      "url": "https://vk.com/audio?q=Aphex%20Twin%20Xtal",
+      "tags": ["attention", "feed", "algorithm", "soft", "ambient"]
+    }
+  ]
+}

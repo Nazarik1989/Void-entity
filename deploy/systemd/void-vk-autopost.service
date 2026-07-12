@@ -1,0 +1,34 @@
+[Unit]
+Description=VOID VK browser autopost
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/void-vk-publisher/profile
+ConditionPathExists=!/etc/void-vk-publisher.disabled
+
+[Service]
+Type=oneshot
+User=publisher
+Group=publisher
+WorkingDirectory=/opt/void_entity
+EnvironmentFile=/etc/void-vk-publisher.env
+Environment=PYTHONUNBUFFERED=1
+Environment=VK_BROWSER_PROFILE_DIR=/var/lib/void-vk-publisher/profile
+Environment=XDG_CACHE_HOME=/var/cache/void-vk-publisher
+RuntimeDirectory=void-vk-publisher
+RuntimeDirectoryMode=0700
+UMask=0027
+ExecStart=/usr/bin/flock --nonblock /run/void-vk-publisher/consumer.lock /opt/void_entity/venv/bin/python /opt/void_entity/vk_queue_consumer.py consume-queue
+TimeoutStartSec=45min
+Nice=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/void-vk-publisher/queue /var/lib/void-vk-publisher/profile /var/cache/void-vk-publisher /run/void-vk-publisher
+
+[Install]
+WantedBy=multi-user.target
