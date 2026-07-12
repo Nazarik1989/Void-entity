@@ -1,14 +1,47 @@
 import os
 import sys
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from main import TelegramPostPackage, publish_draft, send_telegram_post
+from main import (
+    DEFAULT_OPENAI_IMAGE_MODEL,
+    TelegramPostPackage,
+    generate_post_images_sync,
+    publish_draft,
+    send_telegram_post,
+)
 
 
 class TelegramPublisherTests(unittest.IsolatedAsyncioTestCase):
+    def test_primary_image_model_is_exact_openrouter_gpt_image_2_id(self) -> None:
+        self.assertEqual(DEFAULT_OPENAI_IMAGE_MODEL, "openai/gpt-image-2")
+
+    def test_image_model_failure_is_diagnostic_and_not_silently_substituted(self) -> None:
+        client = MagicMock()
+        client.images.generate.side_effect = RuntimeError("model unavailable")
+
+        with (
+            patch("main.OPENAI_IMAGE_MODEL", "openai/gpt-image-2"),
+            patch("main.openai_client", return_value=client),
+            patch("main.build_image_prompts_sync", return_value=["prompt"]),
+            patch("builtins.print") as log,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "model unavailable"):
+                generate_post_images_sync({})
+
+        client.images.generate.assert_called_once_with(
+            model="openai/gpt-image-2",
+            prompt="prompt",
+            size=ANY,
+            quality=ANY,
+            n=1,
+        )
+        diagnostic = log.call_args.args[0]
+        self.assertIn("model=openai/gpt-image-2", diagnostic)
+        self.assertIn("source-image/text-only fallback", diagnostic)
+
     def make_bot(self, calls: list[str]) -> MagicMock:
         bot = MagicMock()
 

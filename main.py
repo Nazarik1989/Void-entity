@@ -57,7 +57,15 @@ OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-5.4")
 OPENAI_POST_MODEL = os.getenv("OPENAI_POST_MODEL", "openai/gpt-5.4-mini")
 OPENAI_DIALOG_MODEL = os.getenv("OPENAI_DIALOG_MODEL", os.getenv("OPENAI_MODEL", "openai/gpt-5.4"))
-OPENAI_IMAGE_MODEL = os.getenv("OPENAI_IMAGE_MODEL", "gpt-image-1")
+DEFAULT_OPENAI_IMAGE_MODEL = "openai/gpt-image-2"
+_configured_image_model = os.getenv("OPENAI_IMAGE_MODEL", "").strip()
+if _configured_image_model and _configured_image_model != DEFAULT_OPENAI_IMAGE_MODEL:
+    print(
+        "configured OPENAI_IMAGE_MODEL does not match the required OpenRouter GPT Image 2 ID; "
+        f"ignoring it and using {DEFAULT_OPENAI_IMAGE_MODEL}",
+        flush=True,
+    )
+OPENAI_IMAGE_MODEL = DEFAULT_OPENAI_IMAGE_MODEL
 OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
@@ -1878,13 +1886,21 @@ def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
     images: list[bytes] = []
 
     for prompt in build_image_prompts_sync(draft):
-        response = client.images.generate(
-            model=OPENAI_IMAGE_MODEL,
-            prompt=prompt,
-            size=OPENAI_IMAGE_SIZE,
-            quality=OPENAI_IMAGE_QUALITY,
-            n=1,
-        )
+        try:
+            response = client.images.generate(
+                model=OPENAI_IMAGE_MODEL,
+                prompt=prompt,
+                size=OPENAI_IMAGE_SIZE,
+                quality=OPENAI_IMAGE_QUALITY,
+                n=1,
+            )
+        except Exception as e:
+            print(
+                f"image generation failed for model={OPENAI_IMAGE_MODEL}: "
+                f"{type(e).__name__}: {e}; using source-image/text-only fallback",
+                flush=True,
+            )
+            raise
         if not response.data:
             continue
 
