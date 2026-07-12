@@ -215,13 +215,13 @@ Or publish automatically from a draft id:
 python vk_browser_publisher.py publish-draft 259
 ```
 
-Or create the current scheduled rubric draft on the VPS and publish it automatically:
+Or enqueue an existing draft for the deterministic VPS publisher:
 
 ```bash
-python vk_browser_publisher.py publish-scheduled
+python void_vk_producer.py enqueue-draft 259
 ```
 
-Install background VK autoposting in Windows Task Scheduler (every 3 hours):
+The legacy Windows task is diagnostic only and is not part of the VPS production path:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/install_vk_autopost_task.ps1
@@ -231,9 +231,21 @@ The task runs `scripts/vk_autopost.ps1`, uses the separate headless browser prof
 `data/vk_autopost_profile`, ignores overlapping runs, and writes logs to `logs/vk-autopost.log`.
 The computer must be running, the Windows user must be signed in, and network access must be available.
 
+Production uses one shared queue and a profile readable only by `publisher`:
+
+```text
+VK_PUBLISH_QUEUE_DIR=/var/lib/void-vk-publisher/queue
+VK_BROWSER_PROFILE_DIR=/var/lib/void-vk-publisher/profile
+```
+
+`void-vk-producer.timer` generates scheduled VOID content and enqueues it without browser access.
+`void-vk-autopost.timer` runs only the standalone consumer in `vk_queue_consumer.py`; that process
+does not import `main.py`, Telegram, or LLM code. VPS users, group membership, modes, ACL option,
+one-time profile authorization, kill switch, and admin requeue are documented in
+`deploy/VPS_VK_PUBLISHER.md`.
+
 The browser helper opens the community composer, uploads the generated image, inserts the draft text, searches VK audio,
-selects the closest matching track, and either stops on the final VK screen or clicks publish when `publish-draft` /
-`open-payload --publish` / `publish-scheduled` is used.
+selects the closest matching track, and either stops on the final VK screen or clicks publish for manual diagnostic commands.
 
 Playlist format:
 
