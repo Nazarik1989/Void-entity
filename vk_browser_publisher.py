@@ -14,7 +14,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 import main
-from vk_publish_queue import build_job, consume_once, enqueue_job
+from vk_publish_queue import RetryablePublishError, build_job, consume_once, enqueue_job, recent_track_keys
 
 
 load_dotenv()
@@ -49,6 +49,8 @@ def _track_score(row_text: str, payload: dict[str, Any]) -> int:
     if artist and artist in row:
         score += 100
     title_tokens = _tokens(title)
+    if not title_tokens:
+        title_tokens = _tokens(str(payload.get("track_query") or ""))
     row_tokens = _tokens(row_text)
     score += 10 * len(title_tokens & row_tokens)
     for hint in ("mercury", "beats", "remix", "zavtra"):
@@ -222,12 +224,15 @@ def build_browser_payload(draft_id: int) -> dict[str, Any]:
         image_file.write_bytes(images[0])
         image_path = str(image_file.resolve())
 
-    track = main.choose_vk_music_track(draft)
-    track_query = ""
-    if track:
-        artist = str(track.get("artist", "")).strip()
-        title = str(track.get("title", "")).strip()
-        track_query = f"{artist} {title}".strip()
+    track = main.choose_vk_music_track(
+        draft,
+        excluded_track_keys=set(recent_track_keys(VK_PUBLISH_QUEUE_DIR)),
+    )
+    if not track:
+        raise RuntimeError("No suitable fresh VK music track is available")
+    artist = str(track.get("artist", "")).strip()
+    title = str(track.get("title", "")).strip()
+    track_query = f"{artist} {title}".strip()
 
     payload = {
         "draft_id": draft_id,
@@ -377,28 +382,28 @@ def open_payload(payload_path: str, *, publish: bool = False, mark_draft: bool =
 
         selected_track = ""
         track_query = str(payload.get("track_query") or "").strip()
-        if track_query:
-            page.mouse.click(525, 536)
-            page.wait_for_timeout(1500)
-            page.locator('[data-testid="posting_audio_search_audio_input"]').fill(track_query)
-            page.wait_for_timeout(5000)
-            rows = page.locator('[data-testid="posting_audio_audio_track_row"]')
-            row_texts = [rows.nth(i).inner_text(timeout=2000) for i in range(min(rows.count(), 30))]
-            best_index = -1
-            best_score = 0
-            for index, row_text in enumerate(row_texts):
-                score = _track_score(row_text, payload)
-                if score > best_score:
-                    best_score = score
-                    best_index = index
-            if best_index >= 0 and best_score >= 100:
-                selected_track = row_texts[best_index].replace("\n", " - ")
-                rows.nth(best_index).click(timeout=10000)
-                page.wait_for_timeout(800)
-                page.get_by_text(DONE_TEXT, exact=True).last.click(timeout=10000)
-                page.wait_for_timeout(1500)
-            else:
-                print("Could not confidently select a VK audio result.")
+        if not track_query:
+            raise RetryablePublishError("VK track query is missing")
+        page.mouse.click(525, 536)
+        page.wait_for_timeout(1500)
+        page.locator('[data-testid="posting_audio_search_audio_input"]').fill(track_query)
+        page.wait_for_timeout(5000)
+        rows = page.locator('[data-testid="posting_audio_audio_track_row"]')
+        row_texts = [rows.nth(i).inner_text(timeout=2000) for i in range(min(rows.count(), 30))]
+        best_index = -1
+        best_score = 0
+        for index, row_text in enumerate(row_texts):
+            score = _track_score(row_text, payload)
+            if score > best_score:
+                best_score = score
+                best_index = index
+        if best_index < 0 or best_score <= 0:
+            raise RetryablePublishError("no matching VK audio result; retry later")
+        selected_track = row_texts[best_index].replace("\n", " - ")
+        rows.nth(best_index).click(timeout=10000)
+        page.wait_for_timeout(800)
+        page.get_by_text(DONE_TEXT, exact=True).last.click(timeout=10000)
+        page.wait_for_timeout(1500)
 
         print("Prepared VK post in the browser.")
         print(f"Draft: #{payload['draft_id']}")

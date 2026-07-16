@@ -2728,7 +2728,7 @@ def vk_music_track_key(track: dict[str, Any]) -> str:
     return f"{artist}|{title}"
 
 
-def recent_vk_music_track_keys(limit: int = 5) -> list[str]:
+def recent_vk_music_track_keys(limit: int = 8) -> list[str]:
     conn = db()
     rows = conn.execute(
         """
@@ -2812,7 +2812,15 @@ def track_vk_vibes(track: dict[str, Any]) -> set[str]:
     return explicit | infer_vk_vibes(identity)
 
 
-def choose_vk_music_track(draft: dict | sqlite3.Row) -> dict[str, Any] | None:
+def vk_music_track_query_key(track: dict[str, Any]) -> str:
+    query = f"{track.get('artist', '')} {track.get('title', '')}"
+    return " ".join(re.findall(r"[0-9a-zа-яё]+", query.casefold()))
+
+
+def choose_vk_music_track(
+    draft: dict | sqlite3.Row,
+    excluded_track_keys: set[str] | None = None,
+) -> dict[str, Any] | None:
     tracks = load_vk_music_tracks()
     if not tracks:
         return None
@@ -2824,10 +2832,19 @@ def choose_vk_music_track(draft: dict | sqlite3.Row) -> dict[str, Any] | None:
         overlap = post_vibes & track_vibes
         return sum(3 if vibe in {"future", "dark", "energy", "calm"} else 2 for vibe in overlap)
 
-    recent = set(recent_vk_music_track_keys(limit=5))
-    fresh_tracks = [track for track in tracks if vk_music_track_key(track) not in recent]
-    candidates = fresh_tracks or tracks
+    recent = set(recent_vk_music_track_keys(limit=8))
+    shared_recent = excluded_track_keys or set()
+    candidates = [
+        track
+        for track in tracks
+        if vk_music_track_key(track) not in recent
+        and vk_music_track_query_key(track) not in shared_recent
+    ]
+    if not candidates:
+        return None
     best_score = max(score(track) for track in candidates)
+    if best_score <= 0:
+        return None
     best = [track for track in candidates if score(track) == best_score]
 
     draft_seed = str(draft["id"] if "id" in draft.keys() else sorted(post_vibes))
@@ -3109,6 +3126,8 @@ async def publish_draft_to_vk(draft_id: int, *, force: bool = False) -> str:
         return f"VK publish blocked: {reason}. Check /preview {draft_id} first."
 
     track = await asyncio.to_thread(choose_vk_music_track, draft)
+    if not track:
+        return "VK publish blocked: no suitable fresh music track is available."
     post_text = f"{draft['post']}{format_vk_music_track(track)}"
     attachments: list[str] = []
     image_error = ""

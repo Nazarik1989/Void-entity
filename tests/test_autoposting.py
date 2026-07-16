@@ -2,6 +2,7 @@ import os
 import sys
 import unittest
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -188,6 +189,65 @@ class AutopostingRubricTests(unittest.TestCase):
 
         self.assertTrue({"night", "calm", "melancholy"} <= post_vk_vibes(draft))
         self.assertTrue({"night", "calm", "melancholy"} <= track_vk_vibes(track))
+
+    def test_vk_music_rotation_respects_shared_naz_and_void_history(self) -> None:
+        tracks = [
+            {
+                "artist": f"Artist {index}",
+                "title": f"Future {index}",
+                "tags": ["future"],
+            }
+            for index in range(9)
+        ]
+        draft = {
+            "id": 99,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+        excluded = {f"artist {index} future {index}" for index in range(8)}
+
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch("main.recent_vk_music_track_keys", return_value=[]),
+        ):
+            selected = choose_vk_music_track(draft, excluded_track_keys=excluded)
+
+        self.assertEqual(selected["title"], "Future 8")
+
+    def test_vk_music_selection_blocks_without_fresh_suitable_track(self) -> None:
+        tracks = [{"artist": "Artist", "title": "Future", "tags": ["future"]}]
+        draft = {
+            "id": 100,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch("main.recent_vk_music_track_keys", return_value=[]),
+        ):
+            selected = choose_vk_music_track(
+                draft,
+                excluded_track_keys={"artist future"},
+            )
+
+        self.assertIsNone(selected)
+
+    def test_vk_producer_timer_uses_only_requested_moscow_slots(self) -> None:
+        timer = Path("deploy/systemd/void-vk-producer.timer").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("OnCalendar=*-*-* 13:30:00 Europe/Moscow", timer)
+        self.assertIn("OnCalendar=*-*-* 20:30:00 Europe/Moscow", timer)
+        self.assertIn(
+            "OnCalendar=Fri,Sat *-*-* 23:30:00 Europe/Moscow", timer
+        )
+        self.assertNotIn("00,03,06,09,12,15,18,21", timer)
 
 
 if __name__ == "__main__":

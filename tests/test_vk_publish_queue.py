@@ -8,8 +8,19 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from vk_browser_publisher import parse_scheduled_draft_id
-from vk_publish_queue import QueueValidationError, build_job, canonical_job_id, consume_once, enqueue_job, requeue_failed, validate_job
-from vk_queue_consumer import _click_first_text, _open_composer
+from vk_publish_queue import (
+    DuplicateTrackError,
+    QueueValidationError,
+    RetryablePublishError,
+    build_job,
+    canonical_job_id,
+    consume_once,
+    enqueue_job,
+    recent_track_keys,
+    requeue_failed,
+    validate_job,
+)
+from vk_queue_consumer import _attach_track, _click_first_text, _open_composer
 
 
 class VkPublishQueueTests(unittest.TestCase):
@@ -35,6 +46,67 @@ class VkPublishQueueTests(unittest.TestCase):
 
     def test_valid_job(self):
         self.assertEqual(validate_job(self.enqueue(), self.group)["producer"], "void")
+
+    def test_every_job_requires_a_music_track(self):
+        with self.assertRaisesRegex(QueueValidationError, "track_query is required"):
+            self.job(track_query="")
+
+    def test_shared_recent_eight_tracks_cover_naz_and_void(self):
+        for index in range(8):
+            producer = "naz" if index % 2 == 0 else "void"
+            job = self.job(
+                producer=producer,
+                dedupe_key=f"shared-{index}",
+                track_query=f"Artist Track {index}",
+            )
+            self.enqueue(job)
+            publish = Mock()
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
+            publish.assert_called_once()
+
+        self.assertEqual(len(recent_track_keys(self.root)), 8)
+        repeated = self.job(
+            producer="void",
+            dedupe_key="shared-repeat",
+            track_query="artist track 0",
+        )
+        with self.assertRaisesRegex(DuplicateTrackError, "last 8"):
+            self.enqueue(repeated)
+
+        ninth = self.job(
+            producer="naz",
+            dedupe_key="shared-ninth",
+            track_query="Artist Track 8",
+        )
+        self.enqueue(ninth)
+        self.assertEqual(consume_once(self.root, self.group, Mock()), 0)
+        self.assertNotIn("artist track 0", recent_track_keys(self.root))
+
+    def test_missing_vk_track_stays_pending_for_safe_retry(self):
+        directory = self.enqueue(
+            self.job(dedupe_key="retry-track", track_query="Rare Track")
+        )
+        publish = Mock(
+            side_effect=RetryablePublishError("no matching VK audio result")
+        )
+
+        self.assertEqual(consume_once(self.root, self.group, publish), 0)
+
+        pending = self.root / "pending" / directory.name
+        self.assertTrue(pending.is_dir())
+        self.assertTrue((pending / "retry.txt").is_file())
+        self.assertFalse((self.root / "done" / directory.name).exists())
+        self.assertFalse((self.root / "failed" / directory.name).exists())
+
+        publish.reset_mock()
+        self.assertEqual(consume_once(self.root, self.group, publish), 0)
+        publish.assert_not_called()
+
+    def test_unreadable_shared_track_history_fails_closed(self):
+        (self.root / "recent-tracks.json").write_text("not-json", encoding="utf-8")
+
+        with self.assertRaisesRegex(QueueValidationError, "history is unavailable"):
+            self.enqueue(self.job(dedupe_key="history-corrupt"))
 
     def test_other_group_blocked(self):
         with self.assertRaises(QueueValidationError):
@@ -179,6 +251,22 @@ class VkPublishQueueTests(unittest.TestCase):
         page.mouse.wheel.assert_called_once_with(0, 900)
         page.wait_for_timeout.assert_any_call(1_500)
         click_text.assert_any_call(page, ("Создать",))
+
+
+    def test_consumer_refuses_to_publish_when_vk_has_no_matching_track(self):
+        rows = Mock()
+        rows.count.return_value = 1
+        row = Mock()
+        row.inner_text.return_value = "Completely Different Audio"
+        rows.nth.return_value = row
+        search = Mock()
+        page = Mock()
+        page.locator.side_effect = [search, rows]
+
+        with self.assertRaisesRegex(RetryablePublishError, "retry later"):
+            _attach_track(page, "Requested Artist Requested Track")
+
+        page.get_by_text.assert_not_called()
 
 
 if __name__ == "__main__":
