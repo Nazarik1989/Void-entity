@@ -59,6 +59,10 @@ def _open_composer(page: Any) -> None:
     if button.count() and button.is_visible():
         button.click(timeout=15_000, force=True, no_wait_after=True)
     else:
+        # Admin cards can push the lazy-rendered composer below the initial
+        # viewport. Scroll to the feed before falling back to the text button.
+        page.mouse.wheel(0, 900)
+        page.wait_for_timeout(1_500)
         _click_first_text(page, (CREATE_TEXT,))
     page.wait_for_timeout(700)
     _click_first_text(page, POST_TEXTS)
