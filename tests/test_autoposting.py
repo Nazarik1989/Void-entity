@@ -13,10 +13,12 @@ from main import (
     build_rubric_header,
     clean_source_lines,
     choose_vk_music_track,
+    current_void_schedule_slot,
     display_source_name,
     eligible_schedule_slots,
     eligible_rubric_slots,
     inject_rubric_header,
+    parse_daily_times,
     post_vk_vibes,
     track_vk_vibes,
     too_much_english,
@@ -27,6 +29,26 @@ from void_core import CONTENT_PLAN, RUBRIC_SCHEDULE, TELEGRAM_VOID_SCHEDULE
 
 
 class AutopostingRubricTests(unittest.TestCase):
+    def test_void_daily_times_are_normalized_and_deduplicated(self) -> None:
+        self.assertEqual(
+            parse_daily_times("12:00, 16:00,20:00,00:00,12:00,bad,24:00"),
+            ("12:00", "16:00", "20:00", "00:00"),
+        )
+
+    def test_void_schedule_recognizes_all_requested_moscow_slots(self) -> None:
+        schedule = ("12:00", "16:00", "20:00", "00:00")
+        for hour in (12, 16, 20):
+            with self.subTest(hour=hour):
+                self.assertEqual(
+                    current_void_schedule_slot(datetime(2026, 7, 15, hour, 0), schedule),
+                    f"2026-07-15:{hour:02d}:00",
+                )
+        self.assertEqual(
+            current_void_schedule_slot(datetime(2026, 7, 16, 0, 0), schedule),
+            "2026-07-16:00:00",
+        )
+        self.assertIsNone(current_void_schedule_slot(datetime(2026, 7, 15, 13, 0), schedule))
+
     def test_build_rubric_header_for_news_mode(self) -> None:
         self.assertEqual(build_rubric_header("news", "AI"), "SIGNAL / AI")
 
