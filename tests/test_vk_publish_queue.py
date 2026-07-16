@@ -149,6 +149,24 @@ class VkPublishQueueTests(unittest.TestCase):
         page.get_by_text.assert_called_once_with("Создать", exact=True)
         locator.click.assert_called_once_with(timeout=3_000, force=True, no_wait_after=True)
 
+    def test_consumer_retries_when_vk_replaces_button_during_click(self):
+        stale = Mock()
+        stale.count.return_value = 1
+        stale.first = stale
+        stale.is_visible.return_value = True
+        stale.click.side_effect = TimeoutError("button replaced")
+        ready = Mock()
+        ready.count.return_value = 1
+        ready.first = ready
+        ready.is_visible.return_value = True
+        page = Mock()
+        page.get_by_text.side_effect = [stale, ready]
+
+        _click_first_text(page, ("Создать",), timeout=4_000)
+
+        stale.click.assert_called_once_with(timeout=3_000, force=True, no_wait_after=True)
+        ready.click.assert_called_once_with(timeout=3_000, force=True, no_wait_after=True)
+
 
 if __name__ == "__main__":
     unittest.main()
