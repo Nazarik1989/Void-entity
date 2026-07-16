@@ -40,11 +40,16 @@ def _click_first_text(page: Any, labels: tuple[str, ...], timeout: int = 15_000)
         for label in labels:
             locator = page.get_by_text(label, exact=True)
             if locator.count() and locator.first.is_visible():
-                # VK may keep the click navigation request open even though the
-                # composer has already changed state. Do not turn that into a
-                # failed queue job (and a potential duplicate retry).
-                locator.first.click(timeout=3_000, force=True, no_wait_after=True)
-                return
+                try:
+                    # VK may keep the click navigation request open even though
+                    # the composer changed state, or replace the button between
+                    # lookup and click. Neither should fail the queue job.
+                    locator.first.click(timeout=3_000, force=True, no_wait_after=True)
+                    return
+                except Exception as exc:
+                    if type(exc).__name__ != "TimeoutError":
+                        raise
+                    continue
         page.wait_for_timeout(250)
     raise RuntimeError("required VK composer control not found")
 
