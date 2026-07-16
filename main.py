@@ -1902,12 +1902,50 @@ def image_count_for_draft(mode: str, post: str) -> int:
     return 1
 
 
+IMAGE_VISUAL_STYLES = (
+    "cinematic documentary photography with natural light and an observational composition",
+    "surreal editorial photography with restrained practical effects and unusual scale",
+    "architectural minimalism with strong geometry, negative space, and precise lighting",
+    "tactile still-life photography with macro details, real materials, and shallow depth of field",
+    "atmospheric analog-film photography with subtle grain and an unexpected camera angle",
+    "high-end editorial collage combining photography, paper texture, and clean abstract forms",
+    "sculptural studio photography with bold silhouettes, reflective materials, and controlled light",
+    "wide environmental photography with layered depth, weather, and a strong sense of place",
+)
+
+IMAGE_SUBJECT_ROTATION = (
+    "Feature a beautiful adult woman as the central subject; make her distinctive, confident, tasteful, and non-sexualized.",
+    "Show no people, faces, silhouettes, or humanoid figures; tell the story through place, objects, light, and atmosphere.",
+    "Feature an adult man as the central subject with a distinctive age, appearance, wardrobe, and expression.",
+    "Feature a beautiful adult woman with a clearly different appearance, age, hairstyle, wardrobe, and camera angle from a generic recurring heroine; keep the portrayal tasteful and non-sexualized.",
+    "Show no people or human-like characters; use architecture, landscape, machinery, or symbolic objects as the subject.",
+    "Feature a small mixed-gender group of clearly distinct adults in a candid scene rather than a posed hero portrait.",
+    "Feature an older adult woman with a memorable, intelligent presence; portray beauty through character, expression, and cinematic light.",
+    "Avoid a central character entirely; build an abstract or environmental composition tied directly to the post topic.",
+)
+
+
+def image_visual_directions(draft_id: int, count: int) -> list[str]:
+    directions = []
+    for index in range(max(0, count)):
+        rotation_index = draft_id + index * 3
+        style = IMAGE_VISUAL_STYLES[rotation_index % len(IMAGE_VISUAL_STYLES)]
+        subject = IMAGE_SUBJECT_ROTATION[rotation_index % len(IMAGE_SUBJECT_ROTATION)]
+        directions.append(
+            f"Use {style}. {subject} Keep a subtle VOID identity through controlled contrast and a restrained dark accent, "
+            "but do not reuse a recurring face or character design."
+        )
+    return directions
+
+
 def build_image_prompts_sync(draft: dict | sqlite3.Row) -> list[str]:
+    draft_id = int(draft["id"] or 0)
     mode = draft["mode"] or "news"
     title = draft["title"] or "VOID signal"
     post = draft["post"] or ""
     source_name = draft["source_name"] or ""
     count = image_count_for_draft(mode, post)
+    visual_directions = image_visual_directions(draft_id, count)
 
     instructions = """
 You are an art director for a Telegram channel called VOID.
@@ -1920,15 +1958,23 @@ Rules:
 - The image must be relevant to the post's concrete topic.
 - Avoid text, logos, UI screenshots, brand marks, and fake article pages.
 - Avoid depicting a real named person unless the post is specifically about that person.
-- Style: editorial conceptual illustration, cinematic but clean, dark neutral background, high contrast, subtle technological atmosphere.
+- Follow each numbered VISUAL_DIRECTION. Vary medium, composition, gender, age, appearance, and camera distance between posts.
+- Do not default to the same solitary futuristic person or reuse a recurring face or character design.
+- When a direction says no people, include no faces, silhouettes, or humanoid figures.
+- Keep a recognizable VOID mood through controlled contrast and one restrained dark accent, not through a repeated character.
 - No gore, no explicit content.
 """.strip()
 
+    direction_text = "\n".join(
+        f"VISUAL_DIRECTION_{index}: {direction}"
+        for index, direction in enumerate(visual_directions, start=1)
+    )
     input_text = (
         f"NEEDED_IMAGES: {count}\n"
         f"MODE: {mode}\n"
         f"TITLE: {title}\n"
         f"SOURCE_NAME: {source_name}\n"
+        f"{direction_text}\n"
         f"POST:\n{post[:1400]}"
     )
 
@@ -1941,16 +1987,21 @@ Rules:
                 prompts.append(match.group(1).strip())
         prompts = [p for p in prompts if p][:count]
         if prompts:
-            return prompts
+            return [
+                f"{prompt} Mandatory visual direction: {visual_directions[index]}"
+                for index, prompt in enumerate(prompts)
+            ]
     except Exception as e:
         print(f"image prompt error: {type(e).__name__}: {e}", flush=True)
 
-    fallback = (
-        f"Editorial conceptual illustration for a Telegram post titled '{title}'. "
-        f"Represent the concrete topic of the post, source context: {source_name}. "
-        "No text, no logos, no UI screenshots, dark neutral background, high contrast, clean cinematic composition."
-    )
-    return [fallback] * count
+    return [
+        (
+            f"Editorial image for a Telegram post titled '{title}'. "
+            f"Represent the concrete topic of the post, source context: {source_name}. "
+            f"{direction} No text, no logos, no UI screenshots."
+        )
+        for direction in visual_directions
+    ]
 
 
 def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
