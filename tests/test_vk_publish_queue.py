@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from vk_browser_publisher import parse_scheduled_draft_id
 from vk_publish_queue import QueueValidationError, build_job, canonical_job_id, consume_once, enqueue_job, requeue_failed, validate_job
-from vk_queue_consumer import _click_first_text
+from vk_queue_consumer import _click_first_text, _open_composer
 
 
 class VkPublishQueueTests(unittest.TestCase):
@@ -166,6 +166,19 @@ class VkPublishQueueTests(unittest.TestCase):
 
         stale.click.assert_called_once_with(timeout=3_000, force=True, no_wait_after=True)
         ready.click.assert_called_once_with(timeout=3_000, force=True, no_wait_after=True)
+
+    @patch("vk_queue_consumer._click_first_text")
+    def test_consumer_scrolls_to_lazy_composer(self, click_text):
+        publish_button = Mock()
+        publish_button.count.return_value = 0
+        page = Mock()
+        page.locator.return_value.first = publish_button
+
+        _open_composer(page)
+
+        page.mouse.wheel.assert_called_once_with(0, 900)
+        page.wait_for_timeout.assert_any_call(1_500)
+        click_text.assert_any_call(page, ("Создать",))
 
 
 if __name__ == "__main__":
