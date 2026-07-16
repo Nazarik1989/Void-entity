@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from vk_publish_queue import consume_once, requeue_failed
+from vk_publish_queue import RetryablePublishError, consume_once, requeue_failed
 
 QUEUE_DIR = Path(os.getenv("VK_PUBLISH_QUEUE_DIR", "/var/lib/void-vk-publisher/queue"))
 PROFILE_DIR = Path(os.getenv("VK_BROWSER_PROFILE_DIR", "/var/lib/void-vk-publisher/profile"))
@@ -82,7 +82,7 @@ def _tokens(value: str) -> set[str]:
 
 def _attach_track(page: Any, query: str) -> None:
     if not query:
-        return
+        raise RetryablePublishError("VK track query is missing")
     page.mouse.click(525, 536)
     page.wait_for_timeout(1_500)
     page.locator('[data-testid="posting_audio_search_audio_input"]').fill(query)
@@ -93,8 +93,9 @@ def _attach_track(page: Any, query: str) -> None:
     for index in range(min(rows.count(), 30)):
         score = len(query_tokens & _tokens(rows.nth(index).inner_text(timeout=2_000)))
         scored.append((score, index))
-    if not scored or max(scored)[0] == 0:
-        raise RuntimeError("no matching VK audio result")
+    required_score = max(1, min(2, len(query_tokens)))
+    if not scored or max(scored)[0] < required_score:
+        raise RetryablePublishError("no matching VK audio result; retry later")
     rows.nth(max(scored)[1]).click(timeout=10_000)
     page.wait_for_timeout(800)
     page.get_by_text(DONE_TEXT, exact=True).last.click(timeout=10_000)

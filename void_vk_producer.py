@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 import main
-from vk_publish_queue import build_job, enqueue_job
+from vk_publish_queue import build_job, enqueue_job, recent_track_keys
 
 QUEUE_DIR = Path(os.getenv("VK_PUBLISH_QUEUE_DIR", "/var/lib/void-vk-publisher/queue"))
 
@@ -29,7 +29,12 @@ def enqueue_draft(draft_id: int) -> Path:
         raise RuntimeError(f"Draft #{draft_id} blocked: {reason}")
     images = main.generate_post_images_sync(draft)
     media = {f"image-{index}.png": content for index, content in enumerate(images[:4], start=1)}
-    track = main.choose_vk_music_track(draft) or {}
+    track = main.choose_vk_music_track(
+        draft,
+        excluded_track_keys=set(recent_track_keys(QUEUE_DIR)),
+    )
+    if not track:
+        raise RuntimeError("No suitable fresh VK music track is available; draft was not queued")
     track_query = f"{track.get('artist', '')} {track.get('title', '')}".strip()
     job = build_job(producer="void", target_group_id=str(main.VK_GROUP_ID), text=draft["post"], media=list(media), track_query=track_query, dedupe_key=f"void-draft:{draft_id}", source_ref=f"void:draft:{draft_id}")
     return enqueue_job(QUEUE_DIR, job, media)

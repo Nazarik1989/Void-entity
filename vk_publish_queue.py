@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -21,6 +22,9 @@ MAX_MEDIA_COUNT = 4
 MAX_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_TRACK_QUERY_LENGTH = 300
 MAX_DEDUPE_KEY_LENGTH = 256
+RECENT_TRACK_LIMIT = 8
+TRACK_HISTORY_FILENAME = "recent-tracks.json"
+RETRY_DELAY_SECONDS = 30 * 60
 JOB_ID_RE = re.compile(r"^(naz|void)-[0-9a-f]{24}$")
 
 
@@ -30,6 +34,57 @@ class QueueValidationError(ValueError):
 
 class DuplicateJobError(QueueValidationError):
     pass
+
+
+class DuplicateTrackError(QueueValidationError):
+    pass
+
+
+class RetryablePublishError(RuntimeError):
+    """A pre-publish failure that must leave the job available for retry."""
+
+
+def normalize_track_query(value: str) -> str:
+    return " ".join(re.findall(r"[0-9a-zа-яё]+", str(value).casefold()))
+
+
+def recent_track_keys(queue_root: Path, limit: int = RECENT_TRACK_LIMIT) -> list[str]:
+    if limit <= 0:
+        return []
+    path = Path(queue_root) / TRACK_HISTORY_FILENAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QueueValidationError("shared VK track history is unavailable") from exc
+    tracks = payload.get("tracks", []) if isinstance(payload, dict) else []
+    if not isinstance(tracks, list):
+        return []
+    keys = [str(item.get("key") or "") for item in tracks if isinstance(item, dict)]
+    return [key for key in keys if key][-limit:]
+
+
+def _record_published_track(queue_root: Path, job: dict[str, Any]) -> None:
+    queue_root = Path(queue_root)
+    path = queue_root / TRACK_HISTORY_FILENAME
+    key = normalize_track_query(job["track_query"])
+    existing = recent_track_keys(queue_root, RECENT_TRACK_LIMIT)
+    keys = [item for item in existing if item != key]
+    keys.append(key)
+    payload = {
+        "tracks": [{"key": item} for item in keys[-RECENT_TRACK_LIMIT:]]
+    }
+    temp = queue_root / f".{TRACK_HISTORY_FILENAME}.tmp-{uuid.uuid4().hex}"
+    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(temp, 0o644)
+    os.replace(temp, path)
+
+
+def _ensure_track_is_fresh(queue_root: Path, track_query: str) -> None:
+    key = normalize_track_query(track_query)
+    if key in set(recent_track_keys(queue_root, RECENT_TRACK_LIMIT)):
+        raise DuplicateTrackError("track was used in the last 8 published VK posts")
 
 
 def canonical_job_id(producer: str, dedupe_key: str) -> str:
@@ -70,8 +125,12 @@ def _validate_shape(job: Any, allowed_group_id: str | None = None) -> dict[str, 
         raise QueueValidationError("job_id is not canonical")
     if not isinstance(job["text"], str) or not job["text"] or len(job["text"]) > MAX_TEXT_LENGTH:
         raise QueueValidationError("invalid text length")
-    if not isinstance(job["track_query"], str) or len(job["track_query"]) > MAX_TRACK_QUERY_LENGTH:
-        raise QueueValidationError("invalid track_query")
+    if (
+        not isinstance(job["track_query"], str)
+        or not normalize_track_query(job["track_query"])
+        or len(job["track_query"]) > MAX_TRACK_QUERY_LENGTH
+    ):
+        raise QueueValidationError("track_query is required")
     if not all(isinstance(job[key], str) for key in ("created_at", "not_before", "source_ref")):
         raise QueueValidationError("invalid metadata")
     if not job["created_at"] or not job["source_ref"]:
@@ -140,6 +199,7 @@ def enqueue_job(queue_root: Path, job: dict[str, Any], media: dict[str, bytes]) 
     if set(media) != set(job["media"]):
         raise QueueValidationError("media payload does not match job.media")
     queue_root = Path(queue_root)
+    _ensure_track_is_fresh(queue_root, job["track_query"])
     pending = queue_root / "pending"
     pending.mkdir(parents=True, exist_ok=True)
     final = pending / job["job_id"]
@@ -207,11 +267,29 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
             job = validate_job(processing, allowed_group_id)
             if _dedupe_seen(queue_root, job["dedupe_key"], processing):
                 raise DuplicateJobError("duplicate dedupe_key")
+            retry_file = processing / "retry.txt"
+            if (
+                retry_file.is_file()
+                and not retry_file.is_symlink()
+                and time.time() - retry_file.stat().st_mtime < RETRY_DELAY_SECONDS
+            ):
+                os.replace(processing, source)
+                continue
             if job["not_before"] and datetime.fromisoformat(job["not_before"].replace("Z", "+00:00")) > datetime.now(timezone.utc):
                 os.replace(processing, source)
                 continue
+            _ensure_track_is_fresh(queue_root, job["track_query"])
             publish(job, [processing / name for name in job["media"]])
+            _record_published_track(queue_root, job)
+            if retry_file.exists() and not retry_file.is_symlink():
+                retry_file.unlink()
             os.replace(processing, queue_root / "done" / source.name)
+            return 0
+        except RetryablePublishError as exc:
+            (processing / "retry.txt").write_text(
+                f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
+            )
+            os.replace(processing, source)
             return 0
         except Exception as exc:
             failed_target = queue_root / "failed" / source.name
