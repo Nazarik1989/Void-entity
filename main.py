@@ -76,6 +76,7 @@ CROSSPOST_EXCHANGE_AUTO_PUBLISH = os.getenv("CROSSPOST_EXCHANGE_AUTO_PUBLISH", "
 CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exchange").strip())
 CROSSPOST_EXCHANGE_INTERVAL_SECONDS = max(60, int(os.getenv("CROSSPOST_EXCHANGE_INTERVAL_SECONDS", "300") or "300"))
 CROSSPOST_EXCHANGE_MAX_PER_RUN = max(1, min(int(os.getenv("CROSSPOST_EXCHANGE_MAX_PER_RUN", "1") or "1"), 5))
+VOID_TELEGRAM_AUTO_TIMES_RAW = os.getenv("VOID_TELEGRAM_AUTO_TIMES", "12:00,16:00,20:00,00:00").strip()
 
 VK_USER_ACCESS_TOKEN = os.getenv("VK_USER_ACCESS_TOKEN", "")
 VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
@@ -89,6 +90,46 @@ try:
     MOSCOW_TZ = ZoneInfo("Europe/Moscow")
 except ZoneInfoNotFoundError:
     MOSCOW_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
+
+
+def parse_daily_times(value: str) -> tuple[str, ...]:
+    """Return unique, normalized HH:MM schedule values in configured order."""
+    result: list[str] = []
+    for raw_time in value.split(","):
+        raw_time = raw_time.strip()
+        if not raw_time:
+            continue
+        try:
+            hour_text, minute_text = raw_time.split(":", maxsplit=1)
+            hour = int(hour_text)
+            minute = int(minute_text)
+            if hour not in range(24) or minute not in range(60):
+                raise ValueError
+        except ValueError:
+            print(f"invalid VOID_TELEGRAM_AUTO_TIMES value skipped: {raw_time}", flush=True)
+            continue
+        normalized = f"{hour:02d}:{minute:02d}"
+        if normalized not in result:
+            result.append(normalized)
+    return tuple(result)
+
+
+VOID_TELEGRAM_AUTO_TIMES = parse_daily_times(VOID_TELEGRAM_AUTO_TIMES_RAW)
+
+
+def current_void_schedule_slot(
+    now: datetime | None = None,
+    schedule: tuple[str, ...] | None = None,
+) -> str | None:
+    """Return a date-qualified Moscow schedule slot for exact-minute deduplication."""
+    current = now or datetime.now(MOSCOW_TZ)
+    if current.tzinfo is not None:
+        current = current.astimezone(MOSCOW_TZ)
+    current_time = current.strftime("%H:%M")
+    configured = VOID_TELEGRAM_AUTO_TIMES if schedule is None else schedule
+    if current_time not in configured:
+        return None
+    return f"{current:%Y-%m-%d}:{current_time}"
 
 router = Router()
 auto_task: asyncio.Task | None = None
@@ -3402,17 +3443,17 @@ async def auto_loop(bot: Bot) -> None:
         try:
             enabled = get_setting("auto_publish", "0") == "1"
             if enabled:
-                now_ts = int(datetime.now(timezone.utc).timestamp())
-                void_last_ts = int(get_setting("telegram_void_last_ts", "0") or "0")
-                if now_ts - void_last_ts >= 60 * 60 * 3:
+                slot = current_void_schedule_slot()
+                last_slot = get_setting("telegram_void_last_slot", "")
+                if slot and slot != last_slot:
+                    # Claim first so a slow send or restart cannot duplicate a slot.
+                    set_setting("telegram_void_last_slot", slot)
                     result = await publish_telegram_void_scheduled_once(bot)
-                    if "-> Опубликовано:" in result:
-                        set_setting("telegram_void_last_ts", str(now_ts))
                     print(result, flush=True)
         except Exception as e:
             print(f"auto_loop error: {type(e).__name__}: {e}", flush=True)
 
-        await asyncio.sleep(60 * 5)
+        await asyncio.sleep(20)
 
 
 @router.message(CommandStart())
@@ -4396,7 +4437,8 @@ async def auto_status_command(message: Message):
     enabled = get_setting("auto_publish", "0") == "1"
     await message.answer(
         f"Автопубликация: {'включена' if enabled else 'выключена'}\n\n"
-        f"VOID last_ts: {get_setting('telegram_void_last_ts', '0')}"
+        f"Расписание (Europe/Moscow): {', '.join(VOID_TELEGRAM_AUTO_TIMES) or 'не задано'}\n"
+        f"Последний слот VOID: {get_setting('telegram_void_last_slot', '—')}"
     )
 
 
