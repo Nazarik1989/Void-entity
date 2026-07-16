@@ -14,6 +14,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urljoin
@@ -23,6 +24,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import feedparser
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.enums import ChatAction
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
@@ -69,6 +72,18 @@ OPENAI_IMAGE_MODEL = DEFAULT_OPENAI_IMAGE_MODEL
 OPENAI_IMAGE_SIZE = os.getenv("OPENAI_IMAGE_SIZE", "1024x1024")
 OPENAI_IMAGE_QUALITY = os.getenv("OPENAI_IMAGE_QUALITY", "medium")
 TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
+
+# Voice messages use the official OpenAI API independently from OpenRouter.
+VOICE_MESSAGES_ENABLED = os.getenv("VOICE_MESSAGES_ENABLED", "false").strip().lower() not in {"0", "false", "no", "off"}
+VOICE_MESSAGES_ADMIN_ONLY = os.getenv("VOICE_MESSAGES_ADMIN_ONLY", "true").strip().lower() not in {"0", "false", "no", "off"}
+OPENAI_VOICE_API_KEY = os.getenv("OPENAI_VOICE_API_KEY", "").strip()
+OPENAI_VOICE_BASE_URL = os.getenv("OPENAI_VOICE_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
+OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe").strip()
+OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts").strip()
+OPENAI_TTS_VOICE = os.getenv("OPENAI_TTS_VOICE", "marin").strip()
+OPENAI_REALTIME_MODEL = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime-2").strip()
+VOICE_MAX_BYTES = max(1024 * 1024, min(int(os.getenv("VOICE_MAX_BYTES", str(15 * 1024 * 1024)) or 0), 20 * 1024 * 1024))
+VOICE_MAX_DURATION_SECONDS = max(10, min(int(os.getenv("VOICE_MAX_DURATION_SECONDS", "300") or 0), 1200))
 
 CROSSPOST_DAILY_LIMIT = int(os.getenv("CROSSPOST_DAILY_LIMIT", "2") or "2")
 CROSSPOST_EXCHANGE_ENABLED = os.getenv("CROSSPOST_EXCHANGE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
@@ -135,6 +150,7 @@ router = Router()
 auto_task: asyncio.Task | None = None
 exchange_task: asyncio.Task | None = None
 pending_delegation_purposes: dict[int, str] = {}
+voice_openai_client: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -1798,6 +1814,21 @@ def openai_client() -> Any:
         kwargs["base_url"] = OPENAI_BASE_URL
 
     return OpenAI(**kwargs)
+
+
+def ensure_voice_openai_client() -> Any:
+    """Return an official OpenAI client dedicated to speech APIs."""
+    global voice_openai_client
+    if OpenAI is None:
+        raise RuntimeError("OpenAI SDK не установлен")
+    if not OPENAI_VOICE_API_KEY:
+        raise RuntimeError("OPENAI_VOICE_API_KEY не найден. Голосовой контур пока выключен.")
+    if voice_openai_client is None:
+        voice_openai_client = OpenAI(
+            api_key=OPENAI_VOICE_API_KEY,
+            base_url=OPENAI_VOICE_BASE_URL,
+        )
+    return voice_openai_client
 
 
 def call_ai(
@@ -4561,6 +4592,174 @@ async def handle_reply_button(message: Message, text: str) -> bool:
     return False
 
 
+SUPPORTED_AUDIO_SUFFIXES = {".aac", ".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga", ".ogg", ".wav", ".webm"}
+
+
+def sanitize_voice_text(text: str) -> str:
+    """Remove lightweight Markdown that should not be spoken aloud."""
+    clean = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", str(text or ""))
+    clean = clean.replace("**", "").replace("__", "").replace("```", "")
+    return clean.strip()
+
+
+def telegram_audio_name(message: Message, media: Any) -> str:
+    """Build a safe filename so the transcription API can detect the format."""
+    if getattr(message, "voice", None) is media:
+        return "telegram-voice.ogg"
+    original = Path(str(getattr(media, "file_name", "") or "")).name
+    suffix = Path(original).suffix.lower()
+    if suffix not in SUPPORTED_AUDIO_SUFFIXES:
+        mime_suffix = {
+            "audio/aac": ".aac",
+            "audio/flac": ".flac",
+            "audio/m4a": ".m4a",
+            "audio/mp4": ".mp4",
+            "audio/mpeg": ".mp3",
+            "audio/ogg": ".ogg",
+            "audio/wav": ".wav",
+            "audio/webm": ".webm",
+        }.get(str(getattr(media, "mime_type", "") or "").lower())
+        suffix = mime_suffix or ""
+    if not suffix:
+        raise ValueError("Не удалось определить формат аудио. Пришли voice, MP3, M4A, WAV, OGG или WEBM.")
+    return f"telegram-audio{suffix}"
+
+
+async def download_telegram_audio(message: Message) -> tuple[bytes, str]:
+    media = getattr(message, "voice", None) or getattr(message, "audio", None)
+    if not media:
+        raise ValueError("В сообщении нет голосового или аудиофайла.")
+    if getattr(media, "file_size", 0) and media.file_size > VOICE_MAX_BYTES:
+        raise ValueError(f"Аудио превышает лимит {VOICE_MAX_BYTES // (1024 * 1024)} МБ.")
+    if getattr(media, "duration", 0) and media.duration > VOICE_MAX_DURATION_SECONDS:
+        raise ValueError(f"Голосовое длиннее {VOICE_MAX_DURATION_SECONDS // 60} минут.")
+    filename = telegram_audio_name(message, media)
+    payload = BytesIO()
+    await message.bot.download(media, destination=payload)
+    data = payload.getvalue()
+    if not data:
+        raise ValueError("Telegram вернул пустой аудиофайл.")
+    if len(data) > VOICE_MAX_BYTES:
+        raise ValueError(f"Аудио превышает лимит {VOICE_MAX_BYTES // (1024 * 1024)} МБ.")
+    return data, filename
+
+
+async def transcribe_voice_bytes(data: bytes, filename: str) -> str:
+    def _request() -> str:
+        payload = BytesIO(data)
+        payload.name = filename
+        response = ensure_voice_openai_client().audio.transcriptions.create(
+            model=OPENAI_TRANSCRIBE_MODEL,
+            file=payload,
+        )
+        return str(getattr(response, "text", "") or "").strip()
+
+    try:
+        transcript = await asyncio.to_thread(_request)
+    except Exception as exc:
+        print(f"Voice transcription failed: {type(exc).__name__}", flush=True)
+        raise RuntimeError("Не удалось распознать голосовое. Попробуй ещё раз позже.") from exc
+    if not transcript:
+        raise RuntimeError("Не удалось расслышать речь в голосовом.")
+    return transcript
+
+
+async def synthesize_voice_bytes(text: str) -> bytes:
+    clean_text = sanitize_voice_text(text)
+    if not clean_text:
+        raise ValueError("Нечего озвучивать.")
+
+    def _request() -> bytes:
+        response = ensure_voice_openai_client().audio.speech.create(
+            model=OPENAI_TTS_MODEL,
+            voice=OPENAI_TTS_VOICE,
+            input=clean_text,
+            instructions=(
+                "Speak naturally in Russian as VOID: observant, calm, concise, lightly ironic, "
+                "never theatrical. This is an AI-generated voice."
+            ),
+            response_format="opus",
+        )
+        content = response.read() if hasattr(response, "read") else getattr(response, "content", b"")
+        return bytes(content or b"")
+
+    try:
+        audio = await asyncio.to_thread(_request)
+    except Exception as exc:
+        print(f"Voice synthesis failed: {type(exc).__name__}", flush=True)
+        raise RuntimeError("Не удалось озвучить ответ.") from exc
+    if not audio:
+        raise RuntimeError("OpenAI вернул пустой голосовой ответ.")
+    return audio
+
+
+async def generate_dialog_answer(user_id: int, text: str) -> str:
+    session = get_dialog_session(user_id)
+    history = get_dialog_context(user_id, limit=8)
+    personality = session.get("personality", "observer")
+    memory_note = get_dialog_memory(user_id)
+    prompt = build_dialog_prompt(text, personality, history, memory_note)
+    reply = await asyncio.to_thread(
+        call_ai,
+        prompt,
+        text,
+        model=OPENAI_DIALOG_MODEL,
+    )
+    reply = (reply or "").strip() or "Я не успел сформулировать ответ. Попробуй ещё раз."
+    save_dialog_message(user_id, "user", text)
+    save_dialog_message(user_id, "assistant", reply)
+    new_memory = build_memory_note(text, reply)
+    if new_memory:
+        save_dialog_message(user_id, "memory", new_memory)
+    return reply
+
+
+@router.message(F.voice | F.audio)
+async def handle_voice_message(message: Message) -> None:
+    if not message.from_user:
+        return
+    if not VOICE_MESSAGES_ENABLED:
+        await message.answer("Голосовые VOID пока выключены в настройках.")
+        return
+    if VOICE_MESSAGES_ADMIN_ONLY and not is_admin(message):
+        await message.answer("Голосовой режим пока доступен только администратору VOID.")
+        return
+    if not OPENAI_VOICE_API_KEY:
+        await message.answer("Голосовой API ещё не настроен. Нужен отдельный официальный OpenAI key.")
+        return
+
+    try:
+        await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+        data, filename = await download_telegram_audio(message)
+        transcript = await transcribe_voice_bytes(data, filename)
+        answer = sanitize_voice_text(await generate_dialog_answer(message.from_user.id, transcript))
+        await message.bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.RECORD_VOICE)
+        try:
+            audio = await synthesize_voice_bytes(answer)
+        except RuntimeError:
+            print("Voice reply falling back to text", flush=True)
+            await message.answer(answer, reply_markup=reply_main_keyboard())
+            return
+
+        try:
+            await message.answer_voice(
+                voice=BufferedInputFile(audio, filename="void-reply.ogg"),
+                caption="AI-голос VOID",
+                reply_markup=reply_main_keyboard(),
+            )
+        except TelegramBadRequest:
+            await message.answer_document(
+                document=BufferedInputFile(audio, filename="void-reply.ogg"),
+                caption="Голосовой ответ VOID",
+                reply_markup=reply_main_keyboard(),
+            )
+    except (ValueError, RuntimeError) as exc:
+        await message.answer(sanitize_voice_text(str(exc)), reply_markup=reply_main_keyboard())
+    except Exception as exc:
+        print(f"Voice message failed: {type(exc).__name__}", flush=True)
+        await message.answer("Голосовой режим временно недоступен.", reply_markup=reply_main_keyboard())
+
+
 @router.message()
 async def free_text_handler(message: Message):
 
@@ -4613,35 +4812,14 @@ async def free_text_handler(message: Message):
     if await handle_reply_button(message, text):
         return
 
-    session = get_dialog_session(user_id)
-
-    history = get_dialog_context(user_id, limit=8)
-    personality = session.get("personality", "observer")
-
     if not text:
         return
 
-    memory_note = get_dialog_memory(user_id)
-    prompt = build_dialog_prompt(text, personality, history, memory_note)
-
     try:
-        reply = await asyncio.to_thread(
-            call_ai,
-            prompt,
-            text,
-            model=OPENAI_DIALOG_MODEL,
-        )
-        reply = (reply or "").strip() or "Я не успел сформулировать ответ. Попробуй ещё раз."
+        reply = await generate_dialog_answer(user_id, text)
     except Exception as e:
         print("DIALOG AI ERROR:", repr(e))
         reply = f"AI ERROR: {e}"
-
-    save_dialog_message(user_id, "user", text)
-    save_dialog_message(user_id, "assistant", reply)
-
-    new_memory = build_memory_note(text, reply)
-    if new_memory:
-        save_dialog_message(user_id, "memory", new_memory)
 
     await message.answer(reply, reply_markup=reply_main_keyboard())
 
