@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from vk_browser_publisher import parse_scheduled_draft_id
 from vk_publish_queue import QueueValidationError, build_job, canonical_job_id, consume_once, enqueue_job, requeue_failed, validate_job
+from vk_queue_consumer import _click_first_text
 
 
 class VkPublishQueueTests(unittest.TestCase):
@@ -134,6 +135,19 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertNotIn("import main", source)
         for operation in ("messages.send", "likes.add", "wall.delete", "friends.add", "comments.create", "profile.edit"):
             self.assertNotIn(operation, source)
+
+    def test_consumer_does_not_wait_for_vk_click_navigation(self):
+        locator = Mock()
+        locator.count.return_value = 1
+        locator.first = locator
+        locator.is_visible.return_value = True
+        page = Mock()
+        page.get_by_text.return_value = locator
+
+        _click_first_text(page, ("Создать",))
+
+        page.get_by_text.assert_called_once_with("Создать", exact=True)
+        locator.click.assert_called_once_with(timeout=3_000, force=True, no_wait_after=True)
 
 
 if __name__ == "__main__":
