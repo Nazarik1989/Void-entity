@@ -8,7 +8,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from main import (
     DEFAULT_OPENAI_IMAGE_MODEL,
     TelegramPostPackage,
+    build_image_prompts_sync,
     generate_post_images_sync,
+    image_visual_directions,
     publish_draft,
     send_telegram_post,
 )
@@ -17,6 +19,31 @@ from main import (
 class TelegramPublisherTests(unittest.IsolatedAsyncioTestCase):
     def test_primary_image_model_is_exact_openrouter_gpt_image_2_id(self) -> None:
         self.assertEqual(DEFAULT_OPENAI_IMAGE_MODEL, "openai/gpt-image-2")
+
+    def test_visual_directions_rotate_people_gender_and_people_free_scenes(self) -> None:
+        directions = [image_visual_directions(draft_id, 1)[0] for draft_id in range(8)]
+
+        self.assertTrue(any("beautiful adult woman" in direction for direction in directions))
+        self.assertTrue(any("adult man" in direction for direction in directions))
+        self.assertTrue(any("no people" in direction.lower() for direction in directions))
+        self.assertEqual(len(directions), len(set(directions)))
+
+    def test_two_image_prompts_receive_distinct_mandatory_directions(self) -> None:
+        draft = {
+            "id": 10,
+            "mode": "digest",
+            "title": "Test signal",
+            "post": "Concrete topic",
+            "source_name": "Test source",
+        }
+
+        with patch("main.call_ai", return_value="IMAGE: first composition\nIMAGE: second composition"):
+            prompts = build_image_prompts_sync(draft)
+
+        self.assertEqual(len(prompts), 2)
+        self.assertIn("Mandatory visual direction:", prompts[0])
+        self.assertIn("Mandatory visual direction:", prompts[1])
+        self.assertNotEqual(prompts[0], prompts[1])
 
     def test_image_model_failure_is_diagnostic_and_not_silently_substituted(self) -> None:
         client = MagicMock()
