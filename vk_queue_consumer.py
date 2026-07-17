@@ -80,14 +80,86 @@ def _tokens(value: str) -> set[str]:
     return {part for part in re.split(r"[^0-9A-Za-zА-Яа-яЁё]+", value.casefold()) if len(part) >= 3}
 
 
+def _first_visible(page: Any, selectors: tuple[str, ...]) -> Any | None:
+    for selector in selectors:
+        locator = page.locator(selector)
+        for index in range(locator.count()):
+            candidate = locator.nth(index)
+            if candidate.is_visible():
+                return candidate
+    return None
+
+
+def _audio_search_input(page: Any, timeout: int = 10_000) -> Any | None:
+    selectors = (
+        '[data-testid="posting_audio_search_audio_input"]',
+        '[role="dialog"] input[data-testid*="audio"][data-testid*="search"]',
+        '[role="dialog"] input[type="search"]',
+        '[role="dialog"] input[placeholder*="Поиск"]',
+        'input[data-testid*="audio"][data-testid*="search"]',
+    )
+    deadline = time.monotonic() + timeout / 1000
+    while time.monotonic() < deadline:
+        candidate = _first_visible(page, selectors)
+        if candidate is not None:
+            return candidate
+        page.wait_for_timeout(250)
+    return None
+
+
+def _open_audio_picker(page: Any) -> Any:
+    existing = _audio_search_input(page, timeout=500)
+    if existing is not None:
+        return existing
+
+    for label in ("Музыка", "Аудиозапись", "Аудио"):
+        locator = page.get_by_text(label, exact=True)
+        if locator.count() and locator.last.is_visible():
+            locator.last.click(timeout=5_000, force=True, no_wait_after=True)
+            page.wait_for_timeout(1_000)
+            search = _audio_search_input(page, timeout=5_000)
+            if search is not None:
+                return search
+
+    trigger = _first_visible(
+        page,
+        (
+            'button[data-testid*="audio"]',
+            '[role="button"][data-testid*="audio"]',
+            'button[aria-label*="аудио"]',
+            '[role="button"][aria-label*="аудио"]',
+            'button[title*="аудио"]',
+        ),
+    )
+    if trigger is not None:
+        trigger.click(timeout=5_000, force=True, no_wait_after=True)
+        page.wait_for_timeout(1_000)
+        search = _audio_search_input(page, timeout=5_000)
+        if search is not None:
+            return search
+
+    # Last-resort compatibility with the previous fixed-layout VK composer.
+    page.mouse.click(525, 536)
+    page.wait_for_timeout(1_500)
+    search = _audio_search_input(page, timeout=10_000)
+    if search is None:
+        raise RetryablePublishError("VK audio search input is unavailable; retry later")
+    return search
+
+
 def _attach_track(page: Any, query: str) -> None:
     if not query:
         raise RetryablePublishError("VK track query is missing")
-    page.mouse.click(525, 536)
-    page.wait_for_timeout(1_500)
-    page.locator('[data-testid="posting_audio_search_audio_input"]').fill(query)
+    search = _open_audio_picker(page)
+    try:
+        search.fill(query, timeout=10_000)
+    except Exception as exc:
+        raise RetryablePublishError("VK audio search input is not ready; retry later") from exc
     page.wait_for_timeout(5_000)
-    rows = page.locator('[data-testid="posting_audio_audio_track_row"]')
+    rows = page.locator(
+        '[data-testid="posting_audio_audio_track_row"], '
+        '[data-testid*="audio_track_row"]'
+    )
     query_tokens = _tokens(query)
     scored: list[tuple[int, int]] = []
     for index in range(min(rows.count(), 30)):
