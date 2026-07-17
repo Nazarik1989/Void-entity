@@ -7,7 +7,8 @@ Requires=naz-realtime-adapter.service
 [Service]
 Type=simple
 User=voicehub
-Group=voicehub-ipc
+Group=void
+SupplementaryGroups=voicehub-ipc
 WorkingDirectory=/opt/void_voice_hub_current
 EnvironmentFile=/opt/void_entity_release_20260713/.env
 Environment=PYTHONUNBUFFERED=1
@@ -19,7 +20,7 @@ Environment=VOICE_HUB_NAZ_ADAPTER_SOCKET=/run/naz-realtime/adapter.sock
 Environment=DB_PATH=/opt/void_entity_release_20260713/void.db
 StateDirectory=void-realtime-voice-hub
 StateDirectoryMode=0700
-UMask=0077
+UMask=0007
 ExecStart=/opt/void_voice_hub_current/venv/bin/python /opt/void_voice_hub_current/realtime_voice_hub.py
 Restart=on-failure
 RestartSec=5
