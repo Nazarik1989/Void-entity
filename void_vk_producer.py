@@ -27,6 +27,7 @@ def parse_scheduled_draft_id(response: str) -> int:
 
 
 def sync_published_drafts() -> list[int]:
+    main.init_db()
     published_now: list[int] = []
     for receipt in publication_receipts(QUEUE_DIR, producer="void"):
         match = VOID_DRAFT_SOURCE_RE.fullmatch(receipt["source_ref"])
