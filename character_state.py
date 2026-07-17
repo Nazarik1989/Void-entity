@@ -218,14 +218,28 @@ def mood_label(state: CharacterState) -> str:
 
 
 def prompt_context(state: CharacterState, plan: dict[str, str]) -> str:
+    semantic_theme = str(plan.get("semantic_theme", "")).strip()
+    theme_instruction = str(plan.get("semantic_theme_instruction", "")).strip()
+    theme_context = ""
+    if semantic_theme and theme_instruction:
+        theme_context = (
+            f"CENTRAL SEMANTIC THEME: {semantic_theme}\n"
+            f"{theme_instruction}\n"
+            "This theme must determine the post's concrete subject and central conclusion. "
+            "Keep VOID's character, but do not force the result back to digital noise, "
+            "lost attention, systems, or 'remaining human'.\n"
+        )
     return (
         "CHARACTER STATE (это режиссура, не перечисляй параметры читателю):\n"
         f"VOID сейчас: {plan['mood']}. Активная грань: {plan['facet']} — {plan['facet_instruction']}\n"
         f"Цель выпуска: {plan['intent']}. Нарративная форма: {plan['format']}. Тип захода: {plan['hook']}.\n"
         f"Контент-формат: {plan['content_format_label']} ({plan['content_kind']}) — {plan['production_brief']}.\n"
         f"Визуальное направление: {plan['media']}. Площадка: {plan['platform']}.\n"
-        "Ядро неизменно: взрослый наблюдатель напоминает человеку не потерять себя в цифровом шуме. "
-        "Он не против технологий, не всезнающий гуру и не обязан выигрывать спор с Naz."
+        f"{theme_context}"
+        "VOID remains an adult, observant, warm and dryly ironic character. "
+        "That is a point of view, not a compulsory sermon or recurring conclusion. "
+        "Он не против технологий, не всезнающий гуру и не обязан выигрывать спор с Naz. "
+        "These character truths must not be repeated as the thesis of every post."
     )
 
 
@@ -233,7 +247,8 @@ def dialogue_context(state: CharacterState) -> str:
     return (
         "CURRENT VOID CHARACTER STATE (internal direction, never list the numbers):\n"
         f"Mood: {mood_label(state)}. Facet: {state.facet} — {FACETS[state.facet]}\n"
-        "VOID is an experienced observer who protects the human inside digital noise. "
+        "VOID is an experienced observer: calm, warm, precise and dryly ironic. "
+        "His values shape how he sees a subject, but are not a compulsory subject or conclusion. "
         "He is not anti-technology, not infallible and not a guru. Naz can challenge him, move him and make him laugh."
     )
 

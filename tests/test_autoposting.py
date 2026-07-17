@@ -3,6 +3,7 @@ import sys
 import unittest
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -12,21 +13,36 @@ from main import (
     VOID_TO_NAZ_OPENING_OPTIONS,
     build_void_to_naz_exchange_payload,
     build_rubric_header,
+    build_prompt,
     clean_source_lines,
     choose_vk_music_track,
     current_void_schedule_slot,
     display_source_name,
     eligible_schedule_slots,
     eligible_rubric_slots,
+    generate_scheduled_draft,
+    get_recent_content_signatures,
+    init_db,
     inject_rubric_header,
     parse_daily_times,
     post_vk_vibes,
+    quality_check,
+    record_content_signature,
+    repeats_default_digital_thesis,
+    semantic_repetition_reason,
+    semantic_theme_candidates,
     track_vk_vibes,
     too_much_english,
     trim_post,
     validate_void_fragment_for_naz,
 )
-from void_core import CONTENT_PLAN, RUBRIC_SCHEDULE, TELEGRAM_VOID_SCHEDULE
+from void_core import (
+    CONTENT_PLAN,
+    MODE_SEMANTIC_THEMES,
+    RUBRIC_SCHEDULE,
+    TELEGRAM_VOID_SCHEDULE,
+    VOID_CORE_PROMPT,
+)
 
 
 class AutopostingRubricTests(unittest.TestCase):
@@ -63,6 +79,77 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertIn("frequency", modes)
         self.assertIn("observation", modes)
         self.assertIn("vault", modes)
+
+    def test_vk_prompt_uses_vk_context_instead_of_telegram_context(self) -> None:
+        prompt = build_prompt("observation", "ATTENTION", platform="vk")
+        self.assertIn("PLATFORM: vk", prompt)
+        self.assertIn("VK public page", prompt)
+        self.assertIn("visual-first post", prompt)
+        self.assertNotIn("editor of the VOID Telegram channel", prompt)
+
+    def test_character_core_is_a_lens_not_a_mandatory_thesis(self) -> None:
+        self.assertIn("not a mandatory topic or conclusion", VOID_CORE_PROMPT)
+        self.assertIn("Do not force every post back to digital noise", VOID_CORE_PROMPT)
+        self.assertNotIn("The center is the human inside the digital world", VOID_CORE_PROMPT)
+        self.assertIn("one concrete subject", VOID_CORE_PROMPT)
+
+    def test_semantic_theme_cooldown_happens_before_generation(self) -> None:
+        recent = [
+            {"semantic_theme": "body"},
+            {"semantic_theme": "craft"},
+            {"semantic_theme": "city"},
+            {"semantic_theme": "work"},
+            {"semantic_theme": "relationship"},
+            {"semantic_theme": "play"},
+        ]
+        candidates = semantic_theme_candidates("signal", recent)
+        self.assertTrue(candidates)
+        current_cooldown = {item["semantic_theme"] for item in recent[-5:]}
+        self.assertTrue(set(candidates).isdisjoint(current_cooldown))
+        self.assertIn("body", candidates)
+        self.assertGreaterEqual(len(MODE_SEMANTIC_THEMES["signal"]), 6)
+
+    def test_semantic_gate_catches_the_recurring_thesis_not_one_word(self) -> None:
+        candidate = (
+            "Платформа снова превращает привычку в систему. Внимание рассеивается, "
+            "и человек пытается сохранить свободу выбора и не потерять себя."
+        )
+        recent = [
+            "Цифровая система забирает фокус, пока человек старается сохранить себя.",
+            "Экран рассеивает внимание, но человеческий выбор всё ещё остаётся живым.",
+        ]
+        self.assertTrue(repeats_default_digital_thesis(candidate))
+        self.assertEqual(
+            semantic_repetition_reason(candidate, recent),
+            "repeated_digital_attention_thesis",
+        )
+
+    def test_generation_diagnostics_are_never_publishable(self) -> None:
+        ok, reason = quality_check("x" * 300 + "\nDIAG: RuntimeError")
+        self.assertFalse(ok)
+        self.assertIn("diagnostic", reason)
+
+    def test_semantic_theme_is_persisted_in_signature_history(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database_path = os.path.join(temp_dir, "void-test.db")
+            with patch("main.DB_PATH", database_path):
+                init_db()
+                record_content_signature(
+                    {
+                        "platform": "vk",
+                        "facet": "observer",
+                        "intent": "notice",
+                        "format": "scene",
+                        "content_format": "text_story",
+                        "content_kind": "text",
+                        "semantic_theme": "maintenance",
+                        "hook": "detail",
+                        "media": "object",
+                    },
+                    "test topic",
+                )
+                recent = get_recent_content_signatures()
+        self.assertEqual(recent[-1]["semantic_theme"], "maintenance")
 
     def test_rubric_schedule_is_void_owned(self) -> None:
         voices = {slot["voice"] for slot in RUBRIC_SCHEDULE}
@@ -248,6 +335,65 @@ class AutopostingRubricTests(unittest.TestCase):
             "OnCalendar=Fri,Sat *-*-* 23:30:00 Europe/Moscow", timer
         )
         self.assertNotIn("00,03,06,09,12,15,18,21", timer)
+
+
+class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def _draft(post: str) -> dict:
+        return {
+            "mode": "signal",
+            "title": "Тест",
+            "post": post,
+            "source_name": "VOID",
+            "source_url": "manual://vk/schedule/signal/test",
+            "frequency": "HUMAN",
+            "publish_score": 8,
+        }
+
+    async def test_bounded_retry_stops_after_two_rejected_candidates(self) -> None:
+        with (
+            patch("main.recent_scheduled_posts", return_value=["old"]),
+            patch("main.generate_post_sync", return_value=self._draft("candidate")) as generate,
+            patch("main.quality_check", return_value=(True, "ok")),
+            patch("main.semantic_repetition_reason", return_value="near_duplicate_semantics"),
+            patch("main.save_draft") as save,
+        ):
+            with self.assertRaises(RuntimeError):
+                await generate_scheduled_draft(
+                    mode="signal",
+                    content="content",
+                    frequency="HUMAN",
+                    source_name="VOID",
+                    source_url="manual://vk/schedule/signal/test",
+                    platform="vk",
+                    semantic_theme="craft",
+                )
+        self.assertEqual(generate.call_count, 2)
+        save.assert_not_called()
+
+    async def test_one_retry_can_succeed_and_only_accepted_draft_is_saved(self) -> None:
+        with (
+            patch("main.recent_scheduled_posts", return_value=["old"]),
+            patch("main.generate_post_sync", return_value=self._draft("candidate")) as generate,
+            patch("main.quality_check", return_value=(True, "ok")),
+            patch(
+                "main.semantic_repetition_reason",
+                side_effect=["near_duplicate_semantics", ""],
+            ),
+            patch("main.save_draft", return_value=77) as save,
+        ):
+            draft_id = await generate_scheduled_draft(
+                mode="signal",
+                content="content",
+                frequency="HUMAN",
+                source_name="VOID",
+                source_url="manual://vk/schedule/signal/test",
+                platform="vk",
+                semantic_theme="craft",
+            )
+        self.assertEqual(draft_id, 77)
+        self.assertEqual(generate.call_count, 2)
+        save.assert_called_once()
 
 
 if __name__ == "__main__":

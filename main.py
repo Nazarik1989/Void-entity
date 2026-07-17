@@ -36,8 +36,10 @@ import duo_relationship
 import gaming_vertical
 from void_core import (
     CONTENT_PLAN,
+    MODE_SEMANTIC_THEMES,
     MODE_RUBRICS,
     RUBRIC_SCHEDULE,
+    SEMANTIC_THEMES,
     TELEGRAM_VOID_SCHEDULE,
     VOID_CORE_PROMPT,
     platform_context,
@@ -349,6 +351,7 @@ def init_db() -> None:
         format TEXT NOT NULL,
         content_format TEXT NOT NULL DEFAULT 'text_story',
         content_kind TEXT NOT NULL DEFAULT 'text',
+        semantic_theme TEXT NOT NULL DEFAULT '',
         hook TEXT NOT NULL,
         media TEXT NOT NULL,
         topic TEXT NOT NULL,
@@ -361,6 +364,8 @@ def init_db() -> None:
         cur.execute("ALTER TABLE content_signatures ADD COLUMN content_format TEXT NOT NULL DEFAULT 'text_story'")
     if "content_kind" not in signature_columns:
         cur.execute("ALTER TABLE content_signatures ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'text'")
+    if "semantic_theme" not in signature_columns:
+        cur.execute("ALTER TABLE content_signatures ADD COLUMN semantic_theme TEXT NOT NULL DEFAULT ''")
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_void_signatures_created ON content_signatures(character_id, id)")
 
@@ -786,7 +791,8 @@ def get_recent_content_signatures(limit: int = 16) -> list[dict[str, str]]:
     conn = db()
     rows = conn.execute(
         """
-        SELECT platform, facet, intent, format, content_format, content_kind, hook, media, topic, created_at
+        SELECT platform, facet, intent, format, content_format, content_kind,
+               semantic_theme, hook, media, topic, created_at
         FROM content_signatures
         WHERE character_id=?
         ORDER BY id DESC
@@ -804,8 +810,8 @@ def record_content_signature(plan: dict[str, str], topic: str) -> None:
         """
         INSERT INTO content_signatures(
             character_id, platform, facet, intent, format, content_format, content_kind,
-            hook, media, topic, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            semantic_theme, hook, media, topic, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             void_character.CHARACTER_ID,
@@ -815,6 +821,7 @@ def record_content_signature(plan: dict[str, str], topic: str) -> None:
             str(plan.get("format", "тихое наблюдение")),
             str(plan.get("content_format", "text_story")),
             str(plan.get("content_kind", "text")),
+            str(plan.get("semantic_theme", "")),
             str(plan.get("hook", "деталь")),
             str(plan.get("media", "кинематографический кадр")),
             topic[:1000],
@@ -852,6 +859,7 @@ def build_character_directive(
     platform: str,
     mode: str,
     persist_event: bool = True,
+    semantic_theme: str = "",
 ) -> tuple[void_character.CharacterState, dict[str, str], str]:
     event = character_event_for_mode(mode)
     if persist_event:
@@ -864,6 +872,11 @@ def build_character_directive(
         topic=topic,
         platform=platform,
     )
+    if semantic_theme:
+        if semantic_theme not in SEMANTIC_THEMES:
+            raise ValueError("unknown semantic theme")
+        plan["semantic_theme"] = semantic_theme
+        plan["semantic_theme_instruction"] = SEMANTIC_THEMES[semantic_theme]
     return state, plan, void_character.prompt_context(state, plan)
 
 
@@ -2394,6 +2407,8 @@ def too_much_english(text: str) -> bool:
 
 
 def quality_check(post: str) -> tuple[bool, str]:
+    if "DIAG:" in post:
+        return False, "generation diagnostic must never be published"
     if len(post.strip()) < 250:
         return False, "слишком коротко"
     if len(post) > 3600:
@@ -2429,8 +2444,18 @@ def fallback_post(mode: str, text: str, source_name: str = "", source_url: str =
     return title, post
 
 
-def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
+def build_prompt(
+    mode: str,
+    frequency: str = "HUMAN",
+    platform: str = "telegram",
+) -> str:
     rubric = MODE_RUBRICS.get(mode, "SIGNAL")
+    platform_key = platform if platform in {"telegram", "vk", "max"} else "telegram"
+    editor_surface = {
+        "telegram": "Telegram channel",
+        "vk": "VK public page",
+        "max": "MAX channel",
+    }[platform_key]
 
     mode_rules = {
         "news": "Сделай пост по реальной новости. Факт должен остаться фактом. Не выдумывай деталей.",
@@ -2463,29 +2488,33 @@ def build_prompt(mode: str, frequency: str = "HUMAN") -> str:
     mode_style.setdefault("vault", "Стиль: глубже и тише; запись, которую хочется сохранить.")
 
     structure = {
-        "news": "1. Заголовок рубрики: {rubric} / {frequency} если частота уместна, иначе просто {rubric}\n2. Факт / мысль / наблюдение.\n3. Что это говорит о человеке в цифровой среде.\n4. VOID COMMENT: коротко, иронично, не душно.\n5. Источник, если источник есть.",
-        "manual": "1. Заголовок рубрики: {rubric}\n2. Мысль автора в собственной форме.\n3. Наблюдение о том, что это значит для человека.\n4. VOID COMMENT: коротко, без пафоса.\n5. Источник, если источник есть.",
-        "midnight": "1. Заголовок рубрики: {rubric}\n2. Ночная, чуть более тёмная мысль.\n3. Ощущение, которое возникает в человеке рядом с этой темой.\n4. VOID COMMENT: короткий, холодный, точный.\n5. Источник, если источник есть.",
-        "observation": "1. Заголовок рубрики: {rubric}\n2. Короткое наблюдение над явлением.\n3. Что это говорит о привычке, платформе или поведении.\n4. VOID COMMENT: сухо, без лишней драматизации.\n5. Источник, если источник есть.",
+        "news": "1. Заголовок рубрики: {rubric} / {frequency} если частота уместна, иначе просто {rubric}\n2. Проверяемый факт и его конкретный контекст.\n3. Что именно меняется и кого это затрагивает — без универсальной морали.\n4. VOID COMMENT: коротко, иронично, не душно.\n5. Источник, если источник есть.",
+        "manual": "1. Заголовок рубрики: {rubric}\n2. Конкретная сцена или мысль автора в собственной форме.\n3. Развитие центрального тезиса без ухода в привычную универсальную мораль.\n4. VOID COMMENT: коротко, без пафоса.\n5. Источник, если источник есть.",
+        "midnight": "1. Заголовок рубрики: {rubric}\n2. Конкретная ночная сцена или деталь.\n3. Напряжение или вывод, который принадлежит именно этой сцене.\n4. VOID COMMENT: короткий, холодный, точный.\n5. Источник, если источник есть.",
+        "observation": "1. Заголовок рубрики: {rubric}\n2. Короткое наблюдение над конкретным явлением.\n3. Его механизм, неожиданная деталь или следствие — без готовой морали.\n4. VOID COMMENT: сухо, без лишней драматизации.\n5. Источник, если источник есть.",
         "culture": "1. Заголовок рубрики: {rubric}\n2. Культурное наблюдение над явлением.\n3. Что это говорит о людях, привычке, музыке, медиа или атмосфере.\n4. VOID COMMENT: чуть ближе к человеку, без пафоса.\n5. Источник, если источник есть.",
         "future": "1. Заголовок рубрики: {rubric}\n2. Сдвиг, который уже заметен.\n3. Как это меняет поведение или среду.\n4. VOID COMMENT: чуть аналитичнее, но живо.\n5. Источник, если источник есть.",
         "digest": "1. Заголовок рубрики: {rubric}\n2. 3–5 сигналов в одном посте.\n3. Общий вывод по теме.\n4. VOID COMMENT: ироничный, краткий, связующий.\n5. Источник, если источник есть.",
     }
 
     structure.setdefault("signal", structure["manual"])
-    structure.setdefault("frequency", "1. Рубрика: {rubric}\n2. Атмосфера, звук, город или внутреннее состояние.\n3. Что это говорит о человеке и времени.\n4. VOID COMMENT: коротко, без лишнего пафоса.")
-    structure.setdefault("archive", "1. Рубрика: {rubric}\n2. Три-пять коротких сигналов.\n3. Общая нить: что связывает их и почему это важно человеку.\n4. VOID COMMENT: одна точная фраза без морали.")
-    structure.setdefault("vault", "1. Рубрика: {rubric}\n2. Глубокая, но конкретная мысль.\n3. Почему её стоит сохранить в памяти VOID.\n4. Что человек обычно перестаёт замечать.\n5. VOID COMMENT: тихо, точно, без позы мудреца.")
+    structure.setdefault("frequency", "1. Рубрика: {rubric}\n2. Конкретный звук, жест, место или музыкальная сцена.\n3. Собственный вывод этой сцены, а не универсальная мораль.\n4. VOID COMMENT: коротко, без лишнего пафоса.")
+    structure.setdefault("archive", "1. Рубрика: {rubric}\n2. Три-пять коротких сигналов.\n3. Общая нить, которая принадлежит именно этим сигналам.\n4. VOID COMMENT: одна точная фраза без морали.")
+    structure.setdefault("vault", "1. Рубрика: {rubric}\n2. Глубокая, но конкретная сцена или мысль.\n3. Почему именно её стоит сохранить в памяти VOID.\n4. Деталь, которая меняет смысл этой темы.\n5. VOID COMMENT: тихо, точно, без позы мудреца.")
 
     return f"""
 {VOID_CORE_PROMPT}
 
-{platform_context("telegram")}
+{platform_context(platform_key)}
 
-Ты — редактор Telegram-канала VOID.
+You are the editor of the VOID {editor_surface}.
 
 Пиши СТРОГО НА РУССКОМ.
 Голос VOID: умный, живой, наблюдательный, с сухим юмором.
+Если в CONTENT указан CENTRAL SEMANTIC THEME, он определяет конкретный предмет
+и центральный вывод поста и имеет приоритет над общими примерами рубрики.
+Характер VOID проявляется в интонации и взгляде. Не пересказывай характер как
+одинаковую мораль о цифровом шуме, внимании, системе или сохранении человечности.
 НЕ душни. Не делай вид, что каждое обновление интерфейса — падение Рима.
 Юмор нужен обязательно: 1–2 коротких ироничных укола, но без клоунады.
 Можно материться? Нет. Но можно звучать так, будто очень хочется.
@@ -2529,8 +2558,15 @@ def parse_ai_output(text: str) -> tuple[str, str]:
     return title, post
 
 
-def generate_post_sync(mode: str, content: str, frequency: str = "HUMAN", source_name: str = "", source_url: str = "") -> dict[str, Any]:
-    prompt = build_prompt(mode, frequency)
+def generate_post_sync(
+    mode: str,
+    content: str,
+    frequency: str = "HUMAN",
+    source_name: str = "",
+    source_url: str = "",
+    platform: str = "telegram",
+) -> dict[str, Any]:
+    prompt = build_prompt(mode, frequency, platform)
     input_text = (
         f"MODE: {mode}\n"
         f"FREQUENCY: {frequency}\n"
@@ -2577,8 +2613,23 @@ def generate_post_sync(mode: str, content: str, frequency: str = "HUMAN", source
     }
 
 
-async def generate_and_save(mode: str, content: str, frequency: str = "HUMAN", source_name: str = "", source_url: str = "") -> int:
-    draft = await asyncio.to_thread(generate_post_sync, mode, content, frequency, source_name, source_url)
+async def generate_and_save(
+    mode: str,
+    content: str,
+    frequency: str = "HUMAN",
+    source_name: str = "",
+    source_url: str = "",
+    platform: str = "telegram",
+) -> int:
+    draft = await asyncio.to_thread(
+        generate_post_sync,
+        mode,
+        content,
+        frequency,
+        source_name,
+        source_url,
+        platform,
+    )
     return save_draft(
         mode=draft["mode"],
         title=draft["title"],
@@ -2587,6 +2638,63 @@ async def generate_and_save(mode: str, content: str, frequency: str = "HUMAN", s
         source_url=draft["source_url"],
         frequency=draft["frequency"],
         publish_score=draft["publish_score"],
+    )
+
+
+async def generate_scheduled_draft(
+    *,
+    mode: str,
+    content: str,
+    frequency: str,
+    source_name: str,
+    source_url: str,
+    platform: str,
+    semantic_theme: str,
+) -> int:
+    recent_posts = await asyncio.to_thread(
+        recent_scheduled_posts,
+        platform,
+        SEMANTIC_HISTORY_LIMIT,
+    )
+    attempt_content = content
+    last_reason = "unknown"
+    for attempt in range(SCHEDULED_GENERATION_ATTEMPTS):
+        draft = await asyncio.to_thread(
+            generate_post_sync,
+            mode,
+            attempt_content,
+            frequency,
+            source_name,
+            source_url,
+            platform,
+        )
+        ok, quality_reason = quality_check(str(draft.get("post") or ""))
+        last_reason = quality_reason if not ok else semantic_repetition_reason(
+            str(draft["post"]),
+            recent_posts,
+        )
+        if ok and not last_reason:
+            return await asyncio.to_thread(
+                save_draft,
+                draft["mode"],
+                draft["title"],
+                draft["post"],
+                draft["source_name"],
+                draft["source_url"],
+                draft["frequency"],
+                draft["publish_score"],
+            )
+        if attempt + 1 < SCHEDULED_GENERATION_ATTEMPTS:
+            attempt_content = (
+                f"{content}\n\n"
+                "BOUNDED RETRY: the previous candidate was blocked before saving "
+                f"because of {last_reason}. Do not paraphrase it. Return to the "
+                f"selected semantic theme '{semantic_theme}', choose a different "
+                "concrete scene and make the central conclusion materially different."
+            )
+    raise RuntimeError(
+        f"scheduled draft blocked after {SCHEDULED_GENERATION_ATTEMPTS} bounded attempts: "
+        f"{last_reason}"
     )
 
 
@@ -3313,6 +3421,114 @@ def schedule_recent_value(recent_key: str, slot_name: str) -> str:
     return ",".join(recent[-8:])
 
 
+SCHEDULED_GENERATION_ATTEMPTS = 2
+SEMANTIC_THEME_COOLDOWN = 5
+SEMANTIC_HISTORY_LIMIT = 8
+
+
+def semantic_theme_candidates(
+    mode: str,
+    recent_signatures: list[dict[str, str]] | None = None,
+) -> list[str]:
+    allowed = list(
+        MODE_SEMANTIC_THEMES.get(
+            mode,
+            ("craft", "city", "work", "relationship", "play", "maintenance", "body", "absurdity"),
+        )
+    )
+    recent = [
+        str(item.get("semantic_theme", ""))
+        for item in list(recent_signatures or [])[-SEMANTIC_THEME_COOLDOWN:]
+        if str(item.get("semantic_theme", ""))
+    ]
+    available = [theme for theme in allowed if theme not in recent]
+    if available:
+        return available
+    return [theme for theme in allowed if theme not in recent[-2:]] or allowed
+
+
+def choose_semantic_theme(
+    mode: str,
+    recent_signatures: list[dict[str, str]] | None = None,
+) -> str:
+    return random.choice(semantic_theme_candidates(mode, recent_signatures))
+
+
+def recent_scheduled_posts(platform: str, limit: int = SEMANTIC_HISTORY_LIMIT) -> list[str]:
+    prefix = "manual://vk/schedule/%" if platform == "vk" else "manual://telegram/void/%"
+    conn = db()
+    rows = conn.execute(
+        """
+        SELECT post FROM drafts
+        WHERE source_url LIKE ?
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (prefix, max(1, limit)),
+    ).fetchall()
+    conn.close()
+    return [str(row["post"] or "") for row in reversed(rows)]
+
+
+_SEMANTIC_STOPWORDS = {
+    "void", "comment", "signal", "observation", "future", "file", "midnight",
+    "vault", "human", "attention", "источник", "который", "которая", "которые",
+    "этого", "потому", "просто", "сейчас", "только", "через", "между", "когда",
+    "чтобы", "после", "перед", "можно", "нужно", "очень", "один", "одна", "свою",
+    "себя", "этот", "такая", "такой", "тоже", "если", "есть", "будет", "быть",
+}
+
+
+def _semantic_tokens(post: str) -> set[str]:
+    body = re.split(r"\n\s*Источник\s*:", post, maxsplit=1, flags=re.I)[0]
+    return {
+        token
+        for token in re.findall(r"[a-zа-яё]{4,}", body.casefold())
+        if token not in _SEMANTIC_STOPWORDS
+    }
+
+
+def repeats_default_digital_thesis(post: str) -> bool:
+    value = post.casefold()
+    digital_context = (
+        "цифров", "систем", "экран", "лент", "уведомлен", "алгоритм",
+        "платформ", "интерфейс", "онлайн", "шум",
+    )
+    attention_context = (
+        "вниман", "фокус", "замеча", "отвлека", "рассеив", "пауза",
+        "привычк", "осознан",
+    )
+    preservation_context = (
+        "человек", "человечес", "себя", "жив", "свобод", "выбор", "сохран",
+    )
+    return (
+        any(stem in value for stem in digital_context)
+        and any(stem in value for stem in attention_context)
+        and any(stem in value for stem in preservation_context)
+    )
+
+
+def semantic_repetition_reason(
+    post: str,
+    recent_posts: list[str],
+) -> str:
+    if repeats_default_digital_thesis(post):
+        recent_default_theses = sum(
+            repeats_default_digital_thesis(previous) for previous in recent_posts
+        )
+        if recent_default_theses >= 2:
+            return "repeated_digital_attention_thesis"
+
+    candidate_tokens = _semantic_tokens(post)
+    for previous in recent_posts:
+        previous_tokens = _semantic_tokens(previous)
+        shared = candidate_tokens & previous_tokens
+        union = candidate_tokens | previous_tokens
+        if len(shared) >= 12 and union and len(shared) / len(union) >= 0.38:
+            return "near_duplicate_semantics"
+    return ""
+
+
 def choose_schedule_slot(schedule: list[dict[str, Any]], recent_key: str, now: datetime | None = None) -> dict[str, Any]:
     slots = eligible_schedule_slots(schedule, now)
     recent_raw = get_setting(recent_key, "")
@@ -3390,11 +3606,19 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
     name = str(slot.get("name", "Scheduled Signal"))
     brief = str(slot.get("brief", "Make an original post for the shared public."))
     mode = str(slot.get("mode", "signal"))
+    recent_signatures = await asyncio.to_thread(get_recent_content_signatures)
+    semantic_theme = (
+        ""
+        if voice == "news"
+        else choose_semantic_theme(mode, recent_signatures)
+    )
     _, editorial_plan, character_directive = await asyncio.to_thread(
         build_character_directive,
         brief,
         "vk",
         mode,
+        True,
+        semantic_theme,
     )
 
     content = (
@@ -3422,6 +3646,7 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
                 item.get("frequency", "HUMAN"),
                 item.get("source_name", ""),
                 item.get("url", ""),
+                "vk",
             )
             draft = get_draft(draft_id)
             ok, _ = quality_check(draft["post"] if draft else "")
@@ -3430,14 +3655,20 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
                 return draft_id
         raise RuntimeError("fresh news signals not found")
 
-    draft_id = await generate_and_save(
-        mode,
-        content,
-        str(slot.get("frequency", "HUMAN")),
-        "VOID / VK scheduled rubric",
-        f"manual://vk/schedule/{slot.get('mode', 'signal')}/{now_iso()}",
+    draft_id = await generate_scheduled_draft(
+        mode=mode,
+        content=content,
+        frequency=str(slot.get("frequency", "HUMAN")),
+        source_name="VOID / VK scheduled rubric",
+        source_url=f"manual://vk/schedule/{slot.get('mode', 'signal')}/{now_iso()}",
+        platform="vk",
+        semantic_theme=semantic_theme,
     )
-    await asyncio.to_thread(record_content_signature, editorial_plan, brief)
+    await asyncio.to_thread(
+        record_content_signature,
+        editorial_plan,
+        f"semantic_theme:{semantic_theme}|{brief}",
+    )
     return draft_id
 
 
@@ -3448,12 +3679,19 @@ async def save_telegram_void_scheduled_draft(
     name = str(slot.get("name", "Telegram VOID"))
     brief = str(slot.get("brief", "Make an original Telegram post."))
     mode = str(slot.get("mode", "signal"))
+    recent_signatures = await asyncio.to_thread(get_recent_content_signatures)
+    semantic_theme = (
+        ""
+        if voice == "news"
+        else choose_semantic_theme(mode, recent_signatures)
+    )
     _, editorial_plan, character_directive = await asyncio.to_thread(
         build_character_directive,
         brief,
         "telegram",
         mode,
         False,
+        semantic_theme,
     )
 
     if voice == "news":
@@ -3472,6 +3710,7 @@ async def save_telegram_void_scheduled_draft(
                 item.get("frequency", "HUMAN"),
                 item.get("source_name", ""),
                 item.get("url", ""),
+                "telegram",
             )
             draft = get_draft(draft_id)
             ok, _ = quality_check(draft["post"] if draft else "")
@@ -3486,14 +3725,16 @@ async def save_telegram_void_scheduled_draft(
         f"{character_directive}\n\n"
         "Make an original VOID post for Telegram. Do not mention that this came from a schedule."
     )
-    draft_id = await generate_and_save(
-        mode,
-        content,
-        str(slot.get("frequency", "HUMAN")),
-        "VOID / Telegram scheduled rubric",
-        f"manual://telegram/void/{slot.get('mode', 'signal')}/{now_iso()}",
+    draft_id = await generate_scheduled_draft(
+        mode=mode,
+        content=content,
+        frequency=str(slot.get("frequency", "HUMAN")),
+        source_name="VOID / Telegram scheduled rubric",
+        source_url=f"manual://telegram/void/{slot.get('mode', 'signal')}/{now_iso()}",
+        platform="telegram",
+        semantic_theme=semantic_theme,
     )
-    return draft_id, editorial_plan, brief
+    return draft_id, editorial_plan, f"semantic_theme:{semantic_theme}|{brief}"
 
 
 async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
