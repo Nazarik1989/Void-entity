@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Realtime Voice Hub</title>
+  <style>
+    :root { font-family: system-ui, sans-serif; color: #f2f2f2; background: #0d0d10; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; }
+    main { width: min(34rem, calc(100% - 2rem)); padding: 1.5rem; border: 1px solid #2c2c34; border-radius: 1rem; background: #17171c; }
+    h1 { margin-top: 0; font-size: 1.35rem; }
+    fieldset { border: 0; padding: 0; margin: 1.25rem 0; display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; }
+    label { padding: .85rem; border: 1px solid #3a3a44; border-radius: .75rem; cursor: pointer; text-align: center; }
+    label:has(input:checked) { border-color: #b8a6ff; background: #282239; }
+    button { width: 100%; padding: .9rem; border: 0; border-radius: .75rem; font: inherit; font-weight: 700; cursor: pointer; }
+    #start { background: #d8d0ff; color: #111; }
+    #stop { margin-top: .75rem; background: #492b31; color: #fff; }
+    button:disabled { opacity: .45; cursor: default; }
+    #status { min-height: 1.5em; margin-bottom: 0; color: #c9c9d2; }
+  </style>
+  <script src="https://telegram.org/js/telegram-web-app.js"></script>
+</head>
+<body>
+  <main>
+    <h1>Naz / VOID · Realtime Voice</h1>
+    <fieldset id="personas">
+      <label><input type="radio" name="persona" value="naz" checked> Naz</label>
+      <label><input type="radio" name="persona" value="void"> VOID</label>
+    </fieldset>
+    <button id="start" type="button">Начать разговор</button>
+    <button id="stop" type="button" disabled>Завершить</button>
+    <p id="status" role="status">Готово к подключению.</p>
+    <audio id="remote-audio" autoplay></audio>
+  </main>
+  <script type="module" src="/voice/static/app.js"></script>
+</body>
+</html>

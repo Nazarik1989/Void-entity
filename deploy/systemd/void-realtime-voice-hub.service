@@ -1,0 +1,44 @@
+[Unit]
+Description=VOID/Naz Realtime Voice Hub
+After=network-online.target naz-realtime-adapter.service
+Wants=network-online.target
+Requires=naz-realtime-adapter.service
+
+[Service]
+Type=simple
+User=voicehub
+Group=voicehub-ipc
+WorkingDirectory=/opt/void_entity_release_20260713
+EnvironmentFile=/opt/void_entity_release_20260713/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=OPENAI_REALTIME_MODEL=gpt-realtime-2.1
+Environment=VOICE_HUB_HOST=127.0.0.1
+Environment=VOICE_HUB_PORT=8091
+Environment=VOICE_HUB_STATE_DB=/var/lib/void-realtime-voice-hub/sessions.sqlite3
+Environment=VOICE_HUB_NAZ_ADAPTER_SOCKET=/run/naz-realtime/adapter.sock
+Environment=DB_PATH=/opt/void_entity_release_20260713/void.db
+StateDirectory=void-realtime-voice-hub
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/opt/void_entity_release_20260713/venv/bin/python /opt/void_entity_release_20260713/realtime_voice_hub.py
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+AmbientCapabilities=
+ReadWritePaths=/var/lib/void-realtime-voice-hub /opt/void_entity_release_20260713
+
+[Install]
+WantedBy=multi-user.target
