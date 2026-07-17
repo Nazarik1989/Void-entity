@@ -12,7 +12,6 @@ SupplementaryGroups=voicehub-ipc
 WorkingDirectory=/opt/void_voice_hub_current
 EnvironmentFile=/opt/void_entity_release_20260713/.env
 Environment=PYTHONUNBUFFERED=1
-Environment=OPENAI_REALTIME_MODEL=gpt-realtime-2.1
 Environment=VOICE_HUB_HOST=127.0.0.1
 Environment=VOICE_HUB_PORT=8091
 Environment=VOICE_HUB_STATE_DB=/var/lib/void-realtime-voice-hub/sessions.sqlite3
@@ -21,7 +20,7 @@ Environment=DB_PATH=/opt/void_entity_release_20260713/void.db
 StateDirectory=void-realtime-voice-hub
 StateDirectoryMode=0700
 UMask=0007
-ExecStart=/opt/void_voice_hub_current/venv/bin/python /opt/void_voice_hub_current/realtime_voice_hub.py
+ExecStart=/usr/bin/env OPENAI_REALTIME_MODEL=gpt-realtime-2.1 /opt/void_voice_hub_current/venv/bin/python /opt/void_voice_hub_current/realtime_voice_hub.py
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
