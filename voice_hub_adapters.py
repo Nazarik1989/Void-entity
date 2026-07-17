@@ -52,12 +52,12 @@ class VoidSqlitePersonaAdapter:
                 )
                 existing = conn.execute(
                     "SELECT user_id FROM voice_hub_deliveries WHERE idempotency_key=?",
-                    (envelope.idempotency_key,),
+                    (envelope.session_id,),
                 ).fetchone()
                 if existing is not None:
                     if int(existing[0]) != int(envelope.user_id):
                         raise PermissionError("Idempotency key belongs to another user")
-                    return f"void:{envelope.idempotency_key}"
+                    return f"void:{envelope.session_id}"
                 conn.execute(
                     """
                     INSERT INTO dialog_messages(user_id, role, content, created_at)
@@ -70,11 +70,11 @@ class VoidSqlitePersonaAdapter:
                     INSERT INTO voice_hub_deliveries(idempotency_key, user_id, created_at)
                     VALUES (?, ?, ?)
                     """,
-                    (envelope.idempotency_key, int(envelope.user_id), now),
+                    (envelope.session_id, int(envelope.user_id), now),
                 )
         finally:
             conn.close()
-        return f"void:{envelope.idempotency_key}"
+        return f"void:{envelope.session_id}"
 
 
 async def unix_json_request(socket_path: Path, payload: dict[str, Any]) -> dict[str, Any]:
@@ -144,9 +144,11 @@ class NazUnixPersonaAdapter:
         response = await self._call(
             "final_summary",
             user_id=int(envelope.user_id),
-            idempotency_key=envelope.idempotency_key,
+            session_id=envelope.session_id,
             summary=envelope.summary,
         )
+        if not isinstance(response.get("saved"), bool):
+            raise RuntimeError("Naz adapter did not return a saved result")
         receipt = response.get("receipt")
         if not isinstance(receipt, str) or not receipt:
             raise RuntimeError("Naz adapter did not return a receipt")

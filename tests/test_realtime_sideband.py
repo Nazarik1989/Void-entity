@@ -55,17 +55,25 @@ class RealtimeSidebandTests(unittest.IsolatedAsyncioTestCase):
 
 
 class NazUnixContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_adapter_sends_only_narrow_contract_and_checks_response_id(self) -> None:
+    async def test_adapter_matches_naz_session_contract_and_accepts_duplicate(self) -> None:
         requests = []
+        delivered_sessions = set()
 
         async def request(_path, payload):
             requests.append(payload)
             if payload["operation"] == "persona_instructions":
                 return {"request_id": payload["request_id"], "ok": True, "instructions": "Naz"}
+            self.assertEqual(
+                set(payload),
+                {"protocol", "request_id", "operation", "user_id", "session_id", "summary"},
+            )
+            saved = payload["session_id"] not in delivered_sessions
+            delivered_sessions.add(payload["session_id"])
             return {
                 "request_id": payload["request_id"],
                 "ok": True,
-                "receipt": "naz:receipt",
+                "receipt": f"naz:{payload['session_id']}",
+                "saved": saved,
             }
 
         adapter = NazUnixPersonaAdapter("adapter.sock", request=request)
@@ -76,16 +84,43 @@ class NazUnixContractTests(unittest.IsolatedAsyncioTestCase):
             {
                 "persona": "naz",
                 "user_id": "42",
-                "idempotency_key": "server_session_key_123456789",
+                "session_id": "server_session_key_123456789",
                 "summary": "server summary",
             },
         )()
-        self.assertEqual(await adapter.deliver(envelope), "naz:receipt")
+        first = await adapter.deliver(envelope)
+        second = await adapter.deliver(envelope)
+        self.assertEqual(first, "naz:server_session_key_123456789")
+        self.assertEqual(second, first)
         self.assertEqual(
             set(requests[1]),
-            {"protocol", "request_id", "operation", "user_id", "idempotency_key", "summary"},
+            {"protocol", "request_id", "operation", "user_id", "session_id", "summary"},
         )
+        self.assertNotIn("idempotency_key", requests[1])
+        self.assertEqual(requests[1]["user_id"], 42)
         self.assertNotIn("database", str(requests).casefold())
+
+    async def test_adapter_rejects_response_without_boolean_saved_result(self) -> None:
+        async def request(_path, payload):
+            return {
+                "request_id": payload["request_id"],
+                "ok": True,
+                "receipt": "naz:session",
+            }
+
+        adapter = NazUnixPersonaAdapter("adapter.sock", request=request)
+        envelope = type(
+            "Envelope",
+            (),
+            {
+                "persona": "naz",
+                "user_id": "42",
+                "session_id": "server_session_key_123456789",
+                "summary": "server summary",
+            },
+        )()
+        with self.assertRaises(RuntimeError):
+            await adapter.deliver(envelope)
 
 
 class VoidAdapterTests(unittest.IsolatedAsyncioTestCase):
@@ -112,7 +147,7 @@ class VoidAdapterTests(unittest.IsolatedAsyncioTestCase):
                 {
                     "persona": "void",
                     "user_id": "42",
-                    "idempotency_key": "server_session_key_123456789",
+                    "session_id": "server_session_key_123456789",
                     "summary": "Серверный итог",
                 },
             )()
