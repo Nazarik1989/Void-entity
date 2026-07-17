@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+from main import get_draft, init_db, save_draft
 from vk_browser_publisher import parse_scheduled_draft_id
 from vk_publish_queue import (
     DuplicateTrackError,
@@ -16,11 +17,13 @@ from vk_publish_queue import (
     canonical_job_id,
     consume_once,
     enqueue_job,
+    publication_receipts,
     recent_track_keys,
     requeue_failed,
     validate_job,
 )
 from vk_queue_consumer import _attach_track, _click_first_text, _open_composer
+from void_vk_producer import sync_published_drafts
 
 
 class VkPublishQueueTests(unittest.TestCase):
@@ -97,10 +100,59 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertTrue((pending / "retry.txt").is_file())
         self.assertFalse((self.root / "done" / directory.name).exists())
         self.assertFalse((self.root / "failed" / directory.name).exists())
+        self.assertEqual(publication_receipts(self.root), [])
 
         publish.reset_mock()
         self.assertEqual(consume_once(self.root, self.group, publish), 0)
         publish.assert_not_called()
+
+    def test_only_successful_publication_receipt_activates_draft_memory(self):
+        with tempfile.TemporaryDirectory() as database_dir:
+            database_path = os.path.join(database_dir, "void-test.db")
+            with (
+                patch("main.DB_PATH", database_path),
+                patch("void_vk_producer.QUEUE_DIR", self.root),
+            ):
+                init_db()
+                draft_id = save_draft(
+                    "signal",
+                    "test",
+                    "publishable placeholder",
+                    "VOID scheduled rubric",
+                    "manual://vk/schedule/signal/test",
+                    "HUMAN",
+                )
+                job = self.job(
+                    dedupe_key=f"void-draft:{draft_id}",
+                    source_ref=f"void:draft:{draft_id}",
+                )
+                self.enqueue(job)
+
+                self.assertEqual(sync_published_drafts(), [])
+                self.assertIsNone(get_draft(draft_id)["published_at"])
+
+                self.assertEqual(consume_once(self.root, self.group, Mock()), 0)
+                receipts = publication_receipts(self.root, producer="void")
+                self.assertEqual(len(receipts), 1)
+                self.assertNotIn("text", receipts[0])
+                self.assertEqual(sync_published_drafts(), [draft_id])
+                self.assertIsNotNone(get_draft(draft_id)["published_at"])
+                self.assertEqual(sync_published_drafts(), [])
+
+    def test_consumer_backfills_receipts_for_existing_done_jobs(self):
+        directory = self.enqueue(
+            self.job(dedupe_key="legacy-done", source_ref="void:draft:42")
+        )
+        (self.root / "done").mkdir()
+        os.replace(directory, self.root / "done" / directory.name)
+        self.assertEqual(publication_receipts(self.root), [])
+
+        publish = Mock()
+        self.assertEqual(consume_once(self.root, self.group, publish), 0)
+
+        publish.assert_not_called()
+        receipts = publication_receipts(self.root, producer="void")
+        self.assertEqual([item["source_ref"] for item in receipts], ["void:draft:42"])
 
     def test_unreadable_shared_track_history_fails_closed(self):
         (self.root / "recent-tracks.json").write_text("not-json", encoding="utf-8")

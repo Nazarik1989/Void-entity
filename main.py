@@ -344,6 +344,7 @@ def init_db() -> None:
     cur.execute("""
     CREATE TABLE IF NOT EXISTS content_signatures (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        draft_id INTEGER,
         character_id TEXT NOT NULL,
         platform TEXT NOT NULL,
         facet TEXT NOT NULL,
@@ -366,6 +367,8 @@ def init_db() -> None:
         cur.execute("ALTER TABLE content_signatures ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'text'")
     if "semantic_theme" not in signature_columns:
         cur.execute("ALTER TABLE content_signatures ADD COLUMN semantic_theme TEXT NOT NULL DEFAULT ''")
+    if "draft_id" not in signature_columns:
+        cur.execute("ALTER TABLE content_signatures ADD COLUMN draft_id INTEGER")
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_void_signatures_created ON content_signatures(character_id, id)")
 
@@ -791,11 +794,16 @@ def get_recent_content_signatures(limit: int = 16) -> list[dict[str, str]]:
     conn = db()
     rows = conn.execute(
         """
-        SELECT platform, facet, intent, format, content_format, content_kind,
-               semantic_theme, hook, media, topic, created_at
-        FROM content_signatures
-        WHERE character_id=?
-        ORDER BY id DESC
+        SELECT signatures.platform, signatures.facet, signatures.intent,
+               signatures.format, signatures.content_format,
+               signatures.content_kind, signatures.semantic_theme,
+               signatures.hook, signatures.media, signatures.topic,
+               signatures.created_at
+        FROM content_signatures AS signatures
+        JOIN drafts ON drafts.id = signatures.draft_id
+        WHERE signatures.character_id=?
+          AND drafts.published_at IS NOT NULL
+        ORDER BY signatures.id DESC
         LIMIT ?
         """,
         (void_character.CHARACTER_ID, max(1, limit)),
@@ -804,16 +812,21 @@ def get_recent_content_signatures(limit: int = 16) -> list[dict[str, str]]:
     return [dict(row) for row in reversed(rows)]
 
 
-def record_content_signature(plan: dict[str, str], topic: str) -> None:
+def record_content_signature(
+    plan: dict[str, str],
+    topic: str,
+    draft_id: int,
+) -> None:
     conn = db()
     conn.execute(
         """
         INSERT INTO content_signatures(
-            character_id, platform, facet, intent, format, content_format, content_kind,
+            draft_id, character_id, platform, facet, intent, format, content_format, content_kind,
             semantic_theme, hook, media, topic, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
+            int(draft_id),
             void_character.CHARACTER_ID,
             str(plan.get("platform", "telegram")),
             str(plan.get("facet", "observer")),
@@ -1726,16 +1739,22 @@ def get_draft(draft_id: int) -> sqlite3.Row | None:
     return row
 
 
-def mark_published(draft_id: int, source_url: str = "") -> None:
+def mark_published(draft_id: int, source_url: str = "") -> bool:
     conn = db()
-    conn.execute("UPDATE drafts SET published_at=? WHERE id=?", (now_iso(), draft_id))
+    published_at = now_iso()
+    cursor = conn.execute(
+        "UPDATE drafts SET published_at=? WHERE id=? AND published_at IS NULL",
+        (published_at, draft_id),
+    )
     if source_url and source_url.startswith("http"):
         conn.execute(
             "INSERT OR REPLACE INTO published_urls(url, draft_id, published_at) VALUES (?, ?, ?)",
-            (source_url, draft_id, now_iso()),
+            (source_url, draft_id, published_at),
         )
     conn.commit()
+    published_now = cursor.rowcount > 0
     conn.close()
+    return published_now
 
 
 def already_published(url: str) -> bool:
@@ -1762,6 +1781,7 @@ def mark_vk_published(
     music_track: dict[str, Any] | None = None,
 ) -> None:
     conn = db()
+    published_at = now_iso()
     conn.execute(
         """
         INSERT OR REPLACE INTO vk_posts(draft_id, post_id, owner_id, attachments, music_track, published_at)
@@ -1773,8 +1793,12 @@ def mark_vk_published(
             owner_id,
             ",".join(attachments or []),
             json.dumps(music_track or {}, ensure_ascii=False),
-            now_iso(),
+            published_at,
         ),
+    )
+    conn.execute(
+        "UPDATE drafts SET published_at=? WHERE id=? AND published_at IS NULL",
+        (published_at, draft_id),
     )
     conn.commit()
     conn.close()
@@ -3415,7 +3439,12 @@ async def publish_draft(
     if apply_planned_character_event:
         await asyncio.to_thread(apply_character_event, character_event_for_mode(str(draft["mode"] or "")))
     if content_plan is not None:
-        await asyncio.to_thread(record_content_signature, content_plan, content_topic)
+        await asyncio.to_thread(
+            record_content_signature,
+            content_plan,
+            content_topic,
+            draft_id,
+        )
     for key, value in (setting_updates or {}).items():
         await asyncio.to_thread(set_setting, key, value)
     await asyncio.to_thread(apply_character_event, "publish")
@@ -3665,6 +3694,7 @@ def recent_scheduled_posts(platform: str, limit: int = SEMANTIC_HISTORY_LIMIT) -
         """
         SELECT post FROM drafts
         WHERE source_url LIKE ?
+          AND published_at IS NOT NULL
         ORDER BY id DESC
         LIMIT ?
         """,
@@ -3862,7 +3892,7 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
         brief,
         "vk",
         mode,
-        True,
+        False,
         semantic_theme,
     )
 
@@ -3896,7 +3926,12 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
             draft = get_draft(draft_id)
             ok, _ = quality_check(draft["post"] if draft else "")
             if ok:
-                await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", brief))
+                await asyncio.to_thread(
+                    record_content_signature,
+                    editorial_plan,
+                    item.get("title", brief),
+                    draft_id,
+                )
                 return draft_id
         raise RuntimeError("fresh news signals not found")
 
@@ -3913,6 +3948,7 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
         record_content_signature,
         editorial_plan,
         f"semantic_theme:{semantic_theme}|{brief}",
+        draft_id,
     )
     return draft_id
 
@@ -4366,7 +4402,12 @@ async def discuss_news_command(message: Message):
         item.get("mode", "news"), content, item.get("frequency", "HUMAN"),
         item.get("source_name", ""), item.get("url", ""),
     )
-    await asyncio.to_thread(record_content_signature, editorial_plan, item.get("title", "news"))
+    await asyncio.to_thread(
+        record_content_signature,
+        editorial_plan,
+        item.get("title", "news"),
+        draft_id,
+    )
     await message.answer(
         f"Общий сигнал: {item.get('title', '')}\n"
         f"VOID-черновик: #{draft_id}\n"
@@ -4531,7 +4572,7 @@ async def gaming_draft(message: Message, *, commercial: bool = False) -> None:
             "gaming", f"Gaming: {topic[:120]}", post,
             "VOID gaming vertical", f"manual://gaming/{now_iso()}", "GAMING", 7,
         )
-        record_content_signature(plan, topic)
+        record_content_signature(plan, topic, draft_id)
     except Exception as exc:
         await message.answer(f"Игровой черновик не получился: {type(exc).__name__}: {exc}")
         return

@@ -29,15 +29,18 @@ from main import (
     get_recent_content_signatures,
     init_db,
     inject_rubric_header,
+    mark_published,
     parse_daily_times,
     parse_scheduled_ai_output,
     post_vk_vibes,
     publish_telegram_void_scheduled_once,
     quality_check,
+    recent_scheduled_posts,
     record_content_signature,
     repeats_default_digital_thesis,
     semantic_repetition_reason,
     semantic_theme_candidates,
+    save_draft,
     track_vk_vibes,
     too_much_english,
     trim_post,
@@ -136,11 +139,19 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("diagnostic", reason)
 
-    def test_semantic_theme_is_persisted_in_signature_history(self) -> None:
+    def test_only_published_drafts_enter_semantic_memory(self) -> None:
         with TemporaryDirectory() as temp_dir:
             database_path = os.path.join(temp_dir, "void-test.db")
             with patch("main.DB_PATH", database_path):
                 init_db()
+                draft_id = save_draft(
+                    "signal",
+                    "test",
+                    "scheduled post placeholder",
+                    "VOID scheduled rubric",
+                    "manual://vk/schedule/signal/test",
+                    "HUMAN",
+                )
                 record_content_signature(
                     {
                         "platform": "vk",
@@ -154,9 +165,17 @@ class AutopostingRubricTests(unittest.TestCase):
                         "media": "object",
                     },
                     "test topic",
+                    draft_id,
                 )
+                self.assertEqual(get_recent_content_signatures(), [])
+                self.assertEqual(recent_scheduled_posts("vk"), [])
+
+                mark_published(draft_id)
+
                 recent = get_recent_content_signatures()
+                scheduled = recent_scheduled_posts("vk")
         self.assertEqual(recent[-1]["semantic_theme"], "maintenance")
+        self.assertEqual(scheduled, ["scheduled post placeholder"])
 
     def test_rubric_schedule_is_void_owned(self) -> None:
         voices = {slot["voice"] for slot in RUBRIC_SCHEDULE}
