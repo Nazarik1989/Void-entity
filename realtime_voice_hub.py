@@ -9,13 +9,16 @@ import json
 import os
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Protocol
 from urllib.parse import parse_qsl
 
 from aiohttp import ClientError, ClientSession, ClientTimeout, web
-from dotenv import load_dotenv
+
+from realtime_sideband import CALL_ID_RE, SidebandError, SidebandManager
+from voice_hub_adapters import NazUnixPersonaAdapter, PersonaAdapter, VoidSqlitePersonaAdapter
+from voice_hub_store import StoreConflictError, StoredSession, VoiceHubStore
 
 
 REALTIME_MODEL = "gpt-realtime-2.1"
@@ -153,23 +156,30 @@ class VoiceHubConfig:
     max_session_duration_seconds: int = 900
     telegram_launch_max_age_seconds: int = 300
     ephemeral_token_ttl_seconds: int = 60
+    state_db_path: Path = Path("data/voice_hub.sqlite3")
+    naz_adapter_socket: Path = Path("/run/naz-realtime/adapter.sock")
+    void_db_path: Path = Path("void.db")
     host: str = "127.0.0.1"
     port: int = 8080
 
     @classmethod
     def from_env(cls) -> "VoiceHubConfig":
-        load_dotenv()
         model_override = os.getenv("OPENAI_REALTIME_MODEL", REALTIME_MODEL).strip()
         if model_override != REALTIME_MODEL:
             raise ValueError(f"OPENAI_REALTIME_MODEL must be exactly {REALTIME_MODEL}")
+        allowlist_source = os.getenv("VOICE_HUB_ALLOWED_TELEGRAM_USER_IDS")
+        if allowlist_source is None:
+            allowlist_source = os.getenv("ADMIN_ID", "")
         allowed_values = frozenset(
             item.strip()
-            for item in os.getenv("VOICE_HUB_ALLOWED_TELEGRAM_USER_IDS", "").split(",")
+            for item in allowlist_source.split(",")
             if item.strip()
         )
         if any(not item.isdigit() or int(item) <= 0 for item in allowed_values):
             raise ValueError("VOICE_HUB_ALLOWED_TELEGRAM_USER_IDS must contain positive integers")
         allowed = frozenset(str(int(item)) for item in allowed_values)
+        if not allowed:
+            raise ValueError("Voice Hub Telegram allowlist must not be empty")
         duration = int(os.getenv("VOICE_HUB_MAX_SESSION_SECONDS", "900"))
         if not 30 <= duration <= 3600:
             raise ValueError("VOICE_HUB_MAX_SESSION_SECONDS must be between 30 and 3600")
@@ -183,6 +193,11 @@ class VoiceHubConfig:
             max_session_duration_seconds=duration,
             telegram_launch_max_age_seconds=int(os.getenv("VOICE_HUB_TELEGRAM_AUTH_MAX_AGE_SECONDS", "300")),
             ephemeral_token_ttl_seconds=ttl,
+            state_db_path=Path(os.getenv("VOICE_HUB_STATE_DB", "data/voice_hub.sqlite3")),
+            naz_adapter_socket=Path(
+                os.getenv("VOICE_HUB_NAZ_ADAPTER_SOCKET", "/run/naz-realtime/adapter.sock")
+            ),
+            void_db_path=Path(os.getenv("DB_PATH", "void.db")),
             host=os.getenv("VOICE_HUB_HOST", "127.0.0.1").strip(),
             port=int(os.getenv("VOICE_HUB_PORT", "8080")),
         )
@@ -197,10 +212,13 @@ class VoiceHubConfig:
 class EphemeralToken:
     value: str
     expires_at: int
+    realtime_session_id: str
 
 
 class RealtimeTokenProvider(Protocol):
-    async def mint(self, *, persona: str, safety_identifier: str) -> EphemeralToken:
+    async def mint(
+        self, *, persona: str, instructions: str, safety_identifier: str
+    ) -> EphemeralToken:
         ...
 
 
@@ -218,7 +236,7 @@ class OpenAIRealtimeTokenProvider:
         self._ephemeral_ttl_seconds = ephemeral_ttl_seconds
         self._client_session = client_session
 
-    def session_payload(self, persona: str) -> dict[str, Any]:
+    def session_payload(self, persona: str, instructions: str | None = None) -> dict[str, Any]:
         persona_config = PERSONAS.get(persona)
         if persona_config is None:
             raise AuthorizationError("Persona is not allowed")
@@ -227,7 +245,7 @@ class OpenAIRealtimeTokenProvider:
             "session": {
                 "type": "realtime",
                 "model": REALTIME_MODEL,
-                "instructions": persona_config["instructions"],
+                "instructions": instructions or persona_config["instructions"],
                 "output_modalities": ["audio"],
                 "audio": {
                     "input": {"turn_detection": {"type": "server_vad"}},
@@ -236,7 +254,9 @@ class OpenAIRealtimeTokenProvider:
             },
         }
 
-    async def mint(self, *, persona: str, safety_identifier: str) -> EphemeralToken:
+    async def mint(
+        self, *, persona: str, instructions: str, safety_identifier: str
+    ) -> EphemeralToken:
         own_session = self._client_session is None
         session = self._client_session or ClientSession(timeout=ClientTimeout(total=15))
         try:
@@ -247,7 +267,7 @@ class OpenAIRealtimeTokenProvider:
                     "Content-Type": "application/json",
                     "OpenAI-Safety-Identifier": safety_identifier,
                 },
-                json=self.session_payload(persona),
+                json=self.session_payload(persona, instructions),
             ) as response:
                 try:
                     payload = await response.json()
@@ -263,11 +283,16 @@ class OpenAIRealtimeTokenProvider:
         value = str(payload.get("value") or "")
         try:
             expires_at = int(payload["expires_at"])
+            realtime_session_id = str(payload["session"]["id"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise UpstreamError("OpenAI response did not contain token expiry") from exc
-        if not value.startswith("ek_"):
+            raise UpstreamError("OpenAI response did not contain session binding") from exc
+        if not value.startswith("ek_") or not realtime_session_id.startswith("sess_"):
             raise UpstreamError("OpenAI response did not contain an ephemeral token")
-        return EphemeralToken(value=value, expires_at=expires_at)
+        return EphemeralToken(
+            value=value,
+            expires_at=expires_at,
+            realtime_session_id=realtime_session_id,
+        )
 
 
 @dataclass(frozen=True)
@@ -281,107 +306,6 @@ class SummaryEnvelope:
     ended_at: int
 
 
-class PersonaSummaryAdapter(Protocol):
-    async def deliver(self, envelope: SummaryEnvelope) -> str:
-        ...
-
-
-class AcceptedSummaryAdapter:
-    """Safe default adapter seam; replace with a Naz/VOID persistence adapter at integration."""
-
-    async def deliver(self, envelope: SummaryEnvelope) -> str:
-        return f"accepted:{envelope.persona}:{envelope.idempotency_key}"
-
-
-@dataclass
-class VoiceSession:
-    session_id: str
-    identity: LaunchIdentity
-    persona: str
-    started_at: int
-    expires_at: int
-    state: str = "minting"
-    summary_receipt: str | None = None
-    delivery_future: asyncio.Future[str] | None = field(default=None, repr=False)
-
-
-class SessionRegistry:
-    def __init__(self, *, clock: Callable[[], float] = time.time) -> None:
-        self._clock = clock
-        self._lock = asyncio.Lock()
-        self._sessions: dict[str, VoiceSession] = {}
-        self._active_by_user: dict[tuple[str, str], str] = {}
-
-    async def reserve(self, identity: LaunchIdentity, persona: str, duration_seconds: int) -> VoiceSession:
-        now = int(self._clock())
-        user_key = (identity.platform, identity.user_id)
-        async with self._lock:
-            active_id = self._active_by_user.get(user_key)
-            if active_id:
-                active = self._sessions[active_id]
-                if active.state in {"minting", "active", "delivering"} and active.expires_at > now:
-                    raise ActiveSessionError("User already has an active voice session")
-                self._active_by_user.pop(user_key, None)
-            session = VoiceSession(
-                session_id=secrets.token_urlsafe(24),
-                identity=identity,
-                persona=persona,
-                started_at=now,
-                expires_at=now + duration_seconds,
-            )
-            self._sessions[session.session_id] = session
-            self._active_by_user[user_key] = session.session_id
-            return session
-
-    async def activate(self, session_id: str) -> None:
-        async with self._lock:
-            self._sessions[session_id].state = "active"
-
-    async def release_failed_reservation(self, session_id: str) -> None:
-        async with self._lock:
-            session = self._sessions.pop(session_id, None)
-            if session:
-                self._active_by_user.pop((session.identity.platform, session.identity.user_id), None)
-
-    async def get_owned(self, session_id: str, identity: LaunchIdentity) -> VoiceSession:
-        async with self._lock:
-            session = self._sessions.get(session_id)
-            if session is None or session.identity != identity:
-                raise SessionNotFoundError("Voice session was not found")
-            return session
-
-    async def begin_delivery(self, session: VoiceSession) -> tuple[asyncio.Future[str], bool]:
-        async with self._lock:
-            if session.summary_receipt is not None:
-                future = asyncio.get_running_loop().create_future()
-                future.set_result(session.summary_receipt)
-                return future, False
-            if session.delivery_future is not None:
-                return session.delivery_future, False
-            future = asyncio.get_running_loop().create_future()
-            session.delivery_future = future
-            session.state = "delivering"
-            return future, True
-
-    async def complete_delivery(self, session: VoiceSession, receipt: str) -> None:
-        async with self._lock:
-            session.summary_receipt = receipt
-            session.state = "finished"
-            self._active_by_user.pop((session.identity.platform, session.identity.user_id), None)
-            future = session.delivery_future
-            session.delivery_future = None
-            if future is not None and not future.done():
-                future.set_result(receipt)
-
-    async def fail_delivery(self, session: VoiceSession, exc: Exception) -> None:
-        async with self._lock:
-            session.state = "active"
-            future = session.delivery_future
-            session.delivery_future = None
-            if future is not None and not future.done():
-                future.set_exception(exc)
-
-
 class VoiceHubService:
     def __init__(
         self,
@@ -389,16 +313,20 @@ class VoiceHubService:
         token_provider: RealtimeTokenProvider,
         *,
         verifiers: Mapping[str, LaunchVerifier],
-        summary_adapters: Mapping[str, PersonaSummaryAdapter],
-        registry: SessionRegistry | None = None,
+        persona_adapters: Mapping[str, PersonaAdapter],
+        store: VoiceHubStore,
+        sidebands: SidebandManager,
         clock: Callable[[], float] = time.time,
     ) -> None:
         self.config = config
         self._token_provider = token_provider
         self._verifiers = dict(verifiers)
-        self._summary_adapters = dict(summary_adapters)
-        self._registry = registry or SessionRegistry(clock=clock)
+        self._persona_adapters = dict(persona_adapters)
+        self._store = store
+        self._sidebands = sidebands
         self._clock = clock
+        self._instructions: dict[str, str] = {}
+        self._finalize_locks: dict[str, asyncio.Lock] = {}
 
     def authenticate(self, platform: str, launch_data: str) -> LaunchIdentity:
         verifier = self._verifiers.get(platform)
@@ -411,7 +339,7 @@ class VoiceHubService:
 
     def _authorize_persona(self, persona: str) -> str:
         normalized = str(persona or "").strip().casefold()
-        if normalized not in PERSONAS or normalized not in self._summary_adapters:
+        if normalized not in PERSONAS or normalized not in self._persona_adapters:
             raise AuthorizationError("Persona is not allowlisted")
         return normalized
 
@@ -426,18 +354,28 @@ class VoiceHubService:
     async def start_session(self, platform: str, launch_data: str, persona: str) -> dict[str, Any]:
         identity = self.authenticate(platform, launch_data)
         allowed_persona = self._authorize_persona(persona)
-        session = await self._registry.reserve(
-            identity, allowed_persona, self.config.max_session_duration_seconds
-        )
         try:
+            session = self._store.reserve(
+                session_id=secrets.token_urlsafe(24),
+                platform=identity.platform,
+                user_id=identity.user_id,
+                persona=allowed_persona,
+                duration_seconds=self.config.max_session_duration_seconds,
+            )
+        except StoreConflictError as exc:
+            raise ActiveSessionError("User already has an active voice session") from exc
+        try:
+            instructions = await self._persona_adapters[allowed_persona].instructions(identity.user_id)
             token = await self._token_provider.mint(
                 persona=allowed_persona,
+                instructions=instructions,
                 safety_identifier=self._safety_identifier(identity),
             )
         except Exception:
-            await self._registry.release_failed_reservation(session.session_id)
+            self._store.delete_reservation(session.session_id)
             raise
-        await self._registry.activate(session.session_id)
+        session = self._store.activate(session.session_id, token.realtime_session_id)
+        self._instructions[session.session_id] = instructions
         return {
             "session_id": session.session_id,
             "ephemeral_token": token.value,
@@ -445,49 +383,158 @@ class VoiceHubService:
             "session_expires_at": session.expires_at,
             "max_duration_seconds": self.config.max_session_duration_seconds,
             "model": REALTIME_MODEL,
-            "persona": allowed_persona,
+            "persona": session.persona,
         }
 
-    async def finish_session(
-        self,
-        session_id: str,
-        platform: str,
-        launch_data: str,
-        summary: str,
+    def _get_owned(self, session_id: str, identity: LaunchIdentity) -> StoredSession:
+        session = self._store.get(session_id)
+        if session is None or session.platform != identity.platform or session.user_id != identity.user_id:
+            raise SessionNotFoundError("Voice session was not found")
+        return session
+
+    async def bind_call(
+        self, session_id: str, platform: str, launch_data: str, call_id: str
     ) -> dict[str, Any]:
         identity = self.authenticate(platform, launch_data)
-        if not isinstance(summary, str):
-            raise VoiceHubError("Summary must be text")
-        clean_summary = " ".join(summary.split()).strip()
-        if not clean_summary:
-            clean_summary = "Сессия завершена без доступного текстового summary."
-        if len(clean_summary) > MAX_SUMMARY_CHARS:
-            raise VoiceHubError("Summary is too large")
-        session = await self._registry.get_owned(session_id, identity)
-        future, should_deliver = await self._registry.begin_delivery(session)
-        if should_deliver:
-            adapter = self._summary_adapters[session.persona]
+        session = self._get_owned(session_id, identity)
+        if not CALL_ID_RE.fullmatch(call_id):
+            raise VoiceHubError("Invalid Realtime call ID")
+        if session.realtime_session_id is None:
+            raise SessionNotFoundError("Realtime session binding is unavailable")
+        instructions = self._instructions.get(session_id)
+        if instructions is None:
+            instructions = await self._persona_adapters[session.persona].instructions(session.user_id)
+            self._instructions[session_id] = instructions
+        try:
+            await self._sidebands.attach(
+                hub_session_id=session.session_id,
+                call_id=call_id,
+                expected_realtime_session_id=session.realtime_session_id,
+                instructions=instructions,
+                voice=PERSONAS[session.persona]["voice"],
+                deadline=session.expires_at,
+                on_limit=self._finish_on_limit,
+                on_end=self._finish_on_end,
+            )
+            session = self._store.attach(session.session_id, call_id)
+        except (SidebandError, StoreConflictError) as exc:
+            raise VoiceHubError("Realtime call binding failed") from exc
+        return {"session_id": session.session_id, "status": "attached", "expires_at": session.expires_at}
+
+    async def finish_session(
+        self, session_id: str, platform: str, launch_data: str
+    ) -> dict[str, Any]:
+        identity = self.authenticate(platform, launch_data)
+        session = self._get_owned(session_id, identity)
+        if session.state not in {"attached", "finalizing", "finished"}:
+            raise VoiceHubError("Voice session is not bound to a Realtime call")
+        return await self._finalize(session.session_id, reason="user")
+
+    async def _finish_on_limit(self, session_id: str) -> None:
+        try:
+            await self._finalize(session_id, reason="server_limit")
+        except Exception:
+            return
+
+    async def _finish_on_end(self, session_id: str) -> None:
+        try:
+            await self._finalize(session_id, reason="remote_end")
+        except Exception:
+            return
+
+    async def _finalize(self, session_id: str, *, reason: str) -> dict[str, Any]:
+        lock = self._finalize_locks.setdefault(session_id, asyncio.Lock())
+        async with lock:
+            session = self._store.get(session_id)
+            if session is None:
+                raise SessionNotFoundError("Voice session was not found")
+            if session.state == "finished" and session.summary_receipt:
+                return {
+                    "session_id": session.session_id,
+                    "status": "finished",
+                    "summary_receipt": session.summary_receipt,
+                }
+            session = self._store.begin_finalization(session_id)
+            control = self._sidebands.get(session_id)
+            usage: dict[str, Any] = {}
+            lifecycle: dict[str, Any] = {}
+            if reason == "server_limit" and control is not None:
+                await control.hangup()
+            summary = session.summary
+            if not summary and control is not None and reason != "server_limit":
+                try:
+                    summary = await control.request_summary(timeout=10)
+                except (SidebandError, asyncio.TimeoutError):
+                    summary = control.transcript_summary()
+            if not summary and control is not None:
+                summary = control.transcript_summary()
+            if not summary:
+                summary = "Сессия завершена; серверная текстовая расшифровка недоступна."
+            summary = " ".join(summary.split()).strip()[:MAX_SUMMARY_CHARS]
+            self._store.save_server_summary(session_id, summary)
+            if control is not None:
+                snapshot = control.snapshot()
+                usage = dict(snapshot.get("usage") or {})
+                lifecycle = dict(snapshot.get("lifecycle") or {})
+                if reason != "server_limit":
+                    await control.hangup()
             envelope = SummaryEnvelope(
                 idempotency_key=session.session_id,
-                platform=identity.platform,
-                user_id=identity.user_id,
+                platform=session.platform,
+                user_id=session.user_id,
                 persona=session.persona,
-                summary=clean_summary,
+                summary=summary,
                 started_at=session.started_at,
                 ended_at=int(self._clock()),
             )
+            receipt = await self._persona_adapters[session.persona].deliver(envelope)
+            session = self._store.finish(
+                session_id,
+                receipt=str(receipt),
+                reason=reason,
+                usage=usage,
+                lifecycle=lifecycle,
+            )
+            await self._sidebands.remove(session_id)
+            self._instructions.pop(session_id, None)
+            self._finalize_locks.pop(session_id, None)
+            return {
+                "session_id": session.session_id,
+                "status": "finished",
+                "summary_receipt": session.summary_receipt,
+            }
+
+    async def recover(self) -> None:
+        now = int(self._clock())
+        for session in self._store.recoverable():
+            if not session.call_id or not session.realtime_session_id:
+                self._store.abandon(session.session_id, "restart_without_bound_call")
+                continue
             try:
-                receipt = await adapter.deliver(envelope)
-                await self._registry.complete_delivery(session, str(receipt))
-            except Exception as exc:
-                await self._registry.fail_delivery(session, exc)
-                try:
-                    await future
-                except Exception:
-                    pass
-                raise
-        receipt = await future
-        return {"session_id": session.session_id, "status": "finished", "summary_receipt": receipt}
+                instructions = await self._persona_adapters[session.persona].instructions(session.user_id)
+                self._instructions[session.session_id] = instructions
+                await self._sidebands.attach(
+                    hub_session_id=session.session_id,
+                    call_id=session.call_id,
+                    expected_realtime_session_id=session.realtime_session_id,
+                    instructions=instructions,
+                    voice=PERSONAS[session.persona]["voice"],
+                    deadline=session.expires_at,
+                    on_limit=self._finish_on_limit,
+                    on_end=self._finish_on_end,
+                )
+                if session.expires_at <= now:
+                    await self._finalize(session.session_id, reason="server_limit")
+                elif session.state == "finalizing":
+                    await self._finalize(session.session_id, reason="recovery")
+            except Exception:
+                if session.summary:
+                    try:
+                        await self._finalize(session.session_id, reason="recovery")
+                    except Exception:
+                        pass
+                else:
+                    self._store.abandon(session.session_id, "sideband_recovery_failed")
 
 
 def _json_error(code: str, status: int) -> web.Response:
@@ -508,6 +555,13 @@ async def _read_json(request: web.Request) -> dict[str, Any]:
     return payload
 
 
+def _validate_fields(
+    payload: Mapping[str, Any], *, required: set[str], allowed: set[str]
+) -> None:
+    if set(payload) - allowed or not required.issubset(payload):
+        raise VoiceHubError("Request fields are invalid")
+
+
 @web.middleware
 async def error_middleware(request: web.Request, handler: Callable[[web.Request], Awaitable[web.StreamResponse]]) -> web.StreamResponse:
     try:
@@ -524,9 +578,18 @@ def create_app(
     config: VoiceHubConfig,
     *,
     token_provider: RealtimeTokenProvider | None = None,
-    summary_adapters: Mapping[str, PersonaSummaryAdapter] | None = None,
+    persona_adapters: Mapping[str, PersonaAdapter] | None = None,
+    store: VoiceHubStore | None = None,
+    sidebands: SidebandManager | None = None,
 ) -> web.Application:
-    adapters = dict(summary_adapters or {name: AcceptedSummaryAdapter() for name in PERSONAS})
+    adapters = dict(
+        persona_adapters
+        or {
+            "naz": NazUnixPersonaAdapter(config.naz_adapter_socket),
+            "void": VoidSqlitePersonaAdapter(config.void_db_path, PERSONAS["void"]["instructions"]),
+        }
+    )
+    sideband_manager = sidebands or SidebandManager(config.openai_api_key)
     service = VoiceHubService(
         config,
         token_provider or OpenAIRealtimeTokenProvider(
@@ -540,7 +603,9 @@ def create_app(
             ),
             "vk": VkLaunchVerifier(),
         },
-        summary_adapters=adapters,
+        persona_adapters=adapters,
+        store=store or VoiceHubStore(config.state_db_path),
+        sidebands=sideband_manager,
     )
     app = web.Application(client_max_size=32 * 1024, middlewares=[error_middleware])
     app["voice_hub_service"] = service
@@ -551,6 +616,11 @@ def create_app(
 
     async def start(request: web.Request) -> web.Response:
         payload = await _read_json(request)
+        _validate_fields(
+            payload,
+            required={"platform", "launch_data", "persona"},
+            allowed={"platform", "launch_data", "persona"},
+        )
         result = await service.start_session(
             str(payload.get("platform") or "telegram"),
             str(payload.get("launch_data") or ""),
@@ -558,20 +628,49 @@ def create_app(
         )
         return web.json_response(result, status=201, headers={"Cache-Control": "no-store"})
 
+    async def attach(request: web.Request) -> web.Response:
+        payload = await _read_json(request)
+        _validate_fields(
+            payload,
+            required={"platform", "launch_data", "call_id"},
+            allowed={"platform", "launch_data", "call_id"},
+        )
+        result = await service.bind_call(
+            request.match_info["session_id"],
+            str(payload["platform"]),
+            str(payload["launch_data"]),
+            str(payload["call_id"]),
+        )
+        return web.json_response(result, headers={"Cache-Control": "no-store"})
+
     async def finish(request: web.Request) -> web.Response:
         payload = await _read_json(request)
+        _validate_fields(
+            payload,
+            required={"platform", "launch_data"},
+            allowed={"platform", "launch_data"},
+        )
         result = await service.finish_session(
             request.match_info["session_id"],
-            str(payload.get("platform") or "telegram"),
-            str(payload.get("launch_data") or ""),
-            payload.get("summary", ""),
+            str(payload["platform"]),
+            str(payload["launch_data"]),
         )
         return web.json_response(result, headers={"Cache-Control": "no-store"})
 
     app.router.add_get("/voice", index)
     app.router.add_post("/api/voice/sessions", start)
+    app.router.add_post("/api/voice/sessions/{session_id}/attach", attach)
     app.router.add_post("/api/voice/sessions/{session_id}/finish", finish)
     app.router.add_static("/voice/static", static_dir, show_index=False)
+
+    async def startup(_: web.Application) -> None:
+        await service.recover()
+
+    async def cleanup(_: web.Application) -> None:
+        await sideband_manager.close()
+
+    app.on_startup.append(startup)
+    app.on_cleanup.append(cleanup)
     return app
 
 
