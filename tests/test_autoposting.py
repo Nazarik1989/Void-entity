@@ -4,11 +4,14 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import void_vk_producer
+
 from main import (
+    SemanticSummary,
     VOID_TO_NAZ_FORBIDDEN_OPENINGS,
     VOID_TO_NAZ_OPENING_OPTIONS,
     build_void_to_naz_exchange_payload,
@@ -25,7 +28,9 @@ from main import (
     init_db,
     inject_rubric_header,
     parse_daily_times,
+    parse_scheduled_ai_output,
     post_vk_vibes,
+    publish_telegram_void_scheduled_once,
     quality_check,
     record_content_signature,
     repeats_default_digital_thesis,
@@ -339,7 +344,10 @@ class AutopostingRubricTests(unittest.TestCase):
 
 class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
-    def _draft(post: str) -> dict:
+    def _draft(
+        post: str,
+        summary: SemanticSummary | None = None,
+    ) -> dict:
         return {
             "mode": "signal",
             "title": "Тест",
@@ -348,6 +356,12 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
             "source_url": "manual://vk/schedule/signal/test",
             "frequency": "HUMAN",
             "publish_score": 8,
+            "semantic_summary": summary or SemanticSummary(
+                central_thesis="центральный тезис кандидата",
+                conclusion="итоговый вывод кандидата",
+                narrative_shape="сцена -> наблюдение -> вывод",
+                key_meanings=("первый смысл", "второй смысл", "третий смысл"),
+            ),
         }
 
     async def test_bounded_retry_stops_after_two_rejected_candidates(self) -> None:
@@ -371,10 +385,31 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(generate.call_count, 2)
         save.assert_not_called()
 
+    async def test_semantic_metadata_is_not_part_of_publishable_post(self) -> None:
+        raw = (
+            "TITLE: Тест\n"
+            "CENTRAL_THESIS: центральный тезис\n"
+            "CONCLUSION: итоговый вывод\n"
+            "NARRATIVE_SHAPE: сцена -> наблюдение -> вывод\n"
+            "KEY_MEANINGS: ремесло, контроль, терпение\n"
+            "POST: Публикуемый текст."
+        )
+        _, post, summary = parse_scheduled_ai_output(raw)
+        self.assertEqual(post, "Публикуемый текст.")
+        self.assertEqual(summary.central_thesis, "центральный тезис")
+        self.assertNotIn("CENTRAL_THESIS", post)
+        self.assertNotIn("KEY_MEANINGS", post)
+
     async def test_one_retry_can_succeed_and_only_accepted_draft_is_saved(self) -> None:
         with (
             patch("main.recent_scheduled_posts", return_value=["old"]),
-            patch("main.generate_post_sync", return_value=self._draft("candidate")) as generate,
+            patch(
+                "main.generate_post_sync",
+                side_effect=[
+                    self._draft("rejected candidate"),
+                    self._draft("accepted candidate"),
+                ],
+            ) as generate,
             patch("main.quality_check", return_value=(True, "ok")),
             patch(
                 "main.semantic_repetition_reason",
@@ -394,6 +429,136 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(draft_id, 77)
         self.assertEqual(generate.call_count, 2)
         save.assert_called_once()
+        self.assertEqual(save.call_args.args[2], "accepted candidate")
+
+    async def test_retry_receives_rejected_semantics_without_rejected_post(self) -> None:
+        rejected_post = "REJECTED-CANDIDATE-FULL-TEXT"
+        rejected_summary = SemanticSummary(
+            central_thesis="уникальный центральный тезис отказа",
+            conclusion="уникальный вывод отказа",
+            narrative_shape="предметная сцена -> обобщение -> мораль",
+            key_meanings=("ремесло", "контроль", "терпение"),
+        )
+        with (
+            patch("main.recent_scheduled_posts", return_value=["old"]),
+            patch(
+                "main.generate_post_sync",
+                side_effect=[
+                    self._draft(rejected_post, rejected_summary),
+                    self._draft("accepted candidate"),
+                ],
+            ) as generate,
+            patch("main.quality_check", return_value=(True, "ok")),
+            patch(
+                "main.semantic_repetition_reason",
+                side_effect=["near_duplicate_semantics", ""],
+            ),
+            patch("main.save_draft", return_value=77),
+        ):
+            await generate_scheduled_draft(
+                mode="signal",
+                content="original content",
+                frequency="HUMAN",
+                source_name="VOID",
+                source_url="manual://vk/schedule/signal/test",
+                platform="vk",
+                semantic_theme="craft",
+            )
+
+        retry_content = generate.call_args_list[1].args[1]
+        self.assertIn("near_duplicate_semantics", retry_content)
+        self.assertIn(rejected_summary.central_thesis, retry_content)
+        self.assertIn(rejected_summary.conclusion, retry_content)
+        self.assertIn(rejected_summary.narrative_shape, retry_content)
+        for meaning in rejected_summary.key_meanings:
+            self.assertIn(meaning, retry_content)
+        self.assertNotIn(rejected_post, retry_content)
+        self.assertIn("Do not repeat or paraphrase that central thesis", retry_content)
+        self.assertIn("Do not repeat that conclusion or moral", retry_content)
+        self.assertIn("Do not reuse that narrative shape", retry_content)
+        self.assertIn("different concrete scene", retry_content)
+        self.assertIn("substantially different conclusion", retry_content)
+
+    async def test_missing_semantic_summary_stops_without_uninformed_retry(self) -> None:
+        candidate = self._draft("candidate")
+        candidate["semantic_summary"] = None
+        with (
+            patch("main.recent_scheduled_posts", return_value=["old"]),
+            patch("main.generate_post_sync", return_value=candidate) as generate,
+            patch("main.save_draft") as save,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "missing semantic summary"):
+                await generate_scheduled_draft(
+                    mode="signal",
+                    content="content",
+                    frequency="HUMAN",
+                    source_name="VOID",
+                    source_url="manual://vk/schedule/signal/test",
+                    platform="vk",
+                    semantic_theme="craft",
+                )
+        self.assertEqual(generate.call_count, 1)
+        save.assert_not_called()
+
+    async def test_scheduled_generation_is_limited_to_two_model_calls(self) -> None:
+        structured_output = (
+            "TITLE: Тест\n"
+            "CENTRAL_THESIS: центральный тезис\n"
+            "CONCLUSION: итоговый вывод\n"
+            "NARRATIVE_SHAPE: сцена -> наблюдение -> вывод\n"
+            "KEY_MEANINGS: ремесло, контроль, терпение\n"
+            "POST: " + ("Тестовый русский текст для проверки лимита генераций. " * 8)
+        )
+        with (
+            patch("main.recent_scheduled_posts", return_value=["old"]),
+            patch("main.call_ai", return_value=structured_output) as call_ai_mock,
+            patch("main.too_much_english", return_value=True),
+            patch("main.save_draft") as save,
+        ):
+            with self.assertRaises(RuntimeError):
+                await generate_scheduled_draft(
+                    mode="signal",
+                    content="content",
+                    frequency="HUMAN",
+                    source_name="VOID",
+                    source_url="manual://vk/schedule/signal/test",
+                    platform="vk",
+                    semantic_theme="craft",
+                )
+        self.assertEqual(call_ai_mock.call_count, 2)
+        save.assert_not_called()
+
+    async def test_semantic_rejection_does_not_reach_telegram_publish(self) -> None:
+        slot = {
+            "name": "Scheduled Signal",
+            "voice": "void",
+            "mode": "signal",
+        }
+        with (
+            patch("main.choose_telegram_schedule_slot", return_value=slot),
+            patch(
+                "main.save_telegram_void_scheduled_draft",
+                side_effect=RuntimeError("semantic rejection"),
+            ),
+            patch("main.publish_draft", new=AsyncMock()) as publish,
+        ):
+            result = await publish_telegram_void_scheduled_once(object())
+        publish.assert_not_awaited()
+        self.assertIn("schedule failed", result)
+
+
+class ScheduledVkRejectionTests(unittest.TestCase):
+    def test_semantic_rejection_does_not_reach_vk_queue(self) -> None:
+        with (
+            patch(
+                "void_vk_producer.main.make_scheduled_rubric_draft_once",
+                new=AsyncMock(side_effect=RuntimeError("semantic rejection")),
+            ),
+            patch("void_vk_producer.enqueue_draft") as enqueue,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "semantic rejection"):
+                void_vk_producer.produce_scheduled()
+        enqueue.assert_not_called()
 
 
 if __name__ == "__main__":

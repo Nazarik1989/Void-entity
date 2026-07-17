@@ -2558,6 +2558,82 @@ def parse_ai_output(text: str) -> tuple[str, str]:
     return title, post
 
 
+@dataclass(frozen=True)
+class SemanticSummary:
+    central_thesis: str
+    conclusion: str
+    narrative_shape: str
+    key_meanings: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SemanticGateDecision:
+    accepted: bool
+    reason: str
+    central_thesis: str
+    conclusion: str
+    narrative_shape: str
+    key_meanings: tuple[str, ...]
+
+
+SCHEDULED_SEMANTIC_CONTRACT = """
+For scheduled generation, return strictly in this exact order:
+TITLE: short Russian title
+CENTRAL_THESIS: one short sentence describing the candidate's central thesis
+CONCLUSION: one short sentence describing its final conclusion or moral
+NARRATIVE_SHAPE: a short structural description, for example "scene -> observation -> conclusion"
+KEY_MEANINGS: 3-6 short comma-separated meanings
+POST: final post
+
+The semantic fields are editorial metadata. Keep every field concise, do not quote
+whole passages from POST, and do not include them inside POST.
+""".strip()
+
+
+def _required_semantic_field(text: str, name: str, limit: int) -> str:
+    match = re.search(
+        rf"^\s*{re.escape(name)}\s*:\s*(.+?)\s*$",
+        text,
+        flags=re.I | re.M,
+    )
+    if not match:
+        raise ValueError(f"missing scheduled semantic field: {name}")
+    value = " ".join(match.group(1).replace("```", "").split()).strip()
+    if not value:
+        raise ValueError(f"empty scheduled semantic field: {name}")
+    return value[:limit]
+
+
+def parse_scheduled_ai_output(text: str) -> tuple[str, str, SemanticSummary]:
+    post_marker = re.search(r"^\s*POST\s*:\s*", text, flags=re.I | re.M)
+    if not post_marker:
+        raise ValueError("missing scheduled POST field")
+    metadata = text[:post_marker.start()]
+    post = text[post_marker.end():].strip().replace("```", "").strip()
+    if not post:
+        raise ValueError("empty scheduled POST field")
+
+    title = _required_semantic_field(metadata, "TITLE", 160).strip('"')
+    central_thesis = _required_semantic_field(metadata, "CENTRAL_THESIS", 200)
+    conclusion = _required_semantic_field(metadata, "CONCLUSION", 200)
+    narrative_shape = _required_semantic_field(metadata, "NARRATIVE_SHAPE", 120)
+    raw_meanings = _required_semantic_field(metadata, "KEY_MEANINGS", 360)
+    key_meanings = tuple(
+        item.strip()[:60]
+        for item in re.split(r"[,;]", raw_meanings)
+        if item.strip()
+    )[:6]
+    if len(key_meanings) < 3:
+        raise ValueError("scheduled semantic summary needs at least 3 key meanings")
+
+    return title, post, SemanticSummary(
+        central_thesis=central_thesis,
+        conclusion=conclusion,
+        narrative_shape=narrative_shape,
+        key_meanings=key_meanings,
+    )
+
+
 def generate_post_sync(
     mode: str,
     content: str,
@@ -2565,8 +2641,13 @@ def generate_post_sync(
     source_name: str = "",
     source_url: str = "",
     platform: str = "telegram",
+    *,
+    semantic_contract: bool = False,
+    allow_internal_retry: bool = True,
 ) -> dict[str, Any]:
     prompt = build_prompt(mode, frequency, platform)
+    if semantic_contract:
+        prompt = f"{prompt}\n\n{SCHEDULED_SEMANTIC_CONTRACT}"
     input_text = (
         f"MODE: {mode}\n"
         f"FREQUENCY: {frequency}\n"
@@ -2574,19 +2655,26 @@ def generate_post_sync(
         f"SOURCE_URL: {source_url}\n"
         f"CONTENT:\n{content}"
     )
+    semantic_summary: SemanticSummary | None = None
 
     try:
         raw = call_ai(prompt, input_text, max_output_tokens=1200, model=OPENAI_POST_MODEL)
-        title, post = parse_ai_output(raw)
+        if semantic_contract:
+            title, post, semantic_summary = parse_scheduled_ai_output(raw)
+        else:
+            title, post = parse_ai_output(raw)
 
-        if too_much_english(post):
+        if allow_internal_retry and too_much_english(post):
             raw = call_ai(
                 prompt + "\n\nПредыдущий вариант оставил слишком много английского. Перепиши полностью по-русски.",
                 input_text,
                 max_output_tokens=1200,
                 model=OPENAI_POST_MODEL,
             )
-            title, post = parse_ai_output(raw)
+            if semantic_contract:
+                title, post, semantic_summary = parse_scheduled_ai_output(raw)
+            else:
+                title, post = parse_ai_output(raw)
 
         post = inject_rubric_header(mode, frequency, post)
 
@@ -2610,6 +2698,7 @@ def generate_post_sync(
         "source_url": source_url,
         "frequency": frequency,
         "publish_score": 8 if mode != "manual" else 7,
+        "semantic_summary": semantic_summary,
     }
 
 
@@ -2667,13 +2756,33 @@ async def generate_scheduled_draft(
             source_name,
             source_url,
             platform,
+            semantic_contract=True,
+            allow_internal_retry=False,
         )
+        semantic_summary = draft.get("semantic_summary")
+        if not isinstance(semantic_summary, SemanticSummary):
+            raise RuntimeError(
+                "scheduled candidate blocked before retry: missing semantic summary"
+            )
         ok, quality_reason = quality_check(str(draft.get("post") or ""))
-        last_reason = quality_reason if not ok else semantic_repetition_reason(
-            str(draft["post"]),
-            recent_posts,
+        decision = (
+            SemanticGateDecision(
+                accepted=False,
+                reason=quality_reason,
+                central_thesis=semantic_summary.central_thesis,
+                conclusion=semantic_summary.conclusion,
+                narrative_shape=semantic_summary.narrative_shape,
+                key_meanings=semantic_summary.key_meanings,
+            )
+            if not ok
+            else semantic_gate_decision(
+                str(draft["post"]),
+                recent_posts,
+                semantic_summary,
+            )
         )
-        if ok and not last_reason:
+        last_reason = decision.reason
+        if decision.accepted:
             return await asyncio.to_thread(
                 save_draft,
                 draft["mode"],
@@ -2685,12 +2794,10 @@ async def generate_scheduled_draft(
                 draft["publish_score"],
             )
         if attempt + 1 < SCHEDULED_GENERATION_ATTEMPTS:
-            attempt_content = (
-                f"{content}\n\n"
-                "BOUNDED RETRY: the previous candidate was blocked before saving "
-                f"because of {last_reason}. Do not paraphrase it. Return to the "
-                f"selected semantic theme '{semantic_theme}', choose a different "
-                "concrete scene and make the central conclusion materially different."
+            attempt_content = build_semantic_retry_content(
+                content,
+                semantic_theme,
+                decision,
             )
     raise RuntimeError(
         f"scheduled draft blocked after {SCHEDULED_GENERATION_ATTEMPTS} bounded attempts: "
@@ -3527,6 +3634,47 @@ def semantic_repetition_reason(
         if len(shared) >= 12 and union and len(shared) / len(union) >= 0.38:
             return "near_duplicate_semantics"
     return ""
+
+
+def semantic_gate_decision(
+    post: str,
+    recent_posts: list[str],
+    summary: SemanticSummary,
+) -> SemanticGateDecision:
+    reason = semantic_repetition_reason(post, recent_posts)
+    return SemanticGateDecision(
+        accepted=not reason,
+        reason=reason,
+        central_thesis=summary.central_thesis,
+        conclusion=summary.conclusion,
+        narrative_shape=summary.narrative_shape,
+        key_meanings=summary.key_meanings,
+    )
+
+
+def build_semantic_retry_content(
+    original_content: str,
+    semantic_theme: str,
+    decision: SemanticGateDecision,
+) -> str:
+    key_meanings = "; ".join(decision.key_meanings)
+    return (
+        f"{original_content}\n\n"
+        "BOUNDED RETRY: the previous candidate was blocked before saving. "
+        f"REASON: {decision.reason}\n\n"
+        "SAFE SEMANTIC SUMMARY OF THE REJECTED CANDIDATE:\n"
+        f"CENTRAL_THESIS: {decision.central_thesis}\n"
+        f"CONCLUSION: {decision.conclusion}\n"
+        f"NARRATIVE_SHAPE: {decision.narrative_shape}\n"
+        f"KEY_MEANINGS: {key_meanings}\n\n"
+        "Hard constraints:\n"
+        "- Do not repeat or paraphrase that central thesis.\n"
+        "- Do not repeat that conclusion or moral.\n"
+        "- Do not reuse that narrative shape.\n"
+        "- Do not rebuild the post from the same set of key meanings.\n"
+        f"- Stay within the selected semantic theme '{semantic_theme}', but use "
+        "a different concrete scene and reach a substantially different conclusion."
+    )
 
 
 def choose_schedule_slot(schedule: list[dict[str, Any]], recent_key: str, now: datetime | None = None) -> dict[str, Any]:

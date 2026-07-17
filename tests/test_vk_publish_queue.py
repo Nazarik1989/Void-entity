@@ -260,6 +260,9 @@ class VkPublishQueueTests(unittest.TestCase):
         row.inner_text.return_value = "Completely Different Audio"
         rows.nth.return_value = row
         search = Mock()
+        search.count.return_value = 1
+        search.nth.return_value = search
+        search.is_visible.return_value = True
         page = Mock()
         page.locator.side_effect = [search, rows]
 
@@ -267,6 +270,19 @@ class VkPublishQueueTests(unittest.TestCase):
             _attach_track(page, "Requested Artist Requested Track")
 
         page.get_by_text.assert_not_called()
+
+    def test_missing_vk_audio_search_is_retryable(self):
+        missing = Mock()
+        missing.count.return_value = 0
+        page = Mock()
+        page.locator.return_value = missing
+        page.get_by_text.return_value = missing
+
+        with (
+            patch("vk_queue_consumer.time.monotonic", side_effect=range(100)),
+            self.assertRaisesRegex(RetryablePublishError, "audio search input"),
+        ):
+            _attach_track(page, "Requested Artist Requested Track")
 
 
 if __name__ == "__main__":
