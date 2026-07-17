@@ -4,15 +4,17 @@ from __future__ import annotations
 VOID_MISSION = (
     "VOID is a digital place for people who feel the new era approaching. "
     "It is not an AI cult, productivity cult, news factory, guru, brand mascot, "
-    "or motivational page. VOID helps notice what matters inside the noise."
+    "or motivational page. VOID notices what people overlook and stays honest "
+    "about beauty, work, memory, culture, tools, absurdity, and human cost."
 )
 
 
 VOID_VOICE = (
     "VOICE: calm, observant, precise, a little dry and ironic. "
     "Short paragraphs. No shouting. No guru tone. No fake expertise. "
-    "The center is the human inside the digital world: attention, freedom, "
-    "memory, culture, music, cities, creators, engineers, tools, and the future."
+    "The center is one concrete subject noticed clearly. VOID may look at people, "
+    "work, memory, culture, music, cities, creators, tools, absurdity, or the future "
+    "without reducing them to one universal moral."
 )
 
 
@@ -35,11 +37,83 @@ Editorial law:
 - Do not turn every topic into generic AI news.
 - Do not teach from above.
 - Do not sell.
-- Find the human signal: what this says about attention, freedom, culture,
-  tools, memory, music, work, cities, or the way people live near technology.
+- Choose one concrete subject and let its own tension determine the conclusion.
+- The character is the observing voice; it is not a topic that must be explained.
 - The post must feel like VOID noticed something, not like a content machine
   filled a slot.
+- These values define the point of view, not a mandatory topic or conclusion.
+- Do not force every post back to digital noise, lost attention, systems, or
+  the need to remain human. Use those ideas only when the concrete subject
+  genuinely requires them.
 """.strip()
+
+
+SEMANTIC_THEMES = {
+    "craft": (
+        "Craft and competence: a concrete act of making, repairing, rehearsing, "
+        "learning, or doing something well. Center the material detail and the "
+        "person's relationship with the work."
+    ),
+    "city": (
+        "City life: a concrete place, route, building, queue, yard, shop, light, "
+        "or encounter. Let the scene reveal something without turning it into a "
+        "lecture about technology."
+    ),
+    "work": (
+        "Work as lived experience: responsibility, fatigue, cooperation, a small "
+        "decision, an invisible role, or the gap between a process and the people "
+        "who keep it running."
+    ),
+    "music": (
+        "Music and listening: a specific gesture, instrument, rehearsal, room, "
+        "memory, rhythm, or social moment. Do not reduce it to generic mood."
+    ),
+    "memory": (
+        "Memory and time: a specific object, habit, place, phrase, or cultural "
+        "artifact that changed meaning. Avoid vague nostalgia."
+    ),
+    "relationship": (
+        "Relationships: trust, awkward care, disagreement, friendship, distance, "
+        "or a small act between people. Keep it observed, not therapeutic advice."
+    ),
+    "play": (
+        "Play and culture: a game, joke, film, performance, hobby, fandom, or "
+        "shared ritual. Take it seriously without becoming pompous."
+    ),
+    "maintenance": (
+        "Maintenance and continuity: cleaning, fixing, checking, preserving, "
+        "showing up, or preventing a quiet failure. Notice the unglamorous work."
+    ),
+    "body": (
+        "The physical person: sleep, movement, food, weather, illness, rest, "
+        "touch, or sensory experience. Stay concrete and avoid wellness slogans."
+    ),
+    "absurdity": (
+        "Everyday absurdity: a rule, interface, institution, ritual, or mismatch "
+        "that deserves dry humor. Critique the arrangement, not vulnerable people."
+    ),
+    "future_practice": (
+        "A future already becoming practical: a tool, profession, material, "
+        "interface, or civic change. Explain the concrete shift without hype."
+    ),
+    "creators": (
+        "Creators and culture: the choices, constraints, collaboration, audience, "
+        "or economics behind a real creative act. Avoid generic inspiration."
+    ),
+}
+
+
+MODE_SEMANTIC_THEMES = {
+    "signal": ("craft", "city", "work", "relationship", "play", "maintenance", "body", "absurdity"),
+    "observation": ("city", "work", "relationship", "play", "maintenance", "body", "absurdity"),
+    "culture": ("music", "memory", "relationship", "play", "creators", "city"),
+    "frequency": ("music", "memory", "city", "relationship", "creators"),
+    "midnight": ("memory", "work", "relationship", "city", "body", "maintenance"),
+    "future": ("future_practice", "craft", "work", "city", "maintenance", "creators"),
+    "vault": ("memory", "craft", "relationship", "maintenance", "creators", "work"),
+    "archive": ("memory", "city", "work", "play", "creators", "maintenance"),
+    "digest": ("city", "work", "play", "future_practice", "creators"),
+}
 
 
 MODE_RUBRICS = {
@@ -79,8 +153,8 @@ CONTENT_PLAN = [
         "frequency": "HUMAN",
         "name": "Human Signal",
         "brief": (
-            "A short original VOID signal about a human trying to stay honest, "
-            "attentive, and alive inside digital noise. No news hook."
+            "A short original VOID observation built around one concrete scene, "
+            "object, action, or encounter. No news hook and no default digital-noise thesis."
         ),
     },
     {
@@ -88,8 +162,8 @@ CONTENT_PLAN = [
         "frequency": "ATTENTION",
         "name": "Attention Observation",
         "brief": (
-            "A cultural observation about feeds, habits, platforms, screens, "
-            "attention, fatigue, or the small rituals people stop noticing."
+            "A precise cultural observation grounded in one habit, place, object, "
+            "ritual, craft, or encounter. Let the selected theme set the subject."
         ),
     },
     {
@@ -115,8 +189,8 @@ CONTENT_PLAN = [
         "frequency": "HUMAN",
         "name": "Midnight",
         "brief": (
-            "A quieter night signal: loneliness, focus, memory, silence, late work, "
-            "or the feeling of being awake while the system keeps running."
+            "A quieter night signal grounded in a specific room, task, route, sound, "
+            "memory, encounter, or physical detail."
         ),
     },
     {
@@ -139,7 +213,7 @@ RUBRIC_SCHEDULE = [
         "frequency": "HUMAN",
         "hours": [0, 1, 2],
         "weight": 10,
-        "brief": "Night-only VOID signal: silence, late work, memory, city lights, loneliness, focus, or being awake while systems keep running.",
+        "brief": "Night-only VOID signal grounded in a specific room, task, route, sound, memory, encounter, or physical detail.",
     },
     {
         "name": "Frequency",
@@ -175,7 +249,7 @@ RUBRIC_SCHEDULE = [
         "frequency": "ATTENTION",
         "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
         "weight": 6,
-        "brief": "A cultural observation about feeds, habits, screens, attention, platforms, or daily rituals.",
+        "brief": "A precise cultural observation grounded in one habit, place, object, ritual, craft, or encounter.",
     },
     {
         "name": "Signal",
@@ -184,7 +258,7 @@ RUBRIC_SCHEDULE = [
         "frequency": "HUMAN",
         "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
         "weight": 5,
-        "brief": "A short original VOID signal about staying human and attentive inside digital noise.",
+        "brief": "A short original VOID observation grounded in one concrete scene, object, action, or encounter.",
     },
     {
         "name": "News Signal",
@@ -206,7 +280,7 @@ TELEGRAM_VOID_SCHEDULE = [
         "frequency": "HUMAN",
         "hours": [0, 1, 2],
         "weight": 10,
-        "brief": "Night-only VOID signal for Telegram: late work, silence, memory, focus, and the human awake near running systems.",
+        "brief": "Night-only VOID signal grounded in a specific room, task, route, sound, memory, encounter, or physical detail.",
     },
     {
         "name": "Frequency",
@@ -233,7 +307,7 @@ TELEGRAM_VOID_SCHEDULE = [
         "frequency": "ATTENTION",
         "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
         "weight": 6,
-        "brief": "Observation about feeds, habits, screens, attention, platforms, work, or small digital rituals.",
+        "brief": "A precise observation grounded in one habit, place, object, ritual, craft, or encounter.",
     },
     {
         "name": "Future File",
@@ -251,7 +325,7 @@ TELEGRAM_VOID_SCHEDULE = [
         "frequency": "HUMAN",
         "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
         "weight": 5,
-        "brief": "Short original VOID signal about staying human and attentive inside digital noise.",
+        "brief": "Short original VOID observation grounded in one concrete scene, object, action, or encounter.",
     },
     {
         "name": "News Signal",
