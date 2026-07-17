@@ -133,8 +133,16 @@ class FakeSidebands:
         if control:
             await control.close()
 
+    async def hangup_call(self, call_id):
+        self.events.append(f"hangup_call:{call_id}")
+
     async def close(self):
         self.controls.clear()
+
+
+class RecoverySidebands(FakeSidebands):
+    async def attach(self, **kwargs):
+        raise RuntimeError("sideband is already closed")
 
 
 class VoiceHubSecurityTests(unittest.IsolatedAsyncioTestCase):
@@ -228,6 +236,28 @@ class VoiceHubSecurityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(first, second)
         self.assertEqual(len(self.void_adapter.calls), 1)
+
+    async def test_recovery_hangs_up_before_delivering_saved_summary(self) -> None:
+        started = await self.service.start_session("telegram", self.launch(), "void")
+        await self.service.bind_call(
+            started["session_id"], "telegram", self.launch(), "rtc_1234567890"
+        )
+        self.store.save_server_summary(started["session_id"], "Сохранённый серверный итог")
+        recovery_sidebands = RecoverySidebands()
+        recovery_service = VoiceHubService(
+            self.config,
+            FakeTokenProvider(),
+            verifiers={"telegram": TelegramLaunchVerifier(BOT_TOKEN)},
+            persona_adapters={"naz": self.naz_adapter, "void": self.void_adapter},
+            store=VoiceHubStore(self.config.state_db_path),
+            sidebands=recovery_sidebands,
+        )
+        await recovery_service.recover()
+        self.assertEqual(
+            recovery_sidebands.events,
+            ["hangup_call:rtc_1234567890"],
+        )
+        self.assertEqual(self.store.get(started["session_id"]).state, "finished")
 
 
 class FixedModelAndContractTests(unittest.TestCase):

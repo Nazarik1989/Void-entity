@@ -10,7 +10,7 @@ from collections import Counter
 from typing import Any, Awaitable, Callable
 from urllib.parse import quote
 
-from aiohttp import ClientError, ClientSession, ClientTimeout, WSMsgType
+from aiohttp import ClientError, ClientSession, ClientTimeout, ClientWSTimeout, WSMsgType
 
 
 CALL_ID_RE = re.compile(r"^rtc_[A-Za-z0-9_-]{8,200}$")
@@ -20,6 +20,31 @@ REALTIME_CALLS_URL = "https://api.openai.com/v1/realtime/calls"
 
 class SidebandError(RuntimeError):
     pass
+
+
+async def hangup_realtime_call(
+    client_session: ClientSession, api_key: str, call_id: str
+) -> None:
+    if not CALL_ID_RE.fullmatch(call_id):
+        raise SidebandError("Invalid Realtime call ID")
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            async with client_session.post(
+                f"{REALTIME_CALLS_URL}/{quote(call_id, safe='')}/hangup",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=ClientTimeout(total=10),
+            ) as response:
+                if response.status in {200, 404}:
+                    return
+                last_error = SidebandError("OpenAI rejected Realtime hangup")
+        except (asyncio.TimeoutError, ClientError) as exc:
+            last_error = SidebandError("Realtime hangup request failed")
+            last_error.__cause__ = exc
+        if attempt == 0:
+            await asyncio.sleep(0.2)
+    assert last_error is not None
+    raise last_error
 
 
 def extract_response_text(response: dict[str, Any]) -> str:
@@ -82,7 +107,7 @@ class SidebandControl:
                 REALTIME_SIDEBAND_URL + quote(self.call_id, safe=""),
                 headers={"Authorization": f"Bearer {self.api_key}"},
                 heartbeat=20,
-                timeout=ClientTimeout(total=10),
+                timeout=ClientWSTimeout(ws_receive=None, ws_close=5),
             )
         except (asyncio.TimeoutError, ClientError) as exc:
             raise SidebandError("Could not connect Realtime sideband") from exc
@@ -231,23 +256,7 @@ class SidebandControl:
 
     async def hangup(self) -> None:
         self._closing = True
-        last_error: Exception | None = None
-        for attempt in range(2):
-            try:
-                async with self._client_session.post(
-                    f"{REALTIME_CALLS_URL}/{quote(self.call_id, safe='')}/hangup",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                ) as response:
-                    if response.status in {200, 404}:
-                        return
-                    last_error = SidebandError("OpenAI rejected Realtime hangup")
-            except (asyncio.TimeoutError, ClientError) as exc:
-                last_error = SidebandError("Realtime hangup request failed")
-                last_error.__cause__ = exc
-            if attempt == 0:
-                await asyncio.sleep(0.2)
-        assert last_error is not None
-        raise last_error
+        await hangup_realtime_call(self._client_session, self.api_key, self.call_id)
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -309,7 +318,9 @@ class SidebandManager:
                     raise SidebandError("Hub session is already bound to another call")
                 return existing
             if self._client_session is None:
-                self._client_session = ClientSession(timeout=ClientTimeout(total=15))
+                self._client_session = ClientSession(
+                    timeout=ClientTimeout(total=None, sock_connect=10)
+                )
             control = SidebandControl(
                 api_key=self._api_key,
                 hub_session_id=hub_session_id,
@@ -334,6 +345,13 @@ class SidebandManager:
 
     def get(self, hub_session_id: str) -> SidebandControl | None:
         return self._controls.get(hub_session_id)
+
+    async def hangup_call(self, call_id: str) -> None:
+        if self._client_session is None:
+            self._client_session = ClientSession(
+                timeout=ClientTimeout(total=None, sock_connect=10)
+            )
+        await hangup_realtime_call(self._client_session, self._api_key, call_id)
 
     async def remove(self, hub_session_id: str) -> None:
         async with self._lock:

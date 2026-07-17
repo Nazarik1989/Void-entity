@@ -528,13 +528,11 @@ class VoiceHubService:
                 elif session.state == "finalizing":
                     await self._finalize(session.session_id, reason="recovery")
             except Exception:
-                if session.summary:
-                    try:
-                        await self._finalize(session.session_id, reason="recovery")
-                    except Exception:
-                        pass
+                if session.summary or session.expires_at <= now:
+                    await self._sidebands.hangup_call(session.call_id)
+                    await self._finalize(session.session_id, reason="recovery")
                 else:
-                    self._store.abandon(session.session_id, "sideband_recovery_failed")
+                    raise SidebandError("Active Realtime call recovery failed")
 
 
 def _json_error(code: str, status: int) -> web.Response:
