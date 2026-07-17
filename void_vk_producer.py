@@ -8,9 +8,15 @@ import re
 from pathlib import Path
 
 import main
-from vk_publish_queue import build_job, enqueue_job, recent_track_keys
+from vk_publish_queue import (
+    build_job,
+    enqueue_job,
+    publication_receipts,
+    recent_track_keys,
+)
 
 QUEUE_DIR = Path(os.getenv("VK_PUBLISH_QUEUE_DIR", "/var/lib/void-vk-publisher/queue"))
+VOID_DRAFT_SOURCE_RE = re.compile(r"^void:draft:(\d+)$")
 
 
 def parse_scheduled_draft_id(response: str) -> int:
@@ -18,6 +24,25 @@ def parse_scheduled_draft_id(response: str) -> int:
     if not match:
         raise RuntimeError("Scheduled draft response did not return a draft id")
     return int(match.group(1))
+
+
+def sync_published_drafts() -> list[int]:
+    published_now: list[int] = []
+    for receipt in publication_receipts(QUEUE_DIR, producer="void"):
+        match = VOID_DRAFT_SOURCE_RE.fullmatch(receipt["source_ref"])
+        if not match:
+            continue
+        draft_id = int(match.group(1))
+        draft = main.get_draft(draft_id)
+        if not draft:
+            continue
+        if main.mark_published(draft_id):
+            main.apply_character_event(
+                main.character_event_for_mode(str(draft["mode"] or ""))
+            )
+            main.apply_character_event("publish")
+            published_now.append(draft_id)
+    return published_now
 
 
 def enqueue_draft(draft_id: int) -> Path:
@@ -41,6 +66,7 @@ def enqueue_draft(draft_id: int) -> Path:
 
 
 def produce_scheduled() -> Path:
+    sync_published_drafts()
     response = asyncio.run(main.make_scheduled_rubric_draft_once())
     draft_id = parse_scheduled_draft_id(response)
     path = enqueue_draft(draft_id)
@@ -52,13 +78,16 @@ def main_cli() -> None:
     parser = argparse.ArgumentParser(description="VOID VK queue producer")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("produce-scheduled")
+    sub.add_parser("sync-published")
     draft = sub.add_parser("enqueue-draft")
     draft.add_argument("draft_id", type=int)
     args = parser.parse_args()
     if args.command == "produce-scheduled":
         produce_scheduled()
-    else:
+    elif args.command == "enqueue-draft":
         print(enqueue_draft(args.draft_id))
+    else:
+        print(f"Synced published VOID drafts: {len(sync_published_drafts())}")
 
 
 if __name__ == "__main__":

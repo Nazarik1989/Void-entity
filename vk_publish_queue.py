@@ -24,6 +24,12 @@ MAX_TRACK_QUERY_LENGTH = 300
 MAX_DEDUPE_KEY_LENGTH = 256
 RECENT_TRACK_LIMIT = 8
 TRACK_HISTORY_FILENAME = "recent-tracks.json"
+PUBLICATION_RECEIPT_SCHEMA = "vk_publication_receipt.v1"
+PUBLICATION_RECEIPTS_DIRNAME = "published"
+PUBLICATION_RECEIPT_BACKFILL_MARKER = ".backfill-v1-complete"
+PUBLICATION_RECEIPT_FIELDS = frozenset(
+    {"schema", "job_id", "producer", "source_ref", "published_at"}
+)
 RETRY_DELAY_SECONDS = 30 * 60
 JOB_ID_RE = re.compile(r"^(naz|void)-[0-9a-f]{24}$")
 
@@ -79,6 +85,103 @@ def _record_published_track(queue_root: Path, job: dict[str, Any]) -> None:
     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(temp, 0o644)
     os.replace(temp, path)
+
+
+def _publication_receipt_path(queue_root: Path, job_id: str) -> Path:
+    return Path(queue_root) / PUBLICATION_RECEIPTS_DIRNAME / f"{job_id}.json"
+
+
+def _record_publication_receipt(queue_root: Path, job: dict[str, Any]) -> None:
+    receipts = Path(queue_root) / PUBLICATION_RECEIPTS_DIRNAME
+    receipts.mkdir(mode=0o770, parents=True, exist_ok=True)
+    receipt = {
+        "schema": PUBLICATION_RECEIPT_SCHEMA,
+        "job_id": job["job_id"],
+        "producer": job["producer"],
+        "source_ref": job["source_ref"],
+        "published_at": _utc_now(),
+    }
+    final = _publication_receipt_path(queue_root, job["job_id"])
+    temp = receipts / f".{job['job_id']}.tmp-{uuid.uuid4().hex}"
+    temp.write_text(
+        json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(temp, 0o640)
+    os.replace(temp, final)
+
+
+def publication_receipts(
+    queue_root: Path,
+    *,
+    producer: str | None = None,
+) -> list[dict[str, str]]:
+    if producer is not None and producer not in PRODUCERS:
+        raise QueueValidationError("unknown receipt producer")
+    receipts = Path(queue_root) / PUBLICATION_RECEIPTS_DIRNAME
+    if not receipts.exists():
+        return []
+    if not receipts.is_dir() or receipts.is_symlink():
+        raise QueueValidationError("publication receipt directory is unavailable")
+    result: list[dict[str, str]] = []
+    for path in sorted(receipts.glob("*.json")):
+        if not path.is_file() or path.is_symlink():
+            raise QueueValidationError("invalid publication receipt path")
+        try:
+            receipt = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise QueueValidationError("publication receipt is unavailable") from exc
+        if not isinstance(receipt, dict) or set(receipt) != PUBLICATION_RECEIPT_FIELDS:
+            raise QueueValidationError("invalid publication receipt fields")
+        if receipt["schema"] != PUBLICATION_RECEIPT_SCHEMA:
+            raise QueueValidationError("unknown publication receipt schema")
+        if (
+            not isinstance(receipt["job_id"], str)
+            or not JOB_ID_RE.fullmatch(receipt["job_id"])
+            or not isinstance(receipt["producer"], str)
+            or receipt["producer"] not in PRODUCERS
+            or not isinstance(receipt["source_ref"], str)
+            or not receipt["source_ref"]
+            or not isinstance(receipt["published_at"], str)
+        ):
+            raise QueueValidationError("invalid publication receipt")
+        try:
+            published_at = datetime.fromisoformat(
+                receipt["published_at"].replace("Z", "+00:00")
+            )
+        except ValueError as exc:
+            raise QueueValidationError("invalid publication timestamp") from exc
+        if published_at.tzinfo is None:
+            raise QueueValidationError("publication timestamp must include timezone")
+        if producer is None or receipt["producer"] == producer:
+            result.append(
+                {key: str(receipt[key]) for key in PUBLICATION_RECEIPT_FIELDS}
+            )
+    return result
+
+
+def _backfill_publication_receipts(
+    queue_root: Path,
+    allowed_group_id: str,
+) -> None:
+    queue_root = Path(queue_root)
+    receipts = queue_root / PUBLICATION_RECEIPTS_DIRNAME
+    marker = receipts / PUBLICATION_RECEIPT_BACKFILL_MARKER
+    if marker.is_file() and not marker.is_symlink():
+        return
+    done = queue_root / "done"
+    for job_dir in sorted(done.iterdir()):
+        if not job_dir.is_dir() or job_dir.is_symlink():
+            continue
+        job = validate_job(job_dir, allowed_group_id)
+        receipt_path = _publication_receipt_path(queue_root, job["job_id"])
+        if not receipt_path.exists():
+            _record_publication_receipt(queue_root, job)
+    receipts.mkdir(mode=0o770, parents=True, exist_ok=True)
+    temp = receipts / f".backfill-v1.tmp-{uuid.uuid4().hex}"
+    temp.write_text(_utc_now() + "\n", encoding="utf-8")
+    os.chmod(temp, 0o640)
+    os.replace(temp, marker)
 
 
 def _ensure_track_is_fresh(queue_root: Path, track_query: str) -> None:
@@ -238,6 +341,8 @@ def requeue_failed(queue_root: Path, job_id: str, allowed_group_id: str) -> Path
     source = queue_root / "failed" / job_id
     if source.is_symlink() or not source.is_dir():
         raise QueueValidationError("failed job not found")
+    if _publication_receipt_path(queue_root, job_id).is_file():
+        raise DuplicateJobError("published job cannot be requeued")
     job = validate_job(source, allowed_group_id)
     if job["job_id"] != job_id:
         raise QueueValidationError("job_id mismatch")
@@ -255,6 +360,7 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
     queue_root = Path(queue_root)
     for state in STATES:
         (queue_root / state).mkdir(parents=True, exist_ok=True)
+    _backfill_publication_receipts(queue_root, allowed_group_id)
     for source in sorted((queue_root / "pending").iterdir()):
         if not source.is_dir() or source.is_symlink() or source.name.startswith("."):
             continue
@@ -280,6 +386,7 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
                 continue
             _ensure_track_is_fresh(queue_root, job["track_query"])
             publish(job, [processing / name for name in job["media"]])
+            _record_publication_receipt(queue_root, job)
             _record_published_track(queue_root, job)
             if retry_file.exists() and not retry_file.is_symlink():
                 retry_file.unlink()
