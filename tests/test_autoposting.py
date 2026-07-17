@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -12,6 +13,7 @@ import void_vk_producer
 
 from main import (
     SemanticSummary,
+    SCHEDULED_RESPONSE_SCHEMA,
     VOID_TO_NAZ_FORBIDDEN_OPENINGS,
     VOID_TO_NAZ_OPENING_OPTIONS,
     build_void_to_naz_exchange_payload,
@@ -386,19 +388,52 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
         save.assert_not_called()
 
     async def test_semantic_metadata_is_not_part_of_publishable_post(self) -> None:
-        raw = (
-            "TITLE: Тест\n"
-            "CENTRAL_THESIS: центральный тезис\n"
-            "CONCLUSION: итоговый вывод\n"
-            "NARRATIVE_SHAPE: сцена -> наблюдение -> вывод\n"
-            "KEY_MEANINGS: ремесло, контроль, терпение\n"
-            "POST: Публикуемый текст."
+        raw = json.dumps(
+            {
+                "title": "Тест",
+                "central_thesis": "центральный тезис",
+                "conclusion": "итоговый вывод",
+                "narrative_shape": "сцена -> наблюдение -> вывод",
+                "key_meanings": ["ремесло", "контроль", "терпение"],
+                "post": "Публикуемый текст.",
+            },
+            ensure_ascii=False,
         )
         _, post, summary = parse_scheduled_ai_output(raw)
         self.assertEqual(post, "Публикуемый текст.")
         self.assertEqual(summary.central_thesis, "центральный тезис")
         self.assertNotIn("CENTRAL_THESIS", post)
         self.assertNotIn("KEY_MEANINGS", post)
+
+    async def test_scheduled_generation_requests_strict_response_schema(self) -> None:
+        structured_output = json.dumps(
+            {
+                "title": "Тест",
+                "central_thesis": "центральный тезис",
+                "conclusion": "итоговый вывод",
+                "narrative_shape": "сцена -> наблюдение -> вывод",
+                "key_meanings": ["ремесло", "контроль", "терпение"],
+                "post": "Тестовый русский текст. " * 20,
+            },
+            ensure_ascii=False,
+        )
+        with (
+            patch("main.recent_scheduled_posts", return_value=[]),
+            patch("main.call_ai", return_value=structured_output) as call_ai_mock,
+            patch("main.save_draft", return_value=77),
+        ):
+            await generate_scheduled_draft(
+                mode="signal",
+                content="content",
+                frequency="HUMAN",
+                source_name="VOID",
+                source_url="manual://vk/schedule/signal/test",
+                platform="vk",
+                semantic_theme="craft",
+            )
+        request = call_ai_mock.call_args.kwargs
+        self.assertIs(request["response_schema"], SCHEDULED_RESPONSE_SCHEMA)
+        self.assertEqual(request["response_schema_name"], "scheduled_void_post")
 
     async def test_one_retry_can_succeed_and_only_accepted_draft_is_saved(self) -> None:
         with (
