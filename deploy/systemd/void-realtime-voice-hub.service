@@ -8,7 +8,7 @@ Requires=naz-realtime-adapter.service
 Type=simple
 User=voicehub
 Group=voicehub-ipc
-WorkingDirectory=/opt/void_entity_release_20260713
+WorkingDirectory=/opt/void_voice_hub_current
 EnvironmentFile=/opt/void_entity_release_20260713/.env
 Environment=PYTHONUNBUFFERED=1
 Environment=OPENAI_REALTIME_MODEL=gpt-realtime-2.1
@@ -20,7 +20,7 @@ Environment=DB_PATH=/opt/void_entity_release_20260713/void.db
 StateDirectory=void-realtime-voice-hub
 StateDirectoryMode=0700
 UMask=0077
-ExecStart=/opt/void_entity_release_20260713/venv/bin/python /opt/void_entity_release_20260713/realtime_voice_hub.py
+ExecStart=/opt/void_voice_hub_current/venv/bin/python /opt/void_voice_hub_current/realtime_voice_hub.py
 Restart=on-failure
 RestartSec=5
 NoNewPrivileges=true
