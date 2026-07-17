@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from hashlib import sha256
-from itertools import product
 from typing import Any, Iterable
 
 import content_formats
@@ -37,7 +35,6 @@ FORMATS = ("тихое наблюдение", "разговор с Naz", "пис
 HOOKS = ("деталь", "пауза", "парадокс", "вопрос без давления", "образ", "сухая констатация")
 MEDIA = ("кинематографический кадр", "архивный артефакт", "диптих Naz/VOID", "городская фотография", "абстрактная метафора", "музыкальная сцена")
 
-COOLDOWN = {"facet": 2, "intent": 2, "format": 3, "hook": 3, "media": 2}
 AXES = ("energy", "warmth", "tension", "curiosity", "confidence", "sociability")
 
 
@@ -149,8 +146,16 @@ def set_axis(raw: dict[str, Any] | CharacterState | None, axis: str, value: int)
     return state
 
 
-def _recently_used(recent: list[dict[str, Any]], key: str, value: str, depth: int) -> bool:
-    return any(str(item.get(key, "")) == value for item in recent[-depth:])
+def _next_axis_value(
+    values: tuple[str, ...],
+    history: list[dict[str, Any]],
+    key: str,
+) -> str:
+    for item in reversed(history):
+        previous = str(item.get(key, ""))
+        if previous in values:
+            return values[(values.index(previous) + 1) % len(values)]
+    return values[0]
 
 
 def plan_content(
@@ -162,25 +167,10 @@ def plan_content(
 ) -> dict[str, str]:
     state = raw_state if isinstance(raw_state, CharacterState) else normalize_state(raw_state)
     history = list(recent)
-    candidates = list(product(INTENTS, FORMATS, HOOKS, MEDIA))
-    seed = int(sha256(f"{topic}|{platform}|{state.revision}".encode("utf-8")).hexdigest()[:12], 16)
-
-    def score(candidate: tuple[str, str, str, str]) -> tuple[int, int]:
-        intent, content_format, hook, media = candidate
-        values = {"intent": intent, "format": content_format, "hook": hook, "media": media}
-        novelty = sum(5 for key, value in values.items() if not _recently_used(history, key, value, COOLDOWN[key]))
-        if state.facet == "guardian" and intent == "предостеречь":
-            novelty += 3
-        if state.facet == "cultural_guide" and media in {"музыкальная сцена", "городская фотография"}:
-            novelty += 3
-        if state.facet == "old_trickster" and hook in {"парадокс", "сухая констатация"}:
-            novelty += 3
-        if state.facet == "companion" and content_format in {"тихое наблюдение", "маленькая притча"}:
-            novelty += 3
-        tie = (seed ^ int(sha256("|".join(candidate).encode("utf-8")).hexdigest()[:12], 16)) % 1_000_000
-        return novelty, tie
-
-    intent, content_format, hook, media = max(candidates, key=score)
+    intent = _next_axis_value(INTENTS, history, "intent")
+    content_format = _next_axis_value(FORMATS, history, "format")
+    hook = _next_axis_value(HOOKS, history, "hook")
+    media = _next_axis_value(MEDIA, history, "media")
     delivery = content_formats.choose_format(
         history,
         platform=platform,
@@ -229,6 +219,19 @@ def prompt_context(state: CharacterState, plan: dict[str, str]) -> str:
             "Keep VOID's character, but do not force the result back to digital noise, "
             "lost attention, systems, or 'remaining human'.\n"
         )
+    editorial_context = ""
+    if str(plan.get("meaning_key", "")).strip():
+        editorial_context = (
+            "SELECTED EDITORIAL AXES (hard constraints, never print these labels):\n"
+            f"THOUGHT DIRECTION: {plan['meaning_thought']}\n"
+            f"MORAL / CONCLUSION DIRECTION: {plan['moral_axis']}\n"
+            f"NARRATIVE SHAPE: {plan['narrative_instruction']}\n"
+            f"CONCRETE SCENE FAMILY: {plan['scene_instruction']}\n"
+            "Invent one specific scene inside that family. Do not substitute a generic "
+            "reflection for the scene. The conclusion must arise from this card and must "
+            "not return to the usual thesis about digital noise, lost attention, systems, "
+            "or preserving humanity.\n"
+        )
     return (
         "CHARACTER STATE (это режиссура, не перечисляй параметры читателю):\n"
         f"VOID сейчас: {plan['mood']}. Активная грань: {plan['facet']} — {plan['facet_instruction']}\n"
@@ -236,6 +239,7 @@ def prompt_context(state: CharacterState, plan: dict[str, str]) -> str:
         f"Контент-формат: {plan['content_format_label']} ({plan['content_kind']}) — {plan['production_brief']}.\n"
         f"Визуальное направление: {plan['media']}. Площадка: {plan['platform']}.\n"
         f"{theme_context}"
+        f"{editorial_context}"
         "VOID remains an adult, observant, warm and dryly ironic character. "
         "That is a point of view, not a compulsory sermon or recurring conclusion. "
         "Он не против технологий, не всезнающий гуру и не обязан выигрывать спор с Naz. "

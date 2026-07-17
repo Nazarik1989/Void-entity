@@ -17,10 +17,13 @@ from main import (
     VOID_TO_NAZ_FORBIDDEN_OPENINGS,
     VOID_TO_NAZ_OPENING_OPTIONS,
     build_void_to_naz_exchange_payload,
+    build_character_directive,
     build_rubric_header,
     build_prompt,
     clean_source_lines,
     choose_vk_music_track,
+    choose_schedule_slot,
+    choose_semantic_theme,
     current_void_schedule_slot,
     display_source_name,
     eligible_schedule_slots,
@@ -40,6 +43,7 @@ from main import (
     repeats_default_digital_thesis,
     semantic_repetition_reason,
     semantic_theme_candidates,
+    select_editorial_axes,
     save_draft,
     track_vk_vibes,
     too_much_english,
@@ -48,8 +52,12 @@ from main import (
 )
 from void_core import (
     CONTENT_PLAN,
+    MEANING_CARDS,
     MODE_SEMANTIC_THEMES,
+    NARRATIVE_SHAPES,
     RUBRIC_SCHEDULE,
+    SCENE_AXES,
+    SEMANTIC_THEME_ORDER,
     TELEGRAM_VOID_SCHEDULE,
     VOID_CORE_PROMPT,
 )
@@ -103,21 +111,120 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertNotIn("The center is the human inside the digital world", VOID_CORE_PROMPT)
         self.assertIn("one concrete subject", VOID_CORE_PROMPT)
 
-    def test_semantic_theme_cooldown_happens_before_generation(self) -> None:
-        recent = [
-            {"semantic_theme": "body"},
-            {"semantic_theme": "craft"},
-            {"semantic_theme": "city"},
-            {"semantic_theme": "work"},
-            {"semantic_theme": "relationship"},
-            {"semantic_theme": "play"},
+    def test_semantic_themes_follow_a_full_deterministic_cycle(self) -> None:
+        recent: list[dict[str, str]] = []
+        selected: list[str] = []
+        expected = [
+            theme
+            for theme in SEMANTIC_THEME_ORDER
+            if theme in MODE_SEMANTIC_THEMES["signal"]
         ]
-        candidates = semantic_theme_candidates("signal", recent)
-        self.assertTrue(candidates)
-        current_cooldown = {item["semantic_theme"] for item in recent[-5:]}
-        self.assertTrue(set(candidates).isdisjoint(current_cooldown))
-        self.assertIn("body", candidates)
+        for _ in expected:
+            theme = choose_semantic_theme("signal", recent)
+            selected.append(theme)
+            recent.append({"semantic_theme": theme})
+        self.assertEqual(selected, expected)
+        self.assertEqual(choose_semantic_theme("signal", recent), expected[0])
+        self.assertEqual(semantic_theme_candidates("signal", recent)[0], expected[0])
         self.assertGreaterEqual(len(MODE_SEMANTIC_THEMES["signal"]), 6)
+
+    def test_meaning_moral_narrative_and_scene_axes_rotate(self) -> None:
+        history: list[dict[str, str]] = []
+        selections = []
+        for _ in range(4):
+            axes = select_editorial_axes("craft", history)
+            selections.append(axes)
+            history.append(axes)
+
+        craft_keys = [card["key"] for card in MEANING_CARDS["craft"]]
+        self.assertEqual(
+            [item["meaning_key"] for item in selections],
+            craft_keys + [craft_keys[0]],
+        )
+        self.assertEqual(
+            [item["narrative_shape"] for item in selections],
+            [item["key"] for item in NARRATIVE_SHAPES[:4]],
+        )
+        self.assertEqual(
+            [item["scene_axis"] for item in selections],
+            [item["key"] for item in SCENE_AXES[:4]],
+        )
+
+    def test_every_semantic_theme_has_three_distinct_meaning_cards(self) -> None:
+        self.assertEqual(set(MEANING_CARDS), set(SEMANTIC_THEME_ORDER))
+        all_keys = []
+        for theme in SEMANTIC_THEME_ORDER:
+            cards = MEANING_CARDS[theme]
+            self.assertEqual(len(cards), 3)
+            self.assertTrue(all(card["thought"] and card["moral"] for card in cards))
+            all_keys.extend(card["key"] for card in cards)
+        self.assertEqual(len(all_keys), 36)
+        self.assertEqual(len(set(all_keys)), 36)
+
+    def test_unpublished_draft_does_not_advance_any_editorial_axis(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            database_path = os.path.join(temp_dir, "void-test.db")
+            with patch("main.DB_PATH", database_path):
+                init_db()
+                _, first, directive = build_character_directive(
+                    "test",
+                    "vk",
+                    "signal",
+                    False,
+                    "craft",
+                )
+                draft_id = save_draft(
+                    "signal",
+                    "test",
+                    "placeholder",
+                    "VOID scheduled rubric",
+                    "manual://vk/schedule/signal/test",
+                    "HUMAN",
+                )
+                record_content_signature(first, "test topic", draft_id)
+
+                _, before_publish, _ = build_character_directive(
+                    "test",
+                    "vk",
+                    "signal",
+                    False,
+                    "craft",
+                )
+                self.assertEqual(
+                    before_publish["meaning_key"],
+                    first["meaning_key"],
+                )
+
+                mark_published(draft_id)
+                _, after_publish, _ = build_character_directive(
+                    "test",
+                    "vk",
+                    "signal",
+                    False,
+                    "craft",
+                )
+
+        self.assertIn("SELECTED EDITORIAL AXES", directive)
+        self.assertNotEqual(after_publish["meaning_key"], first["meaning_key"])
+        self.assertNotEqual(
+            after_publish["narrative_shape"],
+            first["narrative_shape"],
+        )
+        self.assertNotEqual(after_publish["scene_axis"], first["scene_axis"])
+
+    def test_schedule_rotation_is_ordered_not_random(self) -> None:
+        noon = datetime(2026, 7, 17, 13, 30)
+        first = choose_schedule_slot(RUBRIC_SCHEDULE, [], noon)
+        second = choose_schedule_slot(RUBRIC_SCHEDULE, [first["name"]], noon)
+        third = choose_schedule_slot(
+            RUBRIC_SCHEDULE,
+            [first["name"], second["name"]],
+            noon,
+        )
+        self.assertEqual(
+            [first["name"], second["name"], third["name"]],
+            ["Future File", "Observation", "Signal"],
+        )
 
     def test_semantic_gate_catches_the_recurring_thesis_not_one_word(self) -> None:
         candidate = (

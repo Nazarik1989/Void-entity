@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from hashlib import sha256
 from typing import Any, Iterable
 
 
@@ -29,14 +28,22 @@ def choose_format(recent: Iterable[dict[str, Any]], *, platform: str, energy: in
     history = list(recent)
     candidates = [item for item in FORMAT_REGISTRY if platform in item["platforms"] and energy >= int(item["min_energy"]) and (include_production or bool(item["ready"])) and (has_private_thought or not bool(item.get("requires_context")))]
     if not candidates: candidates = [item for item in FORMAT_REGISTRY if platform in item["platforms"] and item["ready"]]
-    recent_keys = [str(item.get("content_format", "")) for item in history[-8:]]
-    recent_kinds = [str(item.get("content_kind", "")) for item in history[-3:]]
-    seed = int(sha256(seed_key.encode("utf-8")).hexdigest()[:12], 16)
-    def score(item: dict[str, Any]) -> tuple[int, int]:
-        novelty = (8 if item["key"] not in recent_keys else 0) + (3 if item["kind"] not in recent_kinds else 0)
-        tie = (seed ^ int(sha256(str(item["key"]).encode()).hexdigest()[:12], 16)) % 1_000_000
-        return novelty, tie
-    return dict(max(candidates, key=score))
+    candidate_by_key = {str(item["key"]): item for item in candidates}
+    registry_keys = [str(item["key"]) for item in FORMAT_REGISTRY]
+    previous = next(
+        (
+            str(item.get("content_format", ""))
+            for item in reversed(history)
+            if str(item.get("content_format", "")) in registry_keys
+        ),
+        "",
+    )
+    start = registry_keys.index(previous) + 1 if previous else 0
+    for offset in range(len(registry_keys)):
+        key = registry_keys[(start + offset) % len(registry_keys)]
+        if key in candidate_by_key:
+            return dict(candidate_by_key[key])
+    return dict(candidates[0])
 
 
 def production_backlog(platform: str) -> list[dict[str, Any]]:

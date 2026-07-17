@@ -116,6 +116,297 @@ MODE_SEMANTIC_THEMES = {
 }
 
 
+SEMANTIC_THEME_ORDER = tuple(SEMANTIC_THEMES)
+
+
+MEANING_CARDS = {
+    "craft": (
+        {
+            "key": "craft_accumulated_skill",
+            "thought": "Visible ease is usually compressed repetition, correction, and patience.",
+            "moral": "End with respect for earned competence, not a slogan about talent.",
+        },
+        {
+            "key": "craft_repair_truth",
+            "thought": "Repair reveals what an object, system, or person was designed to survive.",
+            "moral": "Conclude that preserving something can be as creative as making it new.",
+        },
+        {
+            "key": "craft_constraint_style",
+            "thought": "A real limitation can produce a recognizable method instead of merely reducing options.",
+            "moral": "Let the conclusion show how style can grow from a negotiated constraint.",
+        },
+    ),
+    "city": (
+        {
+            "key": "city_shared_route",
+            "thought": "A route works because strangers repeatedly honor a small shared arrangement.",
+            "moral": "Conclude through coordination and mutual predictability, not urban loneliness.",
+        },
+        {
+            "key": "city_leftover_space",
+            "thought": "People finish architecture by inventing uses for spaces that plans left undefined.",
+            "moral": "End with the idea that lived use can complete an official design.",
+        },
+        {
+            "key": "city_threshold_behavior",
+            "thought": "Entrances, queues, crossings, and waiting areas reveal how a place distributes trust.",
+            "moral": "Make the conclusion about a concrete social agreement visible at the threshold.",
+        },
+    ),
+    "work": (
+        {
+            "key": "work_invisible_coordination",
+            "thought": "Many good outcomes belong to handoffs and quiet coordination rather than one hero.",
+            "moral": "Conclude by recognizing distributed responsibility.",
+        },
+        {
+            "key": "work_failure_ownership",
+            "thought": "The revealing moment in a process is who notices, names, and repairs a small failure.",
+            "moral": "End on accountability as an action, not a declaration.",
+        },
+        {
+            "key": "work_sustainable_pace",
+            "thought": "A pace that can be repeated may be more professional than a dramatic burst.",
+            "moral": "Conclude that endurance is part of quality, without turning it into productivity advice.",
+        },
+    ),
+    "music": (
+        {
+            "key": "music_collective_timing",
+            "thought": "Shared timing is a form of attention between people, not only technical accuracy.",
+            "moral": "End with listening as coordination rather than private mood.",
+        },
+        {
+            "key": "music_imperfect_presence",
+            "thought": "A small imperfection can prove that a performance is responding to this room and this moment.",
+            "moral": "Conclude with presence, not nostalgia for authenticity.",
+        },
+        {
+            "key": "music_changed_listener",
+            "thought": "The same recording changes when the listener's circumstances change.",
+            "moral": "Let the conclusion belong to the new listening situation, not to the track as magic.",
+        },
+    ),
+    "memory": (
+        {
+            "key": "memory_object_reassigned",
+            "thought": "An ordinary object changes meaning when responsibility for it passes to another person.",
+            "moral": "Conclude that inheritance can be a task rather than a sentimental possession.",
+        },
+        {
+            "key": "memory_reconstruction",
+            "thought": "Remembering is an active reconstruction shaped by the present need.",
+            "moral": "End with uncertainty used honestly, without vague nostalgia.",
+        },
+        {
+            "key": "memory_useful_forgetting",
+            "thought": "Forgetting can remove noise while leaving one durable detail that still guides action.",
+            "moral": "Conclude with selection and proportion, not a demand to preserve everything.",
+        },
+    ),
+    "relationship": (
+        {
+            "key": "relationship_small_reliability",
+            "thought": "Trust often grows through unremarkable acts that keep happening when nobody applauds.",
+            "moral": "End with reliability made concrete, not advice about communication.",
+        },
+        {
+            "key": "relationship_respectful_disagreement",
+            "thought": "A disagreement can protect a relationship when both people refuse to simplify each other.",
+            "moral": "Conclude with preserved complexity rather than forced agreement.",
+        },
+        {
+            "key": "relationship_distance_as_care",
+            "thought": "Sometimes care is expressed by giving another person room to act without supervision.",
+            "moral": "End with chosen distance as trust, not emotional withdrawal.",
+        },
+    ),
+    "play": (
+        {
+            "key": "play_safe_failure",
+            "thought": "Play creates a bounded place where failure can become information instead of identity.",
+            "moral": "Conclude with experimentation, not a claim that life is a game.",
+        },
+        {
+            "key": "play_rules_create_freedom",
+            "thought": "A good rule can create more surprising freedom by making expectations shared.",
+            "moral": "End with the productive tension between boundary and invention.",
+        },
+        {
+            "key": "play_serious_hobby",
+            "thought": "A hobby can hold standards, memory, and community without needing to become a career.",
+            "moral": "Conclude that value does not require monetization.",
+        },
+    ),
+    "maintenance": (
+        {
+            "key": "maintenance_invisible_prevention",
+            "thought": "Successful prevention is difficult to notice because the expected failure never arrives.",
+            "moral": "End by making invisible care legible without glorifying exhaustion.",
+        },
+        {
+            "key": "maintenance_distributed_continuity",
+            "thought": "Continuity depends on small checks distributed across people and time.",
+            "moral": "Conclude with continuity as a shared practice, not one person's sacrifice.",
+        },
+        {
+            "key": "maintenance_routine_care",
+            "thought": "A repeated practical routine can carry care more reliably than a dramatic gesture.",
+            "moral": "End on the meaning inside the action itself, without sentimental explanation.",
+        },
+    ),
+    "body": (
+        {
+            "key": "body_limit_as_information",
+            "thought": "A physical limit is information about conditions, not automatically a personal failure.",
+            "moral": "Conclude with adjustment and accuracy, not wellness advice.",
+        },
+        {
+            "key": "body_sensory_knowledge",
+            "thought": "Temperature, weight, balance, smell, and fatigue can reveal what an abstract plan omitted.",
+            "moral": "End with embodied evidence correcting an assumption.",
+        },
+        {
+            "key": "body_rest_recalibration",
+            "thought": "Rest changes perception and judgment before it changes output.",
+            "moral": "Conclude with restored proportion, not rest as a reward for productivity.",
+        },
+    ),
+    "absurdity": (
+        {
+            "key": "absurdity_metric_replaces_purpose",
+            "thought": "A measurement becomes absurd when people start serving it instead of the purpose it represented.",
+            "moral": "End by exposing the inversion through one consequence, not a general rant.",
+        },
+        {
+            "key": "absurdity_rule_outlives_context",
+            "thought": "A rule can survive after the situation that justified it has disappeared.",
+            "moral": "Conclude with the cost of unexamined continuation.",
+        },
+        {
+            "key": "absurdity_interface_blames_user",
+            "thought": "Bad arrangements often translate their own contradiction into a user's alleged mistake.",
+            "moral": "End with dry clarity about responsibility, without mocking the trapped person.",
+        },
+    ),
+    "future_practice": (
+        {
+            "key": "future_routine_adoption",
+            "thought": "A future becomes real when an unfamiliar action turns into an ordinary routine.",
+            "moral": "Conclude with changed practice rather than amazement at the tool.",
+        },
+        {
+            "key": "future_new_role",
+            "thought": "A new tool matters when it creates a new responsibility, handoff, or profession around it.",
+            "moral": "End with the human role that appears, not technological destiny.",
+        },
+        {
+            "key": "future_convenience_moves_labor",
+            "thought": "Convenience rarely removes work completely; it moves work to another person or layer.",
+            "moral": "Conclude by locating the displaced labor precisely.",
+        },
+    ),
+    "creators": (
+        {
+            "key": "creators_editing_is_authorship",
+            "thought": "Selection and removal can shape a work as strongly as adding material.",
+            "moral": "End with restraint as a concrete creative decision.",
+        },
+        {
+            "key": "creators_collaboration_friction",
+            "thought": "Useful collaboration does not remove friction; it gives friction a workable form.",
+            "moral": "Conclude with negotiated difference, not harmony as the goal.",
+        },
+        {
+            "key": "creators_audience_relationship",
+            "thought": "An audience is a changing relationship with expectations, not a number waiting to grow.",
+            "moral": "End with responsibility to a specific audience without preaching engagement.",
+        },
+    ),
+}
+
+
+NARRATIVE_SHAPES = (
+    {
+        "key": "scene_tension_reversal",
+        "instruction": "Open inside a concrete scene, reveal its tension, reverse the first interpretation, then conclude.",
+    },
+    {
+        "key": "object_biography",
+        "instruction": "Follow one object through use, wear, transfer, or repair until its changed meaning becomes visible.",
+    },
+    {
+        "key": "two_people_contrast",
+        "instruction": "Contrast two people's actions in the same situation without declaring either one a caricature.",
+    },
+    {
+        "key": "process_anatomy",
+        "instruction": "Trace a short process step by step and let one overlooked handoff produce the conclusion.",
+    },
+    {
+        "key": "expectation_observation_gap",
+        "instruction": "Set up a reasonable expectation, show the observed mismatch, and conclude from the mismatch.",
+    },
+    {
+        "key": "same_detail_before_after",
+        "instruction": "Return to the same physical detail before and after a small change; let the contrast carry the thought.",
+    },
+    {
+        "key": "rule_and_exception",
+        "instruction": "Show a rule through one ordinary case, then use a precise exception to expose its real purpose or flaw.",
+    },
+    {
+        "key": "open_observation",
+        "instruction": "Build from several precise observations toward a restrained, non-totalizing open conclusion.",
+    },
+)
+
+
+SCENE_AXES = (
+    {
+        "key": "workbench_or_kitchen",
+        "instruction": "Use a real workbench, kitchen, studio table, tool, material, or pair of hands in action.",
+    },
+    {
+        "key": "transit_or_threshold",
+        "instruction": "Use a station, crossing, entrance, corridor, elevator, route, or other threshold in use.",
+    },
+    {
+        "key": "backstage_or_rehearsal",
+        "instruction": "Use preparation before an audience arrives: rehearsal, setup, soundcheck, edit, or reset.",
+    },
+    {
+        "key": "service_or_maintenance",
+        "instruction": "Use a repair, inspection, cleaning, delivery, checklist, or quiet prevention task.",
+    },
+    {
+        "key": "home_at_an_exact_hour",
+        "instruction": "Use a domestic scene anchored to an exact hour, physical task, sound, light, or temperature.",
+    },
+    {
+        "key": "public_queue_or_shop",
+        "instruction": "Use a shop, counter, queue, waiting room, market, or public service interaction.",
+    },
+    {
+        "key": "weather_meets_body",
+        "instruction": "Use weather as a physical condition affecting movement, clothing, work, rest, or perception.",
+    },
+    {
+        "key": "archive_or_carried_object",
+        "instruction": "Use a document, recording, photograph, ticket, note, device, or inherited everyday object.",
+    },
+    {
+        "key": "team_handoff",
+        "instruction": "Use a concrete handoff between two people, shifts, roles, or stages of work.",
+    },
+    {
+        "key": "interface_or_institutional_ritual",
+        "instruction": "Use one form, button, rule, sign, script, meeting ritual, or institutional mismatch.",
+    },
+)
+
+
 MODE_RUBRICS = {
     "signal": "SIGNAL",
     "news": "SIGNAL",
