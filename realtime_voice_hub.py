@@ -297,7 +297,7 @@ class OpenAIRealtimeTokenProvider:
 
 @dataclass(frozen=True)
 class SummaryEnvelope:
-    idempotency_key: str
+    session_id: str
     platform: str
     user_id: str
     persona: str
@@ -479,7 +479,7 @@ class VoiceHubService:
                 if reason != "server_limit":
                     await control.hangup()
             envelope = SummaryEnvelope(
-                idempotency_key=session.session_id,
+                session_id=session.session_id,
                 platform=session.platform,
                 user_id=session.user_id,
                 persona=session.persona,

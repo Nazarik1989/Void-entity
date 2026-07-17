@@ -85,7 +85,7 @@ class RecordingAdapter:
     async def deliver(self, envelope) -> str:
         self.calls.append(envelope)
         await asyncio.sleep(0)
-        return f"receipt:{envelope.idempotency_key}"
+        return f"receipt:{envelope.session_id}"
 
 
 class FakeControl:
@@ -212,6 +212,7 @@ class VoiceHubSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attach["expected_realtime_session_id"], "sess_server_bound")
         envelope = self.void_adapter.calls[0]
         self.assertEqual(envelope.user_id, str(self.user_id))
+        self.assertEqual(envelope.session_id, started["session_id"])
         self.assertEqual(envelope.persona, "void")
         self.assertEqual(envelope.summary, "Серверный итог")
         self.assertEqual(self.sidebands.events[:2], ["summary", "hangup"])
@@ -269,12 +270,13 @@ class FixedModelAndContractTests(unittest.TestCase):
         self.assertNotIn("mini", json.dumps(payload).casefold())
 
     def test_client_authority_fields_are_rejected(self) -> None:
-        with self.assertRaises(VoiceHubError):
-            _validate_fields(
-                {"platform": "telegram", "launch_data": "x", "summary": "client"},
-                required={"platform", "launch_data"},
-                allowed={"platform", "launch_data"},
-            )
+        for field in ("summary", "session_id", "user_id"):
+            with self.subTest(field=field), self.assertRaises(VoiceHubError):
+                _validate_fields(
+                    {"platform": "telegram", "launch_data": "x", field: "client"},
+                    required={"platform", "launch_data"},
+                    allowed={"platform", "launch_data"},
+                )
 
     def test_environment_cannot_override_model(self) -> None:
         env = {
