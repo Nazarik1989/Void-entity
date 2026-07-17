@@ -28,7 +28,7 @@ class VoidCharacterStateTests(unittest.TestCase):
         self.assertGreater(changed.energy, 42)
         self.assertGreater(changed.curiosity, 68)
 
-    def test_planner_respects_recent_shape_cooldowns(self) -> None:
+    def test_planner_advances_every_editorial_axis(self) -> None:
         recent = [{
             "intent": "наблюдать",
             "format": "тихое наблюдение",
@@ -41,6 +41,20 @@ class VoidCharacterStateTests(unittest.TestCase):
         self.assertNotEqual(plan["format"], "тихое наблюдение")
         self.assertNotEqual(plan["hook"], "деталь")
         self.assertNotEqual(plan["media"], "кинематографический кадр")
+
+    def test_planner_axes_complete_their_declared_cycles(self) -> None:
+        history = []
+        intents = []
+        for index in range(len(character.INTENTS)):
+            plan = character.plan_content(
+                character.CharacterState(),
+                history,
+                topic=f"topic-{index}",
+                platform="telegram",
+            )
+            intents.append(plan["intent"])
+            history.append(plan)
+        self.assertEqual(intents, list(character.INTENTS))
 
     def test_prompt_allows_void_to_be_wise_without_becoming_infallible(self) -> None:
         state = character.CharacterState()

@@ -36,10 +36,14 @@ import duo_relationship
 import gaming_vertical
 from void_core import (
     CONTENT_PLAN,
+    MEANING_CARDS,
     MODE_SEMANTIC_THEMES,
     MODE_RUBRICS,
+    NARRATIVE_SHAPES,
     RUBRIC_SCHEDULE,
+    SCENE_AXES,
     SEMANTIC_THEMES,
+    SEMANTIC_THEME_ORDER,
     TELEGRAM_VOID_SCHEDULE,
     VOID_CORE_PROMPT,
     platform_context,
@@ -347,12 +351,17 @@ def init_db() -> None:
         draft_id INTEGER,
         character_id TEXT NOT NULL,
         platform TEXT NOT NULL,
+        mode TEXT NOT NULL DEFAULT '',
         facet TEXT NOT NULL,
         intent TEXT NOT NULL,
         format TEXT NOT NULL,
         content_format TEXT NOT NULL DEFAULT 'text_story',
         content_kind TEXT NOT NULL DEFAULT 'text',
         semantic_theme TEXT NOT NULL DEFAULT '',
+        meaning_key TEXT NOT NULL DEFAULT '',
+        moral_axis TEXT NOT NULL DEFAULT '',
+        scene_axis TEXT NOT NULL DEFAULT '',
+        narrative_shape TEXT NOT NULL DEFAULT '',
         hook TEXT NOT NULL,
         media TEXT NOT NULL,
         topic TEXT NOT NULL,
@@ -369,6 +378,18 @@ def init_db() -> None:
         cur.execute("ALTER TABLE content_signatures ADD COLUMN semantic_theme TEXT NOT NULL DEFAULT ''")
     if "draft_id" not in signature_columns:
         cur.execute("ALTER TABLE content_signatures ADD COLUMN draft_id INTEGER")
+    for column in (
+        "mode",
+        "meaning_key",
+        "moral_axis",
+        "scene_axis",
+        "narrative_shape",
+    ):
+        if column not in signature_columns:
+            cur.execute(
+                f"ALTER TABLE content_signatures "
+                f"ADD COLUMN {column} TEXT NOT NULL DEFAULT ''"
+            )
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_void_signatures_created ON content_signatures(character_id, id)")
 
@@ -794,9 +815,11 @@ def get_recent_content_signatures(limit: int = 16) -> list[dict[str, str]]:
     conn = db()
     rows = conn.execute(
         """
-        SELECT signatures.platform, signatures.facet, signatures.intent,
+        SELECT signatures.platform, signatures.mode, signatures.facet, signatures.intent,
                signatures.format, signatures.content_format,
                signatures.content_kind, signatures.semantic_theme,
+               signatures.meaning_key, signatures.moral_axis,
+               signatures.scene_axis, signatures.narrative_shape,
                signatures.hook, signatures.media, signatures.topic,
                signatures.created_at
         FROM content_signatures AS signatures
@@ -821,20 +844,26 @@ def record_content_signature(
     conn.execute(
         """
         INSERT INTO content_signatures(
-            draft_id, character_id, platform, facet, intent, format, content_format, content_kind,
-            semantic_theme, hook, media, topic, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            draft_id, character_id, platform, mode, facet, intent, format,
+            content_format, content_kind, semantic_theme, meaning_key,
+            moral_axis, scene_axis, narrative_shape, hook, media, topic, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(draft_id),
             void_character.CHARACTER_ID,
             str(plan.get("platform", "telegram")),
+            str(plan.get("mode", "")),
             str(plan.get("facet", "observer")),
             str(plan.get("intent", "наблюдать")),
             str(plan.get("format", "тихое наблюдение")),
             str(plan.get("content_format", "text_story")),
             str(plan.get("content_kind", "text")),
             str(plan.get("semantic_theme", "")),
+            str(plan.get("meaning_key", "")),
+            str(plan.get("moral_axis", "")),
+            str(plan.get("scene_axis", "")),
+            str(plan.get("narrative_shape", "")),
             str(plan.get("hook", "деталь")),
             str(plan.get("media", "кинематографический кадр")),
             topic[:1000],
@@ -879,17 +908,25 @@ def build_character_directive(
         state = apply_character_event(event)
     else:
         state = void_character.apply_event(load_character_state(), event)
+    recent_signatures = get_recent_content_signatures()
     plan = void_character.plan_content(
         state,
-        get_recent_content_signatures(),
+        recent_signatures,
         topic=topic,
         platform=platform,
     )
+    plan["mode"] = mode
     if semantic_theme:
         if semantic_theme not in SEMANTIC_THEMES:
             raise ValueError("unknown semantic theme")
         plan["semantic_theme"] = semantic_theme
         plan["semantic_theme_instruction"] = SEMANTIC_THEMES[semantic_theme]
+        plan.update(
+            select_editorial_axes(
+                semantic_theme,
+                recent_signatures,
+            )
+        )
     return state, plan, void_character.prompt_context(state, plan)
 
 
@@ -3655,36 +3692,112 @@ def schedule_recent_value(recent_key: str, slot_name: str) -> str:
 
 
 SCHEDULED_GENERATION_ATTEMPTS = 2
-SEMANTIC_THEME_COOLDOWN = 5
 SEMANTIC_HISTORY_LIMIT = 8
+
+
+def _cycle_after(
+    values: list[str],
+    previous: str,
+) -> list[str]:
+    if not values:
+        return []
+    if previous not in values:
+        return list(values)
+    start = values.index(previous) + 1
+    return values[start:] + values[:start]
+
+
+def _last_published_axis(
+    recent_signatures: list[dict[str, str]],
+    key: str,
+    allowed: set[str],
+) -> str:
+    return next(
+        (
+            str(item.get(key, ""))
+            for item in reversed(recent_signatures)
+            if str(item.get(key, "")) in allowed
+        ),
+        "",
+    )
 
 
 def semantic_theme_candidates(
     mode: str,
     recent_signatures: list[dict[str, str]] | None = None,
 ) -> list[str]:
-    allowed = list(
+    allowed = set(
         MODE_SEMANTIC_THEMES.get(
             mode,
             ("craft", "city", "work", "relationship", "play", "maintenance", "body", "absurdity"),
         )
     )
-    recent = [
-        str(item.get("semantic_theme", ""))
-        for item in list(recent_signatures or [])[-SEMANTIC_THEME_COOLDOWN:]
-        if str(item.get("semantic_theme", ""))
-    ]
-    available = [theme for theme in allowed if theme not in recent]
-    if available:
-        return available
-    return [theme for theme in allowed if theme not in recent[-2:]] or allowed
+    history = list(recent_signatures or [])
+    previous = _last_published_axis(
+        history,
+        "semantic_theme",
+        set(SEMANTIC_THEME_ORDER),
+    )
+    rotated = _cycle_after(list(SEMANTIC_THEME_ORDER), previous)
+    return [theme for theme in rotated if theme in allowed]
 
 
 def choose_semantic_theme(
     mode: str,
     recent_signatures: list[dict[str, str]] | None = None,
 ) -> str:
-    return random.choice(semantic_theme_candidates(mode, recent_signatures))
+    candidates = semantic_theme_candidates(mode, recent_signatures)
+    if not candidates:
+        raise ValueError(f"no semantic themes configured for mode: {mode}")
+    return candidates[0]
+
+
+def select_editorial_axes(
+    semantic_theme: str,
+    recent_signatures: list[dict[str, str]] | None = None,
+) -> dict[str, str]:
+    history = list(recent_signatures or [])
+    cards = list(MEANING_CARDS.get(semantic_theme, ()))
+    if not cards:
+        raise ValueError(f"no meaning cards configured for theme: {semantic_theme}")
+    card_keys = [str(card["key"]) for card in cards]
+    previous_card = _last_published_axis(
+        history,
+        "meaning_key",
+        set(card_keys),
+    )
+    card_by_key = {str(card["key"]): card for card in cards}
+    card = card_by_key[_cycle_after(card_keys, previous_card)[0]]
+
+    narrative_keys = [str(item["key"]) for item in NARRATIVE_SHAPES]
+    previous_narrative = _last_published_axis(
+        history,
+        "narrative_shape",
+        set(narrative_keys),
+    )
+    narrative_key = _cycle_after(narrative_keys, previous_narrative)[0]
+    narrative = next(
+        item for item in NARRATIVE_SHAPES if item["key"] == narrative_key
+    )
+
+    scene_keys = [str(item["key"]) for item in SCENE_AXES]
+    previous_scene = _last_published_axis(
+        history,
+        "scene_axis",
+        set(scene_keys),
+    )
+    scene_key = _cycle_after(scene_keys, previous_scene)[0]
+    scene = next(item for item in SCENE_AXES if item["key"] == scene_key)
+
+    return {
+        "meaning_key": str(card["key"]),
+        "meaning_thought": str(card["thought"]),
+        "moral_axis": str(card["moral"]),
+        "narrative_shape": narrative_key,
+        "narrative_instruction": str(narrative["instruction"]),
+        "scene_axis": scene_key,
+        "scene_instruction": str(scene["instruction"]),
+    }
 
 
 def recent_scheduled_posts(platform: str, limit: int = SEMANTIC_HISTORY_LIMIT) -> list[str]:
@@ -3804,33 +3917,51 @@ def build_semantic_retry_content(
     )
 
 
-def choose_schedule_slot(schedule: list[dict[str, Any]], recent_key: str, now: datetime | None = None) -> dict[str, Any]:
+def _published_schedule_names(
+    schedule: list[dict[str, Any]],
+    platform: str,
+) -> list[str]:
+    name_by_mode = {
+        str(slot.get("mode", "")): str(slot["name"])
+        for slot in schedule
+    }
+    return [
+        name_by_mode[mode]
+        for item in get_recent_content_signatures(16)
+        if str(item.get("platform", "")) == platform
+        if (mode := str(item.get("mode", ""))) in name_by_mode
+    ]
+
+
+def choose_schedule_slot(
+    schedule: list[dict[str, Any]],
+    recent_names: list[str],
+    now: datetime | None = None,
+) -> dict[str, Any]:
     slots = eligible_schedule_slots(schedule, now)
-    recent_raw = get_setting(recent_key, "")
-    recent = [item for item in recent_raw.split(",") if item]
-    filtered = [slot for slot in slots if slot["name"] not in recent[-3:]]
+    filtered = [
+        slot for slot in slots
+        if str(slot["name"]) not in recent_names[-3:]
+    ]
     if filtered:
         slots = filtered
-    weights = [int(slot.get("weight", 1) or 1) for slot in slots]
-    slot = random.choices(slots, weights=weights, k=1)[0]
-    recent.append(str(slot["name"]))
-    set_setting(recent_key, ",".join(recent[-8:]))
-    return slot
+    return slots[0]
 
 
 def choose_scheduled_rubric(now: datetime | None = None) -> dict[str, Any]:
-    return choose_schedule_slot(RUBRIC_SCHEDULE, "rubric_recent", now)
+    return choose_schedule_slot(
+        RUBRIC_SCHEDULE,
+        _published_schedule_names(RUBRIC_SCHEDULE, "vk"),
+        now,
+    )
 
 
 def choose_telegram_schedule_slot(now: datetime | None = None) -> dict[str, Any]:
-    slots = eligible_schedule_slots(TELEGRAM_VOID_SCHEDULE, now)
-    recent_raw = get_setting("telegram_void_recent", "")
-    recent = [item for item in recent_raw.split(",") if item]
-    filtered = [slot for slot in slots if slot["name"] not in recent[-3:]]
-    if filtered:
-        slots = filtered
-    weights = [int(slot.get("weight", 1) or 1) for slot in slots]
-    return random.choices(slots, weights=weights, k=1)[0]
+    return choose_schedule_slot(
+        TELEGRAM_VOID_SCHEDULE,
+        _published_schedule_names(TELEGRAM_VOID_SCHEDULE, "telegram"),
+        now,
+    )
 
 
 def rubric_schedule_text(now: datetime | None = None) -> str:
@@ -4025,7 +4156,13 @@ async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
     except Exception as e:
         if slot.get("voice") == "news":
             fallback = await asyncio.to_thread(
-                lambda: random.choice([item for item in TELEGRAM_VOID_SCHEDULE if item.get("voice") == "void"])
+                choose_schedule_slot,
+                [
+                    item
+                    for item in TELEGRAM_VOID_SCHEDULE
+                    if item.get("voice") == "void"
+                ],
+                _published_schedule_names(TELEGRAM_VOID_SCHEDULE, "telegram"),
             )
             draft_id, editorial_plan, content_topic = await save_telegram_void_scheduled_draft(fallback)
             slot = fallback
