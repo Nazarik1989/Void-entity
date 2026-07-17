@@ -1849,14 +1849,30 @@ def call_ai(
     input_text: str,
     max_output_tokens: int = 200,
     model: str | None = None,
+    *,
+    response_schema: dict[str, Any] | None = None,
+    response_schema_name: str = "structured_response",
 ) -> str:
     client = openai_client()
 
+    request: dict[str, Any] = {
+        "model": model or OPENAI_MODEL,
+        "instructions": instructions,
+        "input": input_text,
+        "max_output_tokens": max_output_tokens,
+    }
+    if response_schema is not None:
+        request["text"] = {
+            "format": {
+                "type": "json_schema",
+                "name": response_schema_name,
+                "strict": True,
+                "schema": response_schema,
+            }
+        }
+
     response = client.responses.create(
-        model=model or OPENAI_MODEL,
-        instructions=instructions,
-        input=input_text,
-        max_output_tokens=max_output_tokens,
+        **request,
     )
 
     return response.output_text.strip()
@@ -2577,17 +2593,36 @@ class SemanticGateDecision:
 
 
 SCHEDULED_SEMANTIC_CONTRACT = """
-For scheduled generation, return strictly in this exact order:
-TITLE: short Russian title
-CENTRAL_THESIS: one short sentence describing the candidate's central thesis
-CONCLUSION: one short sentence describing its final conclusion or moral
-NARRATIVE_SHAPE: a short structural description, for example "scene -> observation -> conclusion"
-KEY_MEANINGS: 3-6 short comma-separated meanings
-POST: final post
-
-The semantic fields are editorial metadata. Keep every field concise, do not quote
-whole passages from POST, and do not include them inside POST.
+For scheduled generation, fill every field in the required response schema.
+The semantic fields are concise editorial metadata: do not quote whole passages
+from the post and do not include metadata labels inside the publishable post.
 """.strip()
+
+SCHEDULED_RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {"type": "string"},
+        "central_thesis": {"type": "string"},
+        "conclusion": {"type": "string"},
+        "narrative_shape": {"type": "string"},
+        "key_meanings": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 3,
+            "maxItems": 6,
+        },
+        "post": {"type": "string"},
+    },
+    "required": [
+        "title",
+        "central_thesis",
+        "conclusion",
+        "narrative_shape",
+        "key_meanings",
+        "post",
+    ],
+    "additionalProperties": False,
+}
 
 
 def _required_semantic_field(text: str, name: str, limit: int) -> str:
@@ -2604,7 +2639,56 @@ def _required_semantic_field(text: str, name: str, limit: int) -> str:
     return value[:limit]
 
 
+def _bounded_semantic_value(value: Any, name: str, limit: int) -> str:
+    normalized = " ".join(str(value or "").replace("```", "").split()).strip()
+    if not normalized:
+        raise ValueError(f"empty scheduled semantic field: {name}")
+    return normalized[:limit]
+
+
 def parse_scheduled_ai_output(text: str) -> tuple[str, str, SemanticSummary]:
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, dict):
+        title = _bounded_semantic_value(payload.get("title"), "title", 160).strip('"')
+        central_thesis = _bounded_semantic_value(
+            payload.get("central_thesis"),
+            "central_thesis",
+            200,
+        )
+        conclusion = _bounded_semantic_value(
+            payload.get("conclusion"),
+            "conclusion",
+            200,
+        )
+        narrative_shape = _bounded_semantic_value(
+            payload.get("narrative_shape"),
+            "narrative_shape",
+            120,
+        )
+        raw_meanings = payload.get("key_meanings")
+        if not isinstance(raw_meanings, list):
+            raise ValueError("scheduled key_meanings must be a list")
+        key_meanings = tuple(
+            _bounded_semantic_value(item, "key_meaning", 60)
+            for item in raw_meanings[:6]
+        )
+        if len(key_meanings) < 3:
+            raise ValueError("scheduled semantic summary needs at least 3 key meanings")
+        post = str(payload.get("post") or "").strip().replace("```", "").strip()
+        if not post:
+            raise ValueError("empty scheduled POST field")
+        return title, post, SemanticSummary(
+            central_thesis=central_thesis,
+            conclusion=conclusion,
+            narrative_shape=narrative_shape,
+            key_meanings=key_meanings,
+        )
+
+    # Backward-compatible parser for old fixtures and previously captured responses.
     post_marker = re.search(r"^\s*POST\s*:\s*", text, flags=re.I | re.M)
     if not post_marker:
         raise ValueError("missing scheduled POST field")
@@ -2658,7 +2742,19 @@ def generate_post_sync(
     semantic_summary: SemanticSummary | None = None
 
     try:
-        raw = call_ai(prompt, input_text, max_output_tokens=1200, model=OPENAI_POST_MODEL)
+        call_options: dict[str, Any] = {}
+        if semantic_contract:
+            call_options = {
+                "response_schema": SCHEDULED_RESPONSE_SCHEMA,
+                "response_schema_name": "scheduled_void_post",
+            }
+        raw = call_ai(
+            prompt,
+            input_text,
+            max_output_tokens=1800 if semantic_contract else 1200,
+            model=OPENAI_POST_MODEL,
+            **call_options,
+        )
         if semantic_contract:
             title, post, semantic_summary = parse_scheduled_ai_output(raw)
         else:
@@ -2668,8 +2764,9 @@ def generate_post_sync(
             raw = call_ai(
                 prompt + "\n\nПредыдущий вариант оставил слишком много английского. Перепиши полностью по-русски.",
                 input_text,
-                max_output_tokens=1200,
+                max_output_tokens=1800 if semantic_contract else 1200,
                 model=OPENAI_POST_MODEL,
+                **call_options,
             )
             if semantic_contract:
                 title, post, semantic_summary = parse_scheduled_ai_output(raw)
