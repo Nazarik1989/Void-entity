@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+import hashlib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -49,6 +50,33 @@ class VkPublishQueueTests(unittest.TestCase):
 
     def test_valid_job(self):
         self.assertEqual(validate_job(self.enqueue(), self.group)["producer"], "void")
+
+    def test_v2_policy_metadata_accepts_void_and_naz_without_transforming_v1(self):
+        def metadata(persona, persona_version, visual_version):
+            return {
+                "editorial_contract_version": "editorial-relevance.v1",
+                "persona_policy_version": persona_version,
+                "visual_code_version": visual_version,
+                "post_id": f"{persona}-" + "a" * 24,
+                "persona": persona,
+                "destination": "vk",
+                "brief_hash": hashlib.sha256(persona.encode()).hexdigest(),
+                "source_type": "scheduled_rubric",
+                "rubric": "Signal",
+                "music_required": True,
+                "reason_code": "accepted",
+            }
+
+        void_job = self.job(metadata=metadata("void", "void-persona.v2", "void-visual.v2"))
+        naz_job = self.job(
+            producer="naz",
+            dedupe_key="naz-v2",
+            source_ref="naz:scheduled",
+            metadata=metadata("naz", "naz-persona.v2.4", "naz-visual.v2"),
+        )
+        self.assertEqual(void_job["schema"], "vk_publish_job.v2")
+        self.assertEqual(naz_job["schema"], "vk_publish_job.v2")
+        self.assertEqual(self.job()["schema"], "vk_publish_job.v1")
 
     def test_every_job_requires_a_music_track(self):
         with self.assertRaisesRegex(QueueValidationError, "track_query is required"):
