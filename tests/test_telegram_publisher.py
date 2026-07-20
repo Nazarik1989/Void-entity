@@ -10,9 +10,16 @@ from main import (
     TelegramPostPackage,
     build_image_prompts_sync,
     generate_post_images_sync,
+    image_count_for_draft,
     image_visual_directions,
     publish_draft,
     send_telegram_post,
+)
+from void_core import (
+    MATERIAL_RUBRIC,
+    VOID_CANONICAL_MATERIALS,
+    VOID_CANONICAL_PALETTE,
+    VOID_VISUAL_CANON_PROMPT,
 )
 
 
@@ -20,13 +27,87 @@ class TelegramPublisherTests(unittest.IsolatedAsyncioTestCase):
     def test_primary_image_model_is_exact_openrouter_gpt_image_2_id(self) -> None:
         self.assertEqual(DEFAULT_OPENAI_IMAGE_MODEL, "openai/gpt-image-2")
 
-    def test_visual_directions_rotate_people_gender_and_people_free_scenes(self) -> None:
-        directions = [image_visual_directions(draft_id, 1)[0] for draft_id in range(8)]
+    def test_visual_directions_rotate_avatar_and_people_free_scenes(self) -> None:
+        directions = [image_visual_directions(draft_id, 1)[0] for draft_id in range(6)]
 
-        self.assertTrue(any("beautiful adult woman" in direction for direction in directions))
-        self.assertTrue(any("adult man" in direction for direction in directions))
+        self.assertTrue(any("canonical avatar" in direction for direction in directions))
         self.assertTrue(any("no people" in direction.lower() for direction in directions))
         self.assertEqual(len(directions), len(set(directions)))
+
+    def test_visual_canon_contains_exact_palette_and_materials(self) -> None:
+        self.assertEqual(
+            VOID_CANONICAL_PALETTE,
+            {
+                "Absolute Black": "#000000",
+                "Coal Black": "#080808",
+                "Graphite": "#171717",
+                "Smoke": "#2A2A2A",
+                "Ash Grey": "#696966",
+                "Bone White": "#E8E6DF",
+                "Pure White": "#FFFFFF",
+            },
+        )
+        normalized = " ".join(VOID_VISUAL_CANON_PROMPT.split())
+        for name, value in VOID_CANONICAL_PALETTE.items():
+            self.assertIn(f"{name} {value}", normalized)
+        for material in VOID_CANONICAL_MATERIALS:
+            self.assertIn(material, normalized)
+
+    def test_visual_canon_constrains_darkness_white_and_naz_code(self) -> None:
+        canon = " ".join(VOID_VISUAL_CANON_PROMPT.casefold().split())
+        self.assertIn("80–90%", canon)
+        self.assertIn("2–5%", canon)
+        self.assertIn("one source of light", canon)
+        for forbidden in (
+            "no bright blue, purple, or neon identity",
+            "no data networks",
+            "circuit diagrams",
+            "code",
+            "digital interfaces",
+            "energy rings",
+            "technological glow",
+        ):
+            self.assertIn(forbidden, canon)
+
+    def test_visual_canon_blocks_luxury_cyberpunk_and_gothic_cliches(self) -> None:
+        canon = " ".join(VOID_VISUAL_CANON_PROMPT.casefold().split())
+        for forbidden in (
+            "demonstrative luxury",
+            "gold decoration",
+            "glossy advertising interiors",
+            "supercars",
+            "bright cyberpunk",
+            "mystical runes",
+            "occult clichés",
+            "skulls",
+            "ravens",
+            "generic gothic imagery",
+            "excessive grain",
+            "large quotations",
+        ):
+            self.assertIn(forbidden, canon)
+
+    def test_material_builds_complete_four_frame_sequence_with_canon(self) -> None:
+        draft = {
+            "id": 20,
+            "mode": "material",
+            "title": "Material study",
+            "post": "A worn stone object.",
+            "source_name": "VOID",
+        }
+
+        with patch("main.call_ai", return_value="IMAGE: first composition only"):
+            prompts = build_image_prompts_sync(draft)
+
+        self.assertEqual(image_count_for_draft("material", ""), 4)
+        self.assertEqual(len(prompts), 4)
+        for index, prompt in enumerate(prompts, start=1):
+            self.assertIn(VOID_VISUAL_CANON_PROMPT, prompt)
+            self.assertIn("MATERIAL / МАТЕРИЯ", prompt)
+            self.assertIn(f"Frame {index} of 4", prompt)
+        self.assertEqual(MATERIAL_RUBRIC["duration_seconds"], (12, 20))
+        self.assertEqual(MATERIAL_RUBRIC["frame_count"], (3, 4))
+        self.assertFalse(MATERIAL_RUBRIC["scheduled"])
 
     def test_two_image_prompts_receive_distinct_mandatory_directions(self) -> None:
         draft = {

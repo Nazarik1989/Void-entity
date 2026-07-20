@@ -36,6 +36,7 @@ import duo_relationship
 import gaming_vertical
 from void_core import (
     CONTENT_PLAN,
+    MATERIAL_VISUAL_PROMPT,
     MEANING_CARDS,
     MODE_SEMANTIC_THEMES,
     MODE_RUBRICS,
@@ -46,6 +47,7 @@ from void_core import (
     SEMANTIC_THEME_ORDER,
     TELEGRAM_VOID_SCHEDULE,
     VOID_CORE_PROMPT,
+    VOID_VISUAL_CANON_PROMPT,
     platform_context,
 )
 
@@ -1985,6 +1987,8 @@ def clean_source_lines(post: str) -> str:
 
 def image_count_for_draft(mode: str, post: str) -> int:
     text = post or ""
+    if mode == "material":
+        return 4
     if mode == "digest":
         return 2
     if len(text) > 1100 and len(re.findall(r"\n\s*\d+[\.\)]", text)) >= 2:
@@ -1993,37 +1997,43 @@ def image_count_for_draft(mode: str, post: str) -> int:
 
 
 IMAGE_VISUAL_STYLES = (
-    "cinematic documentary photography with natural light and an observational composition",
-    "surreal editorial photography with restrained practical effects and unusual scale",
-    "architectural minimalism with strong geometry, negative space, and precise lighting",
-    "tactile still-life photography with macro details, real materials, and shallow depth of field",
-    "atmospheric analog-film photography with subtle grain and an unexpected camera angle",
-    "high-end editorial collage combining photography, paper texture, and clean abstract forms",
-    "sculptural studio photography with bold silhouettes, reflective materials, and controlled light",
-    "wide environmental photography with layered depth, weather, and a strong sense of place",
+    "low-key cinematic photography with a quiet observational composition",
+    "architectural minimalism with deep negative space and one precise practical light",
+    "tactile still-life photography with macro material detail and deep natural shadow",
+    "restrained editorial photography built around a single meaningful object",
+    "quiet environmental photography with layered darkness and concealed spatial depth",
+    "sculptural photography using black glass or water reflections and a single soft light",
 )
 
 IMAGE_SUBJECT_ROTATION = (
-    "Feature a beautiful adult woman as the central subject; make her distinctive, confident, tasteful, and non-sexualized.",
-    "Show no people, faces, silhouettes, or humanoid figures; tell the story through place, objects, light, and atmosphere.",
-    "Feature an adult man as the central subject with a distinctive age, appearance, wardrobe, and expression.",
-    "Feature a beautiful adult woman with a clearly different appearance, age, hairstyle, wardrobe, and camera angle from a generic recurring heroine; keep the portrayal tasteful and non-sexualized.",
-    "Show no people or human-like characters; use architecture, landscape, machinery, or symbolic objects as the subject.",
-    "Feature a small mixed-gender group of clearly distinct adults in a candid scene rather than a posed hero portrait.",
-    "Feature an older adult woman with a memorable, intelligent presence; portray beauty through character, expression, and cinematic light.",
-    "Avoid a central character entirely; build an abstract or environmental composition tied directly to the post topic.",
+    "If VOID appears, reveal only part of the canonical avatar's mature face or grounded silhouette while preserving its identity anchors.",
+    "Show no people, faces, silhouettes, or humanoid figures; tell the story through one worn object, space, light, and atmosphere.",
+    "Use a hand, sleeve, or partial reflection as a trace of the canonical VOID character, never a newly invented hero.",
+    "Show no people or human-like characters; use a threshold, window, black water, or smoked-glass reflection tied to the topic.",
+    "Let the canonical VOID avatar remain mostly concealed at the visible-hidden boundary; the gaze observes and does not perform.",
+    "Avoid a central person entirely; reveal one meaningful object through texture and a single source of light.",
 )
 
 
-def image_visual_directions(draft_id: int, count: int) -> list[str]:
+MATERIAL_FRAME_DIRECTIONS = (
+    "Frame 1 of 4: begin in spatial darkness; only the first narrow trace of the single light source is visible.",
+    "Frame 2 of 4: let the same narrow light reveal the object's worn material texture, while most of it remains hidden.",
+    "Frame 3 of 4: reveal a partial image of the same central object and the marks of time, touch, and use.",
+    "Frame 4 of 4: let the object recede toward darkness again, leaving only a restrained reflection or afterimage.",
+)
+
+
+def image_visual_directions(draft_id: int, count: int, mode: str = "") -> list[str]:
+    if mode == "material":
+        return list(MATERIAL_FRAME_DIRECTIONS[:max(0, min(count, 4))])
+
     directions = []
     for index in range(max(0, count)):
         rotation_index = draft_id + index * 3
         style = IMAGE_VISUAL_STYLES[rotation_index % len(IMAGE_VISUAL_STYLES)]
         subject = IMAGE_SUBJECT_ROTATION[rotation_index % len(IMAGE_SUBJECT_ROTATION)]
         directions.append(
-            f"Use {style}. {subject} Keep a subtle VOID identity through controlled contrast and a restrained dark accent, "
-            "but do not reuse a recurring face or character design."
+            f"Use {style}. {subject} Follow the canonical VOID identity and its visible-hidden boundary."
         )
     return directions
 
@@ -2035,7 +2045,8 @@ def build_image_prompts_sync(draft: dict | sqlite3.Row) -> list[str]:
     post = draft["post"] or ""
     source_name = draft["source_name"] or ""
     count = image_count_for_draft(mode, post)
-    visual_directions = image_visual_directions(draft_id, count)
+    visual_directions = image_visual_directions(draft_id, count, mode)
+    mode_visual_prompt = MATERIAL_VISUAL_PROMPT if mode == "material" else ""
 
     instructions = """
 You are an art director for a Telegram channel called VOID.
@@ -2044,15 +2055,14 @@ Return only lines in this format:
 IMAGE: prompt
 
 Rules:
-- Return 1 or 2 IMAGE lines, no extra text.
+- Return exactly NEEDED_IMAGES IMAGE lines, no extra text.
 - The image must be relevant to the post's concrete topic.
 - Avoid text, logos, UI screenshots, brand marks, and fake article pages.
 - Avoid depicting a real named person unless the post is specifically about that person.
-- Follow each numbered VISUAL_DIRECTION. Vary medium, composition, gender, age, appearance, and camera distance between posts.
-- Do not default to the same solitary futuristic person or reuse a recurring face or character design.
+- Follow each numbered VISUAL_DIRECTION and the complete canonical visual rules.
+- When VOID appears, preserve the privately held canonical avatar's identity; do not invent a substitute recurring hero.
+- Do not force VOID into every image: object-only and environmental compositions remain valid.
 - When a direction says no people, include no faces, silhouettes, or humanoid figures.
-- Keep a recognizable VOID mood through controlled contrast and one restrained dark accent, not through a repeated character.
-- No gore, no explicit content.
 """.strip()
 
     direction_text = "\n".join(
@@ -2064,6 +2074,8 @@ Rules:
         f"MODE: {mode}\n"
         f"TITLE: {title}\n"
         f"SOURCE_NAME: {source_name}\n"
+        f"VOID_VISUAL_CANON:\n{VOID_VISUAL_CANON_PROMPT}\n"
+        f"MODE_VISUAL_RULES:\n{mode_visual_prompt or 'No additional mode-specific visual rules.'}\n"
         f"{direction_text}\n"
         f"POST:\n{post[:1400]}"
     )
@@ -2077,10 +2089,20 @@ Rules:
                 prompts.append(match.group(1).strip())
         prompts = [p for p in prompts if p][:count]
         if prompts:
-            return [
-                f"{prompt} Mandatory visual direction: {visual_directions[index]}"
-                for index, prompt in enumerate(prompts)
-            ]
+            completed_prompts = []
+            for index, direction in enumerate(visual_directions):
+                generated = prompts[index] if index < len(prompts) else (
+                    f"Editorial image for a post titled '{title}'."
+                )
+                parts = [
+                    generated,
+                    f"Canonical VOID rules (mandatory):\n{VOID_VISUAL_CANON_PROMPT}",
+                ]
+                if mode_visual_prompt:
+                    parts.append(mode_visual_prompt)
+                parts.append(f"Mandatory visual direction: {direction}")
+                completed_prompts.append("\n\n".join(parts))
+            return completed_prompts
     except Exception as e:
         print(f"image prompt error: {type(e).__name__}: {e}", flush=True)
 
@@ -2088,6 +2110,7 @@ Rules:
         (
             f"Editorial image for a Telegram post titled '{title}'. "
             f"Represent the concrete topic of the post, source context: {source_name}. "
+            f"{VOID_VISUAL_CANON_PROMPT} {mode_visual_prompt} "
             f"{direction} No text, no logos, no UI screenshots."
         )
         for direction in visual_directions
@@ -2123,7 +2146,7 @@ def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
 
         images.append(base64.b64decode(b64_json))
 
-    return images[:2]
+    return images[:4]
 
 
 def find_source_image_url(source_url: str) -> str | None:
@@ -3145,6 +3168,7 @@ VK_MODE_VIBES = {
     "news": {"future", "tension", "energy"},
     "signal": {"tension", "future", "energy"},
     "observation": {"calm", "melancholy", "warm"},
+    "material": {"dark", "calm", "melancholy"},
 }
 
 
