@@ -52,6 +52,7 @@ from main import (
 )
 from void_core import (
     CONTENT_PLAN,
+    MATERIAL_RUBRIC,
     MEANING_CARDS,
     MODE_SEMANTIC_THEMES,
     NARRATIVE_SHAPES,
@@ -91,6 +92,38 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertEqual(build_rubric_header("frequency", "HUMAN"), "FREQUENCY")
         self.assertEqual(build_rubric_header("archive", "DIGEST"), "SIGNAL ARCHIVE")
         self.assertEqual(build_rubric_header("vault", "HUMAN"), "THE VAULT")
+        self.assertEqual(build_rubric_header("material", "HUMAN"), "MATERIAL / МАТЕРИЯ")
+
+    def test_material_does_not_change_existing_content_schedules(self) -> None:
+        expected_rubrics = [
+            ("Midnight", "void", "midnight", "HUMAN", (0, 1, 2), 10),
+            ("Frequency", "void", "frequency", "HUMAN", (19, 20, 21, 22), 7),
+            ("The Vault", "void", "vault", "HUMAN", (22, 23), 4),
+            ("Future File", "void", "future", "FUTURE", (12, 13, 14, 15, 16, 17, 18), 5),
+            ("Observation", "void", "observation", "ATTENTION", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 6),
+            ("Signal", "void", "signal", "HUMAN", (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 5),
+            ("News Signal", "news", "news", "AI", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19), 4),
+        ]
+        expected_telegram = [
+            ("Midnight", "void", "midnight", "HUMAN", (0, 1, 2), 10),
+            ("Frequency", "void", "frequency", "HUMAN", (19, 20, 21, 22), 7),
+            ("The Vault", "void", "vault", "HUMAN", (22, 23), 4),
+            ("Observation", "void", "observation", "ATTENTION", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 6),
+            ("Future File", "void", "future", "FUTURE", (12, 13, 14, 15, 16, 17, 18), 5),
+            ("Signal", "void", "signal", "HUMAN", (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 5),
+            ("News Signal", "news", "news", "AI", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19), 4),
+        ]
+
+        def compact(schedule):
+            return [
+                (item["name"], item["voice"], item["mode"], item["frequency"], tuple(item["hours"]), item["weight"])
+                for item in schedule
+            ]
+
+        self.assertEqual(compact(RUBRIC_SCHEDULE), expected_rubrics)
+        self.assertEqual(compact(TELEGRAM_VOID_SCHEDULE), expected_telegram)
+        self.assertNotIn("material", {slot["mode"] for slot in CONTENT_PLAN})
+        self.assertFalse(MATERIAL_RUBRIC["scheduled"])
 
     def test_content_plan_has_non_news_modes(self) -> None:
         modes = {slot["mode"] for slot in CONTENT_PLAN}
@@ -435,6 +468,56 @@ class AutopostingRubricTests(unittest.TestCase):
             selected = choose_vk_music_track(draft, excluded_track_keys=excluded)
 
         self.assertEqual(selected["title"], "Future 8")
+
+    def test_material_uses_allowlist_and_shared_recent_eight_rotation(self) -> None:
+        tracks = [
+            {"artist": f"Artist {index}", "title": f"Dark {index}", "tags": ["dark", "calm"]}
+            for index in range(9)
+        ]
+        draft = {
+            "id": 120,
+            "mode": "material",
+            "title": "Материя",
+            "frequency": "HUMAN",
+            "post": "Камень хранит след прикосновения.",
+        }
+        shared_recent = {f"artist {index} dark {index}" for index in range(8)}
+
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch("main.recent_vk_music_track_keys", return_value=[]),
+        ):
+            selected = choose_vk_music_track(draft, excluded_track_keys=shared_recent)
+
+        self.assertIs(selected, tracks[8])
+        self.assertEqual(MATERIAL_RUBRIC["music_source"], "current allowlist only")
+        self.assertEqual(MATERIAL_RUBRIC["shared_recent_track_limit"], 8)
+
+    def test_vk_producer_accepts_four_material_frames_and_shared_history(self) -> None:
+        draft = {
+            "id": 121,
+            "mode": "material",
+            "title": "Материя",
+            "frequency": "HUMAN",
+            "post": "Достаточно длинный проверенный текст для очереди VOID.",
+        }
+        track = {"artist": "Artist", "title": "Dark", "tags": ["dark"]}
+        with (
+            patch("void_vk_producer.main.get_draft", return_value=draft),
+            patch("void_vk_producer.main.quality_check", return_value=(True, "ok")),
+            patch("void_vk_producer.main.generate_post_images_sync", return_value=[b"1", b"2", b"3", b"4"]),
+            patch("void_vk_producer.recent_track_keys", return_value=[f"old {index}" for index in range(8)]) as recent,
+            patch("void_vk_producer.main.choose_vk_music_track", return_value=track) as choose,
+            patch("void_vk_producer.build_job", return_value={"job_id": "material"}),
+            patch("void_vk_producer.enqueue_job", return_value=Path("queued")) as enqueue,
+        ):
+            result = void_vk_producer.enqueue_draft(121)
+
+        self.assertEqual(result, Path("queued"))
+        recent.assert_called_once_with(void_vk_producer.QUEUE_DIR)
+        self.assertEqual(choose.call_args.kwargs["excluded_track_keys"], {f"old {index}" for index in range(8)})
+        media = enqueue.call_args.args[2]
+        self.assertEqual(tuple(media), ("image-1.png", "image-2.png", "image-3.png", "image-4.png"))
 
     def test_vk_music_selection_blocks_without_fresh_suitable_track(self) -> None:
         tracks = [{"artist": "Artist", "title": "Future", "tags": ["future"]}]

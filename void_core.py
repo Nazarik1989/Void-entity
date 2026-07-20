@@ -48,6 +48,107 @@ Editorial law:
 """.strip()
 
 
+VOID_CANONICAL_PALETTE = {
+    "Absolute Black": "#000000",
+    "Coal Black": "#080808",
+    "Graphite": "#171717",
+    "Smoke": "#2A2A2A",
+    "Ash Grey": "#696966",
+    "Bone White": "#E8E6DF",
+    "Pure White": "#FFFFFF",
+}
+
+
+VOID_CANONICAL_MATERIALS = (
+    "obsidian",
+    "raw or polished stone",
+    "dark wood",
+    "aged leather",
+    "dense black or grey fabric",
+    "old paper",
+    "smoked glass",
+    "blackened steel",
+    "patinated metal",
+    "matte ceramic",
+    "traces of time, touch, and use",
+)
+
+
+VOID_VISUAL_CANON_PROMPT = """
+Canonical VOID visual identity. Core idea: darkness, and somewhere within it — light.
+The privately supplied original VOID avatar is the primary character reference. If
+VOID appears, preserve the reference's recognizable identity, age, facial anchors,
+silhouette, and restrained wardrobe; never replace it with a generic recurring hero.
+Do not force a person into every composition: object-only and environmental scenes
+are part of the same canon.
+
+Palette only: Absolute Black #000000; Coal Black #080808; Graphite #171717;
+Smoke #2A2A2A; Ash Grey #696966; Bone White #E8E6DF; Pure White #FFFFFF.
+Darkness must occupy 80–90% of the image, but it must conceal real space, objects,
+texture, and possibly a person rather than becoming an empty black background.
+Pure white may occupy only 2–5%. Light is an event, never ambient fill lighting.
+
+Use one source of light: a ring, eclipse edge, slit, doorway, window, reflection,
+or narrow beam. Reveal only the important fragment. Keep most of the object hidden,
+allow textures to emerge softly, and retain deep shadows without artificial HDR.
+The light must never explain everything.
+
+Prefer obsidian; raw or polished stone; dark wood; aged leather;
+dense black or grey fabric; old paper; smoked glass; blackened steel;
+patinated metal; matte ceramic; and visible traces of time, touch, and use. Materials must feel heavy,
+real, and able to hold memory, never like a luxury display.
+
+Signature forms: a luminous circle or eclipse; the boundary between visible and
+hidden; a face or object revealed only in part; large negative space; one central
+meaningful object; a reflection in black glass or water. VOID observes rather than
+activates a mechanism. Motion is slow, light is soft, and the frame is quiet.
+
+Never import Naz's visual code: no bright blue, purple, or neon identity;
+no data networks, circuit diagrams, code, digital interfaces, energy rings, or technological glow.
+A rare warm light is allowed only when it comes naturally from fire, a lamp,
+or dawn; it is not a permanent brand color.
+
+Forbidden: demonstrative luxury, gold decoration, glossy advertising interiors,
+supercars as success symbols, bright cyberpunk, mystical runes, occult clichés,
+skulls, ravens, generic gothic imagery, excessive grain, an arbitrary black-and-white
+filter, large quotations over the image, gore, and explicit content.
+""".strip()
+
+
+MATERIAL_RUBRIC = {
+    "label": "MATERIAL / МАТЕРИЯ",
+    "duration_seconds": (12, 20),
+    "frame_count": (3, 4),
+    "sequence": (
+        "darkness",
+        "narrow light",
+        "texture revealed",
+        "partial object",
+        "return to darkness",
+    ),
+    "meaning": (
+        "VOID shows objects with weight and memory. Their value comes not from "
+        "price or novelty, but from what they survived and what they can preserve."
+    ),
+    "voice": "one short VOID thought",
+    "marking": "minimal MATERIAL / VOID marking added in post-production",
+    "music_source": "current allowlist only",
+    "shared_recent_track_limit": 8,
+    "scheduled": False,
+}
+
+
+MATERIAL_VISUAL_PROMPT = """
+MATERIAL / МАТЕРИЯ visual sequence. Produce a coherent four-frame sequence that
+can be edited into 12–20 seconds: darkness → one narrow light → texture revealed →
+a partial image of the object → return toward darkness. Use one central object made
+from the canonical VOID materials and emphasize weight, memory, wear, touch, and use
+rather than price or novelty. Keep the edit calm. Reserve discreet negative space
+for a minimal MATERIAL / VOID mark to be added in post-production; generate no
+typography and never place a large quotation over the image.
+""".strip()
+
+
 SEMANTIC_THEMES = {
     "craft": (
         "Craft and competence: a concrete act of making, repairing, rehearsing, "
@@ -419,6 +520,7 @@ MODE_RUBRICS = {
     "digest": "SIGNAL ARCHIVE",
     "archive": "SIGNAL ARCHIVE",
     "vault": "THE VAULT",
+    "material": "MATERIAL / МАТЕРИЯ",
 }
 
 
