@@ -1,6 +1,8 @@
 import hashlib
 import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import editorial_policy as policy
 import main
@@ -84,6 +86,42 @@ class VoidEditorialPolicyTests(unittest.TestCase):
         decision = policy.parse_image_gate_response(raw)
         self.assertFalse(decision.accepted)
         self.assertEqual(decision.reason_code, "image_thesis_mismatch")
+
+    def test_image_gate_schema_enumerates_codes_and_classifies_unknown_reason(self):
+        prompt = json.loads(policy.build_image_gate_prompt(make_brief()))
+        self.assertEqual(
+            set(prompt["schema"]["properties"]["reason_code"]["enum"]),
+            set(policy.IMAGE_GATE_REASON_CODES),
+        )
+        invalid = {
+            "accepted": False,
+            "reason_code": "image_topic_mismatch",
+            "literal_description": "fixture",
+            "subject_matches": False,
+            "thesis_supported": True,
+            "unexplained_people": False,
+            "unexplained_elements": False,
+            "visual_bible_matches": True,
+            "why_here": False,
+        }
+        with self.assertRaises(policy.GateResponseError) as raised:
+            policy.parse_image_gate_response(json.dumps(invalid))
+        self.assertEqual(raised.exception.reason_code, "schema_unknown_reason_code")
+
+    def test_image_gate_uses_structured_schema_and_does_not_mask_contract_error(self):
+        client = MagicMock()
+        client.responses.create.return_value = SimpleNamespace(
+            output_text=json.dumps({"accepted": True, "reason_code": "accepted"})
+        )
+        with patch.object(main, "openai_client", return_value=client):
+            with self.assertRaises(policy.GateResponseError) as raised:
+                main.evaluate_editorial_image_sync(make_brief(), b"fixture-image")
+        self.assertEqual(raised.exception.reason_code, "schema_missing_fields")
+        request = client.responses.create.call_args.kwargs
+        self.assertEqual(
+            request["text"]["format"]["schema"],
+            policy.image_gate_response_schema(),
+        )
 
     def test_text_gate_schema_enumerates_codes_and_excludes_visual_policy(self):
         brief = make_brief()
