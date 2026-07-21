@@ -2782,21 +2782,7 @@ class SemanticGateDecision:
     key_meanings: tuple[str, ...]
 
 
-EDITORIAL_TEXT_GATE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "accepted": {"type": "boolean"},
-        "reason_code": {"type": "string"},
-        "entry_context_clear": {"type": "boolean"},
-        "self_contained": {"type": "boolean"},
-        "invented_current_event": {"type": "boolean"},
-        "topic_matches": {"type": "boolean"},
-        "persona_matches": {"type": "boolean"},
-    },
-    "required": ["accepted", "reason_code", "entry_context_clear", "self_contained",
-                 "invented_current_event", "topic_matches", "persona_matches"],
-    "additionalProperties": False,
-}
+EDITORIAL_TEXT_GATE_SCHEMA: dict[str, Any] = editorial_policy.text_gate_response_schema()
 
 
 def editorial_text_gate_decision(
@@ -2806,25 +2792,22 @@ def editorial_text_gate_decision(
     try:
         raw = call_ai(
             "Strictly accept or reject the text. Never rewrite it or invent another topic.",
-            json.dumps({"brief": brief.as_dict(), "candidate": post}, ensure_ascii=False),
+            editorial_policy.build_text_gate_prompt(brief, post),
             max_output_tokens=300,
             model=OPENAI_POST_MODEL,
             response_schema=EDITORIAL_TEXT_GATE_SCHEMA,
             response_schema_name="void_editorial_text_gate",
         )
-        value = json.loads(raw)
-        reason = str(value.get("reason_code") or "invalid_brief")
-        checks = (
-            value.get("entry_context_clear") is True
-            and value.get("self_contained") is True
-            and value.get("invented_current_event") is False
-            and value.get("topic_matches") is True
-            and value.get("persona_matches") is True
+        return editorial_policy.parse_text_gate_response(raw)
+    except editorial_policy.GateResponseError as exc:
+        print(
+            f"EDITORIAL_TEXT_GATE post_id={brief.post_id} accepted=false "
+            f"reason_code={exc.reason_code} "
+            f"field_names={','.join(exc.field_names) or 'none'} "
+            f"error_type={type(exc).__name__}",
+            flush=True,
         )
-        accepted = value.get("accepted") is True
-        if reason not in editorial_policy.REASON_CODES or accepted != checks or (accepted and reason != "accepted"):
-            raise ValueError("text gate verdict conflicts with checks")
-        return accepted, reason
+        return False, exc.reason_code
     except Exception as exc:
         print(
             f"EDITORIAL_TEXT_GATE post_id={brief.post_id} accepted=false "
@@ -3145,6 +3128,11 @@ async def generate_scheduled_draft(
                 )
         last_reason = decision.reason
         if decision.accepted:
+            print(
+                f"EDITORIAL_TEXT_GATE post_id={editorial_brief.post_id} "
+                f"attempts={attempt + 1} accepted=true reason_code=accepted",
+                flush=True,
+            )
             return await asyncio.to_thread(
                 save_draft,
                 draft["mode"],
@@ -3156,15 +3144,32 @@ async def generate_scheduled_draft(
                 draft["publish_score"],
                 editorial_brief.canonical_json(),
             )
+        if not editorial_policy.is_retryable_gate_reason(last_reason):
+            print(
+                f"EDITORIAL_TEXT_GATE post_id={editorial_brief.post_id} "
+                f"attempts={attempt + 1} accepted=false "
+                f"reason_code={scheduled_reason_code(last_reason)}",
+                flush=True,
+            )
+            raise RuntimeError(
+                "scheduled draft blocked by non-retryable text gate error: "
+                f"{scheduled_reason_code(last_reason)}"
+            )
         if attempt + 1 < SCHEDULED_GENERATION_ATTEMPTS:
             attempt_content = build_semantic_retry_content(
                 content,
                 semantic_theme,
                 decision,
             )
+    print(
+        f"EDITORIAL_TEXT_GATE post_id={editorial_brief.post_id} "
+        f"attempts={SCHEDULED_GENERATION_ATTEMPTS} accepted=false "
+        f"reason_code={scheduled_reason_code(last_reason)}",
+        flush=True,
+    )
     raise RuntimeError(
         f"scheduled draft blocked after {SCHEDULED_GENERATION_ATTEMPTS} bounded attempts: "
-        f"{last_reason}"
+        f"{scheduled_reason_code(last_reason)}"
     )
 
 
@@ -3932,7 +3937,7 @@ def build_scheduled_content_brief(
         or slot.get("brief")
         or ""
     ).strip()
-    return editorial_policy.build_brief(
+    content_brief = editorial_policy.build_brief(
         destination=platform,
         scheduled_slot=f"{platform}:{slot.get('mode', 'signal')}",
         source_type=source_type,
@@ -3952,10 +3957,37 @@ def build_scheduled_content_brief(
         required_elements=(visual_subject,),
         music_required=platform == "vk",
     )
+    print(
+        "EDITORIAL_BRIEF metadata="
+        + json.dumps(
+            {
+                "post_id": content_brief.post_id,
+                "persona": content_brief.persona,
+                "scheduled_slot": content_brief.scheduled_slot,
+                "rubric": content_brief.rubric,
+                "source_type": content_brief.source_type,
+                "editorial_contract_version": content_brief.editorial_contract_version,
+                "persona_policy_version": content_brief.persona_policy_version,
+                "visual_code_version": content_brief.visual_code_version,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return content_brief
 
 
 SCHEDULED_GENERATION_ATTEMPTS = 2
 SEMANTIC_HISTORY_LIMIT = 8
+
+
+def scheduled_reason_code(reason: str) -> str:
+    safe_codes = editorial_policy.REASON_CODES | {
+        "near_duplicate_semantics",
+        "repeated_digital_attention_thesis",
+    }
+    return reason if reason in safe_codes else "text_quality_rejected"
 
 
 def _cycle_after(
