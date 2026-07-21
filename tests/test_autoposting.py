@@ -12,6 +12,7 @@ import editorial_policy
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import void_vk_producer
+import main
 
 from main import (
     SemanticSummary,
@@ -620,6 +621,45 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                     editorial_brief=self.brief,
                 )
         self.assertEqual(generate.call_count, 2)
+        save.assert_not_called()
+
+    async def test_void_12_text_gate_contract_error_does_not_consume_retry(self) -> None:
+        slot = next(
+            item for item in TELEGRAM_VOID_SCHEDULE if item["mode"] == "observation"
+        )
+        brief = main.build_scheduled_content_brief(
+            slot=slot,
+            editorial_plan={
+                "meaning_thought": "fixture thesis",
+                "scene_instruction": "fixture object",
+            },
+            source_reference="manual://telegram/void/observation/2026-07-21T12:00:00+03:00",
+            platform="telegram",
+            source_type="scheduled_rubric",
+        )
+        with (
+            patch("main.recent_scheduled_posts", return_value=[]),
+            patch("main.generate_post_sync", return_value=self._draft("candidate")) as generate,
+            patch("main.quality_check", return_value=(True, "ok")),
+            patch("main.semantic_repetition_reason", return_value=""),
+            patch(
+                "main.editorial_text_gate_decision",
+                return_value=(False, "schema_unknown_reason_code"),
+            ),
+            patch("main.save_draft") as save,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "non-retryable"):
+                await generate_scheduled_draft(
+                    mode="observation",
+                    content="fixture",
+                    frequency="ATTENTION",
+                    source_name="VOID",
+                    source_url="manual://telegram/void/observation/fixture",
+                    platform="telegram",
+                    semantic_theme="craft",
+                    editorial_brief=brief,
+                )
+        self.assertEqual(generate.call_count, 1)
         save.assert_not_called()
 
     async def test_semantic_metadata_is_not_part_of_publishable_post(self) -> None:
