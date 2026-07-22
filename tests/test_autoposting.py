@@ -7,8 +7,6 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, patch
 
-import editorial_policy
-
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import void_vk_producer
@@ -556,29 +554,6 @@ class AutopostingRubricTests(unittest.TestCase):
 
 
 class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self) -> None:
-        self.brief = editorial_policy.build_brief(
-            destination="vk",
-            scheduled_slot="vk:signal",
-            source_type="scheduled_rubric",
-            source_reference="manual://vk/schedule/signal/test",
-            rubric="Signal",
-            thesis="A fixed craft thesis",
-            context_reason="Scheduled contract test",
-            visual_subject="one worn tool on dark wood",
-            visual_relation="the tool makes the craft thesis visible",
-            allowed_rubrics={"Signal"},
-            music_required=True,
-        )
-        self.relevance_patch = patch(
-            "main.editorial_text_gate_decision",
-            return_value=(True, "accepted"),
-        )
-        self.relevance_patch.start()
-
-    async def asyncTearDown(self) -> None:
-        self.relevance_patch.stop()
-
     @staticmethod
     def _draft(
         post: str,
@@ -617,7 +592,6 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                     source_url="manual://vk/schedule/signal/test",
                     platform="vk",
                     semantic_theme="craft",
-                    editorial_brief=self.brief,
                 )
         self.assertEqual(generate.call_count, 2)
         save.assert_not_called()
@@ -665,7 +639,6 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                 source_url="manual://vk/schedule/signal/test",
                 platform="vk",
                 semantic_theme="craft",
-                editorial_brief=self.brief,
             )
         request = call_ai_mock.call_args.kwargs
         self.assertIs(request["response_schema"], SCHEDULED_RESPONSE_SCHEMA)
@@ -696,7 +669,6 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                 source_url="manual://vk/schedule/signal/test",
                 platform="vk",
                 semantic_theme="craft",
-                editorial_brief=self.brief,
             )
         self.assertEqual(draft_id, 77)
         self.assertEqual(generate.call_count, 2)
@@ -735,7 +707,6 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                 source_url="manual://vk/schedule/signal/test",
                 platform="vk",
                 semantic_theme="craft",
-                editorial_brief=self.brief,
             )
 
         retry_content = generate.call_args_list[1].args[1]
@@ -769,7 +740,6 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                     source_url="manual://vk/schedule/signal/test",
                     platform="vk",
                     semantic_theme="craft",
-                    editorial_brief=self.brief,
                 )
         self.assertEqual(generate.call_count, 1)
         save.assert_not_called()
@@ -798,7 +768,6 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                     source_url="manual://vk/schedule/signal/test",
                     platform="vk",
                     semantic_theme="craft",
-                    editorial_brief=self.brief,
                 )
         self.assertEqual(call_ai_mock.call_count, 2)
         save.assert_not_called()

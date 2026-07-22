@@ -13,11 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
-SCHEMA_V1 = "vk_publish_job.v1"
-SCHEMA = "vk_publish_job.v2"
-FIELDS_V1 = frozenset({"schema", "job_id", "producer", "target_group_id", "text", "media", "track_query", "created_at", "not_before", "dedupe_key", "source_ref"})
-FIELDS = FIELDS_V1 | {"metadata"}
-METADATA_FIELDS = frozenset({"editorial_contract_version", "persona_policy_version", "visual_code_version", "post_id", "persona", "destination", "brief_hash", "source_type", "rubric", "music_required", "reason_code"})
+SCHEMA = "vk_publish_job.v1"
+FIELDS = frozenset({"schema", "job_id", "producer", "target_group_id", "text", "media", "track_query", "created_at", "not_before", "dedupe_key", "source_ref"})
 PRODUCERS = frozenset({"naz", "void"})
 STATES = ("pending", "processing", "done", "failed")
 MAX_TEXT_LENGTH = 16_000
@@ -216,35 +213,12 @@ def _safe_media_name(value: Any) -> str:
 
 
 def _validate_shape(job: Any, allowed_group_id: str | None = None) -> dict[str, Any]:
-    if not isinstance(job, dict):
+    if not isinstance(job, dict) or set(job) != FIELDS:
         raise QueueValidationError("unknown or missing job fields")
-    schema = job.get("schema")
-    expected_fields = FIELDS if schema == SCHEMA else FIELDS_V1
-    if schema not in {SCHEMA_V1, SCHEMA} or set(job) != expected_fields:
+    if job["schema"] != SCHEMA:
         raise QueueValidationError("unknown schema")
     if job["producer"] not in PRODUCERS:
         raise QueueValidationError("unknown producer")
-    if schema == SCHEMA:
-        metadata = job["metadata"]
-        if not isinstance(metadata, dict) or set(metadata) != METADATA_FIELDS:
-            raise QueueValidationError("invalid editorial metadata")
-        if any(not isinstance(metadata.get(key), str) or not metadata[key] for key in METADATA_FIELDS - {"music_required"}):
-            raise QueueValidationError("editorial metadata strings are required")
-        if not isinstance(metadata.get("music_required"), bool):
-            raise QueueValidationError("editorial music_required must be boolean")
-        versions = {
-            "naz": ("naz-persona.v2.4", "naz-visual.v2"),
-            "void": ("void-persona.v2", "void-visual.v2"),
-        }
-        persona_version, visual_version = versions[job["producer"]]
-        if metadata["editorial_contract_version"] != "editorial-relevance.v1" or metadata["persona_policy_version"] != persona_version or metadata["visual_code_version"] != visual_version:
-            raise QueueValidationError("unknown editorial policy version")
-        if metadata["persona"] != job["producer"] or metadata["destination"] != "vk":
-            raise QueueValidationError("editorial identity mismatch")
-        if metadata["reason_code"] != "accepted" or not metadata["music_required"]:
-            raise QueueValidationError("job did not pass the editorial/music gate")
-        if not re.fullmatch(r"(naz|void)-[0-9a-f]{24}", metadata["post_id"]) or not re.fullmatch(r"[0-9a-f]{64}", metadata["brief_hash"]):
-            raise QueueValidationError("invalid editorial identifiers")
     if not isinstance(job["target_group_id"], str) or not job["target_group_id"]:
         raise QueueValidationError("target_group_id must be a JSON string")
     if allowed_group_id is not None and job["target_group_id"] != str(allowed_group_id):
@@ -318,10 +292,8 @@ def _dedupe_seen(queue_root: Path, key: str, current: Path | None = None) -> boo
     return False
 
 
-def build_job(*, producer: str, target_group_id: str, text: str, media: list[str], track_query: str = "", not_before: str = "", dedupe_key: str, source_ref: str, created_at: str | None = None, metadata: dict[str, Any] | None = None) -> dict[str, Any]:
-    job = {"schema": SCHEMA if metadata is not None else SCHEMA_V1, "job_id": canonical_job_id(producer, dedupe_key), "producer": producer, "target_group_id": str(target_group_id), "text": text, "media": media, "track_query": track_query, "created_at": created_at or _utc_now(), "not_before": not_before, "dedupe_key": dedupe_key, "source_ref": source_ref}
-    if metadata is not None:
-        job["metadata"] = dict(metadata)
+def build_job(*, producer: str, target_group_id: str, text: str, media: list[str], track_query: str = "", not_before: str = "", dedupe_key: str, source_ref: str, created_at: str | None = None) -> dict[str, Any]:
+    job = {"schema": SCHEMA, "job_id": canonical_job_id(producer, dedupe_key), "producer": producer, "target_group_id": str(target_group_id), "text": text, "media": media, "track_query": track_query, "created_at": created_at or _utc_now(), "not_before": not_before, "dedupe_key": dedupe_key, "source_ref": source_ref}
     return _validate_shape(job)
 
 

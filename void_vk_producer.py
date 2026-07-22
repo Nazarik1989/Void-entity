@@ -53,20 +53,7 @@ def enqueue_draft(draft_id: int) -> Path:
     ok, reason = main.quality_check(draft["post"])
     if not ok:
         raise RuntimeError(f"Draft #{draft_id} blocked: {reason}")
-    raw_brief = str(draft["editorial_brief_json"] or "") if "editorial_brief_json" in draft.keys() else ""
-    brief = (
-        main.editorial_policy.brief_from_json(
-            raw_brief,
-            allowed_rubrics=main.registered_void_rubrics(),
-        )
-        if raw_brief
-        else None
-    )
     images = main.generate_post_images_sync(draft)
-    expected_images = main.image_count_for_draft(str(draft["mode"] or ""), str(draft["post"] or ""))
-    if brief is not None and len(images) != expected_images:
-        main.delete_unpublished_draft(draft_id)
-        raise RuntimeError("Required relevant images failed semantic QA; draft was removed")
     media = {f"image-{index}.png": content for index, content in enumerate(images[:4], start=1)}
     track = main.choose_vk_music_track(
         draft,
@@ -75,7 +62,7 @@ def enqueue_draft(draft_id: int) -> Path:
     if not track:
         raise RuntimeError("No suitable fresh VK music track is available; draft was not queued")
     track_query = f"{track.get('artist', '')} {track.get('title', '')}".strip()
-    job = build_job(producer="void", target_group_id=str(main.VK_GROUP_ID), text=draft["post"], media=list(media), track_query=track_query, dedupe_key=f"void-draft:{draft_id}", source_ref=f"void:draft:{draft_id}", metadata=brief.job_metadata() if brief else None)
+    job = build_job(producer="void", target_group_id=str(main.VK_GROUP_ID), text=draft["post"], media=list(media), track_query=track_query, dedupe_key=f"void-draft:{draft_id}", source_ref=f"void:draft:{draft_id}")
     return enqueue_job(QUEUE_DIR, job, media)
 
 

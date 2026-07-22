@@ -33,7 +33,6 @@ from dotenv import load_dotenv
 import character_state as void_character
 import delegated_messaging
 import duo_relationship
-import editorial_policy
 import gaming_vertical
 from void_core import (
     CONTENT_PLAN,
@@ -268,6 +267,7 @@ def init_db() -> None:
         created_at TEXT NOT NULL
     )
     """)
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS drafts (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -282,9 +282,6 @@ def init_db() -> None:
         published_at TEXT
     )
     """)
-    draft_columns = {row[1] for row in cur.execute("PRAGMA table_info(drafts)").fetchall()}
-    if "editorial_brief_json" not in draft_columns:
-        cur.execute("ALTER TABLE drafts ADD COLUMN editorial_brief_json TEXT NOT NULL DEFAULT ''")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS catches (
@@ -1748,15 +1745,15 @@ def get_candidate(candidate_id: int) -> sqlite3.Row | None:
     return row
 
 
-def save_draft(mode: str, title: str, post: str, source_name: str = "", source_url: str = "", frequency: str = "", publish_score: int = 5, editorial_brief_json: str = "") -> int:
+def save_draft(mode: str, title: str, post: str, source_name: str = "", source_url: str = "", frequency: str = "", publish_score: int = 5) -> int:
     conn = db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO drafts(mode, title, post, source_name, source_url, frequency, publish_score, created_at, editorial_brief_json)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO drafts(mode, title, post, source_name, source_url, frequency, publish_score, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (mode, title, post, source_name, source_url, frequency, int(publish_score), now_iso(), editorial_brief_json),
+        (mode, title, post, source_name, source_url, frequency, int(publish_score), now_iso()),
     )
     conn.commit()
     draft_id = int(cur.lastrowid)
@@ -1779,17 +1776,6 @@ def get_draft(draft_id: int) -> sqlite3.Row | None:
     row = conn.execute("SELECT * FROM drafts WHERE id=?", (draft_id,)).fetchone()
     conn.close()
     return row
-
-
-def delete_unpublished_draft(draft_id: int) -> bool:
-    conn = db()
-    deleted = conn.execute(
-        "DELETE FROM drafts WHERE id=? AND published_at IS NULL",
-        (int(draft_id),),
-    )
-    conn.commit()
-    conn.close()
-    return deleted.rowcount == 1
 
 
 def mark_published(draft_id: int, source_url: str = "") -> bool:
@@ -2061,32 +2047,6 @@ def build_image_prompts_sync(draft: dict | sqlite3.Row) -> list[str]:
     count = image_count_for_draft(mode, post)
     visual_directions = image_visual_directions(draft_id, count, mode)
     mode_visual_prompt = MATERIAL_VISUAL_PROMPT if mode == "material" else ""
-    raw_brief = (
-        str(draft["editorial_brief_json"] or "")
-        if "editorial_brief_json" in draft.keys()
-        else ""
-    )
-    if raw_brief:
-        brief = editorial_policy.brief_from_json(
-            raw_brief,
-            allowed_rubrics=registered_void_rubrics(),
-        )
-        base = editorial_policy.render_visual_instructions(
-            brief,
-            f"{VOID_VISUAL_CANON_PROMPT}\n{mode_visual_prompt}",
-        )
-        fixed_directions = (
-            list(MATERIAL_FRAME_DIRECTIONS[:count])
-            if mode == "material"
-            else [
-                f"Keep the fixed visual subject unchanged; vary only framing for frame {index}."
-                for index in range(1, count + 1)
-            ]
-        )
-        return [
-            f"{base}\nSequence frame {index}: {direction}"
-            for index, direction in enumerate(fixed_directions, start=1)
-        ]
 
     instructions = """
 You are an art director for a Telegram channel called VOID.
@@ -2157,100 +2117,34 @@ Rules:
     ]
 
 
-def evaluate_editorial_image_sync(
-    brief: editorial_policy.ContentBrief,
-    image: bytes,
-) -> editorial_policy.ImageGateDecision:
-    client = openai_client()
-    encoded = base64.b64encode(image).decode("ascii")
-    try:
-        response = client.responses.create(
-            model=OPENAI_POST_MODEL,
-            instructions=(
-                "Strictly accept or reject image relevance. Return only the requested JSON. "
-                "Never invent or suggest a replacement subject."
-            ),
-            input=[{
-                "role": "user",
-                "content": [
-                    {"type": "input_text", "text": editorial_policy.build_image_gate_prompt(brief)},
-                    {"type": "input_image", "image_url": f"data:image/png;base64,{encoded}"},
-                ],
-            }],
-            max_output_tokens=450,
-        )
-        return editorial_policy.parse_image_gate_response(response.output_text.strip())
-    except Exception as exc:
-        print(
-            f"EDITORIAL_IMAGE_GATE post_id={brief.post_id} accepted=false "
-            f"reason_code=validator_unavailable error_type={type(exc).__name__}",
-            flush=True,
-        )
-        return editorial_policy.ImageGateDecision(
-            False, "validator_unavailable", "", False, False, False, False, False, True
-        )
-
-
 def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
     client = openai_client()
     images: list[bytes] = []
-    raw_brief = (
-        str(draft["editorial_brief_json"] or "")
-        if "editorial_brief_json" in draft.keys()
-        else ""
-    )
-    brief = (
-        editorial_policy.brief_from_json(
-            raw_brief,
-            allowed_rubrics=registered_void_rubrics(),
-        )
-        if raw_brief
-        else None
-    )
 
-    for frame, prompt in enumerate(build_image_prompts_sync(draft), start=1):
-        accepted_image: bytes | None = None
-        attempts = editorial_policy.MAX_REGENERATIONS + 1 if brief else 1
-        for attempt in range(1, attempts + 1):
-            try:
-                response = client.images.generate(
-                    model=OPENAI_IMAGE_MODEL,
-                    prompt=prompt,
-                    size=OPENAI_IMAGE_SIZE,
-                    quality=OPENAI_IMAGE_QUALITY,
-                    n=1,
-                )
-            except Exception as e:
-                print(
-                    f"image generation failed for model={OPENAI_IMAGE_MODEL}: "
-                    f"{type(e).__name__}: {e}",
-                    flush=True,
-                )
-                if brief:
-                    continue
-                raise
-            if not response.data:
-                continue
-            b64_json = getattr(response.data[0], "b64_json", None)
-            if not b64_json:
-                continue
-            candidate = base64.b64decode(b64_json)
-            if brief:
-                decision = evaluate_editorial_image_sync(brief, candidate)
-                print(
-                    f"EDITORIAL_IMAGE_GATE post_id={brief.post_id} frame={frame} "
-                    f"attempt={attempt} accepted={str(decision.accepted).lower()} "
-                    f"reason_code={decision.reason_code}",
-                    flush=True,
-                )
-                if not decision.accepted:
-                    continue
-            accepted_image = candidate
-            break
-        if accepted_image:
-            images.append(accepted_image)
-        elif brief:
-            return []
+    for prompt in build_image_prompts_sync(draft):
+        try:
+            response = client.images.generate(
+                model=OPENAI_IMAGE_MODEL,
+                prompt=prompt,
+                size=OPENAI_IMAGE_SIZE,
+                quality=OPENAI_IMAGE_QUALITY,
+                n=1,
+            )
+        except Exception as e:
+            print(
+                f"image generation failed for model={OPENAI_IMAGE_MODEL}: "
+                f"{type(e).__name__}: {e}; using source-image/text-only fallback",
+                flush=True,
+            )
+            raise
+        if not response.data:
+            continue
+
+        b64_json = getattr(response.data[0], "b64_json", None)
+        if not b64_json:
+            continue
+
+        images.append(base64.b64decode(b64_json))
 
     return images[:4]
 
@@ -2782,58 +2676,6 @@ class SemanticGateDecision:
     key_meanings: tuple[str, ...]
 
 
-EDITORIAL_TEXT_GATE_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "properties": {
-        "accepted": {"type": "boolean"},
-        "reason_code": {"type": "string"},
-        "entry_context_clear": {"type": "boolean"},
-        "self_contained": {"type": "boolean"},
-        "invented_current_event": {"type": "boolean"},
-        "topic_matches": {"type": "boolean"},
-        "persona_matches": {"type": "boolean"},
-    },
-    "required": ["accepted", "reason_code", "entry_context_clear", "self_contained",
-                 "invented_current_event", "topic_matches", "persona_matches"],
-    "additionalProperties": False,
-}
-
-
-def editorial_text_gate_decision(
-    brief: editorial_policy.ContentBrief,
-    post: str,
-) -> tuple[bool, str]:
-    try:
-        raw = call_ai(
-            "Strictly accept or reject the text. Never rewrite it or invent another topic.",
-            json.dumps({"brief": brief.as_dict(), "candidate": post}, ensure_ascii=False),
-            max_output_tokens=300,
-            model=OPENAI_POST_MODEL,
-            response_schema=EDITORIAL_TEXT_GATE_SCHEMA,
-            response_schema_name="void_editorial_text_gate",
-        )
-        value = json.loads(raw)
-        reason = str(value.get("reason_code") or "invalid_brief")
-        checks = (
-            value.get("entry_context_clear") is True
-            and value.get("self_contained") is True
-            and value.get("invented_current_event") is False
-            and value.get("topic_matches") is True
-            and value.get("persona_matches") is True
-        )
-        accepted = value.get("accepted") is True
-        if reason not in editorial_policy.REASON_CODES or accepted != checks or (accepted and reason != "accepted"):
-            raise ValueError("text gate verdict conflicts with checks")
-        return accepted, reason
-    except Exception as exc:
-        print(
-            f"EDITORIAL_TEXT_GATE post_id={brief.post_id} accepted=false "
-            f"reason_code=validator_unavailable error_type={type(exc).__name__}",
-            flush=True,
-        )
-        return False, "validator_unavailable"
-
-
 SCHEDULED_SEMANTIC_CONTRACT = """
 For scheduled generation, fill every field in the required response schema.
 The semantic fields are concise editorial metadata: do not quote whole passages
@@ -2970,11 +2812,8 @@ def generate_post_sync(
     *,
     semantic_contract: bool = False,
     allow_internal_retry: bool = True,
-    editorial_brief: editorial_policy.ContentBrief | None = None,
 ) -> dict[str, Any]:
     prompt = build_prompt(mode, frequency, platform)
-    if editorial_brief is not None:
-        prompt = editorial_policy.render_text_instructions(editorial_brief, prompt)
     if semantic_contract:
         prompt = f"{prompt}\n\n{SCHEDULED_SEMANTIC_CONTRACT}"
     input_text = (
@@ -3029,10 +2868,6 @@ def generate_post_sync(
             post = f"{post.rstrip()}\n\n{source_line}"
 
     except Exception as e:
-        if editorial_brief is not None:
-            raise RuntimeError(
-                f"editorial generation failed closed: {type(e).__name__}"
-            ) from e
         title, post = fallback_post(mode, content, source_name, source_url, frequency)
         post += f"\n\nDIAG: {type(e).__name__}: {e}"
 
@@ -3085,7 +2920,6 @@ async def generate_scheduled_draft(
     source_url: str,
     platform: str,
     semantic_theme: str,
-    editorial_brief: editorial_policy.ContentBrief,
 ) -> int:
     recent_posts = await asyncio.to_thread(
         recent_scheduled_posts,
@@ -3105,7 +2939,6 @@ async def generate_scheduled_draft(
             platform,
             semantic_contract=True,
             allow_internal_retry=False,
-            editorial_brief=editorial_brief,
         )
         semantic_summary = draft.get("semantic_summary")
         if not isinstance(semantic_summary, SemanticSummary):
@@ -3129,20 +2962,6 @@ async def generate_scheduled_draft(
                 semantic_summary,
             )
         )
-        if decision.accepted:
-            relevance_ok, relevance_reason = editorial_text_gate_decision(
-                editorial_brief,
-                str(draft["post"]),
-            )
-            if not relevance_ok:
-                decision = SemanticGateDecision(
-                    accepted=False,
-                    reason=relevance_reason,
-                    central_thesis=semantic_summary.central_thesis,
-                    conclusion=semantic_summary.conclusion,
-                    narrative_shape=semantic_summary.narrative_shape,
-                    key_meanings=semantic_summary.key_meanings,
-                )
         last_reason = decision.reason
         if decision.accepted:
             return await asyncio.to_thread(
@@ -3154,7 +2973,6 @@ async def generate_scheduled_draft(
                 draft["source_url"],
                 draft["frequency"],
                 draft["publish_score"],
-                editorial_brief.canonical_json(),
             )
         if attempt + 1 < SCHEDULED_GENERATION_ATTEMPTS:
             attempt_content = build_semantic_retry_content(
@@ -3569,10 +3387,6 @@ async def prepare_telegram_post_package(draft: dict | sqlite3.Row) -> TelegramPo
     text = str(draft["post"] or "")
     if not text.strip():
         raise ValueError("Telegram post text is empty")
-    editorial_required = bool(
-        "editorial_brief_json" in draft.keys()
-        and str(draft["editorial_brief_json"] or "").strip()
-    )
 
     image_issue: str | None = None
     try:
@@ -3587,9 +3401,6 @@ async def prepare_telegram_post_package(draft: dict | sqlite3.Row) -> TelegramPo
 
     if images:
         return TelegramPostPackage(text=text, draft_id=int(draft["id"]), images=images)
-
-    if editorial_required:
-        raise RuntimeError("required relevant editorial image is unavailable")
 
     source_image_url = await asyncio.to_thread(find_source_image_url, draft["source_url"] or "")
     if source_image_url:
@@ -3679,14 +3490,10 @@ async def publish_draft(
     try:
         package = await prepare_telegram_post_package(draft)
     except Exception as e:
-        if "editorial_brief_json" in draft.keys() and str(draft["editorial_brief_json"] or "").strip():
-            delete_unpublished_draft(draft_id)
         return f"Публикация не выполнена: #{draft_id}. Подготовка пакета: {type(e).__name__}: {e}"
 
     outcome = await send_telegram_post(bot, package)
     if not outcome.success:
-        if "editorial_brief_json" in draft.keys() and str(draft["editorial_brief_json"] or "").strip():
-            delete_unpublished_draft(draft_id)
         return f"Публикация не выполнена: #{draft_id}. {outcome.error}"
 
     mark_published(draft_id, draft["source_url"] or "")
@@ -3906,52 +3713,6 @@ def schedule_recent_value(recent_key: str, slot_name: str) -> str:
     recent = [item for item in get_setting(recent_key, "").split(",") if item]
     recent.append(slot_name)
     return ",".join(recent[-8:])
-
-
-def registered_void_rubrics() -> set[str]:
-    return {
-        str(item.get("name") or "")
-        for item in (*RUBRIC_SCHEDULE, *TELEGRAM_VOID_SCHEDULE)
-        if str(item.get("name") or "")
-    } | {"MATERIAL / МАТЕРИЯ", "Culture", "approved_backstage", "canonical_story"}
-
-
-def build_scheduled_content_brief(
-    *,
-    slot: dict[str, Any],
-    editorial_plan: dict[str, str],
-    source_reference: str,
-    platform: str,
-    source_type: str,
-) -> editorial_policy.ContentBrief:
-    rubric = str(slot.get("name") or "")
-    thesis = str(editorial_plan.get("meaning_thought") or slot.get("brief") or "").strip()
-    visual_subject = str(
-        editorial_plan.get("scene_instruction")
-        or editorial_plan.get("media")
-        or slot.get("brief")
-        or ""
-    ).strip()
-    return editorial_policy.build_brief(
-        destination=platform,
-        scheduled_slot=f"{platform}:{slot.get('mode', 'signal')}",
-        source_type=source_type,
-        source_reference=source_reference,
-        rubric=rubric,
-        thesis=thesis,
-        context_reason=(
-            "A sourced current event selected by the configured rubric."
-            if source_type == "current_event_with_source"
-            else "The configured publication schedule selected this rubric and approved semantic axis."
-        ),
-        visual_subject=visual_subject,
-        visual_relation=(
-            "The selected concrete scene must reveal the fixed thesis through VOID's visible-hidden boundary."
-        ),
-        allowed_rubrics=registered_void_rubrics(),
-        required_elements=(visual_subject,),
-        music_required=platform == "vk",
-    )
 
 
 SCHEDULED_GENERATION_ATTEMPTS = 2
@@ -4302,16 +4063,6 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
     if voice == "news":
         items = await asyncio.to_thread(fetch_news)
         for item in items[:10]:
-            source_reference = str(item.get("url") or "").strip()
-            if not source_reference:
-                continue
-            content_brief = build_scheduled_content_brief(
-                slot=slot,
-                editorial_plan=editorial_plan,
-                source_reference=source_reference,
-                platform="vk",
-                source_type="current_event_with_source",
-            )
             news_content = (
                 f"Заголовок: {item['title']}\n"
                 f"Описание: {item.get('summary', '')}\n"
@@ -4319,15 +4070,13 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
                 f"Ссылка: {item.get('url', '')}"
                 f"\n\n{character_directive}"
             )
-            draft_id = await generate_scheduled_draft(
-                mode=item.get("mode", "news"),
-                content=news_content,
-                frequency=item.get("frequency", "HUMAN"),
-                source_name=item.get("source_name", ""),
-                source_url=source_reference,
-                platform="vk",
-                semantic_theme="",
-                editorial_brief=content_brief,
+            draft_id = await generate_and_save(
+                item.get("mode", "news"),
+                news_content,
+                item.get("frequency", "HUMAN"),
+                item.get("source_name", ""),
+                item.get("url", ""),
+                "vk",
             )
             draft = get_draft(draft_id)
             ok, _ = quality_check(draft["post"] if draft else "")
@@ -4341,23 +4090,14 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
                 return draft_id
         raise RuntimeError("fresh news signals not found")
 
-    source_reference = f"manual://vk/schedule/{slot.get('mode', 'signal')}/{now_iso()}"
-    content_brief = build_scheduled_content_brief(
-        slot=slot,
-        editorial_plan=editorial_plan,
-        source_reference=source_reference,
-        platform="vk",
-        source_type="scheduled_rubric",
-    )
     draft_id = await generate_scheduled_draft(
         mode=mode,
         content=content,
         frequency=str(slot.get("frequency", "HUMAN")),
         source_name="VOID / VK scheduled rubric",
-        source_url=source_reference,
+        source_url=f"manual://vk/schedule/{slot.get('mode', 'signal')}/{now_iso()}",
         platform="vk",
         semantic_theme=semantic_theme,
-        editorial_brief=content_brief,
     )
     await asyncio.to_thread(
         record_content_signature,
@@ -4393,16 +4133,6 @@ async def save_telegram_void_scheduled_draft(
     if voice == "news":
         items = await asyncio.to_thread(fetch_news)
         for item in items[:10]:
-            source_reference = str(item.get("url") or "").strip()
-            if not source_reference:
-                continue
-            content_brief = build_scheduled_content_brief(
-                slot=slot,
-                editorial_plan=editorial_plan,
-                source_reference=source_reference,
-                platform="telegram",
-                source_type="current_event_with_source",
-            )
             content = (
                 f"Заголовок: {item['title']}\n"
                 f"Описание: {item.get('summary', '')}\n"
@@ -4410,15 +4140,13 @@ async def save_telegram_void_scheduled_draft(
                 f"Ссылка: {item.get('url', '')}"
                 f"\n\n{character_directive}"
             )
-            draft_id = await generate_scheduled_draft(
-                mode=item.get("mode", "news"),
-                content=content,
-                frequency=item.get("frequency", "HUMAN"),
-                source_name=item.get("source_name", ""),
-                source_url=source_reference,
-                platform="telegram",
-                semantic_theme="",
-                editorial_brief=content_brief,
+            draft_id = await generate_and_save(
+                item.get("mode", "news"),
+                content,
+                item.get("frequency", "HUMAN"),
+                item.get("source_name", ""),
+                item.get("url", ""),
+                "telegram",
             )
             draft = get_draft(draft_id)
             ok, _ = quality_check(draft["post"] if draft else "")
@@ -4433,23 +4161,14 @@ async def save_telegram_void_scheduled_draft(
         f"{character_directive}\n\n"
         "Make an original VOID post for Telegram. Do not mention that this came from a schedule."
     )
-    source_reference = f"manual://telegram/void/{slot.get('mode', 'signal')}/{now_iso()}"
-    content_brief = build_scheduled_content_brief(
-        slot=slot,
-        editorial_plan=editorial_plan,
-        source_reference=source_reference,
-        platform="telegram",
-        source_type="scheduled_rubric",
-    )
     draft_id = await generate_scheduled_draft(
         mode=mode,
         content=content,
         frequency=str(slot.get("frequency", "HUMAN")),
         source_name="VOID / Telegram scheduled rubric",
-        source_url=source_reference,
+        source_url=f"manual://telegram/void/{slot.get('mode', 'signal')}/{now_iso()}",
         platform="telegram",
         semantic_theme=semantic_theme,
-        editorial_brief=content_brief,
     )
     return draft_id, editorial_plan, f"semantic_theme:{semantic_theme}|{brief}"
 
@@ -4459,7 +4178,20 @@ async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
     try:
         draft_id, editorial_plan, content_topic = await save_telegram_void_scheduled_draft(slot)
     except Exception as e:
-        return f"Telegram VOID schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
+        if slot.get("voice") == "news":
+            fallback = await asyncio.to_thread(
+                choose_schedule_slot,
+                [
+                    item
+                    for item in TELEGRAM_VOID_SCHEDULE
+                    if item.get("voice") == "void"
+                ],
+                _published_schedule_names(TELEGRAM_VOID_SCHEDULE, "telegram"),
+            )
+            draft_id, editorial_plan, content_topic = await save_telegram_void_scheduled_draft(fallback)
+            slot = fallback
+        else:
+            return f"Telegram VOID schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
 
     draft = get_draft(draft_id)
     ok, reason = quality_check(draft["post"] if draft else "")
@@ -5850,23 +5582,10 @@ async def free_text_handler(message: Message):
     await message.answer(reply, reply_markup=reply_main_keyboard())
 
 
-def validate_editorial_config() -> None:
-    if editorial_policy.EDITORIAL_CONTRACT_VERSION != "editorial-relevance.v1":
-        raise RuntimeError("unknown editorial contract version")
-    if editorial_policy.PERSONA_POLICY_VERSION != "void-persona.v2":
-        raise RuntimeError("unknown VOID persona policy version")
-    if editorial_policy.VISUAL_CODE_VERSION != "void-visual.v2":
-        raise RuntimeError("unknown VOID visual code version")
-    names = [str(item.get("name") or "").strip() for item in (*RUBRIC_SCHEDULE, *TELEGRAM_VOID_SCHEDULE)]
-    if any(not name for name in names):
-        raise RuntimeError("VOID rubric registry contains an unnamed rubric")
-
-
 async def run_bot_once():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN не задан")
 
-    validate_editorial_config()
     init_db()
 
     session = AiohttpSession(proxy=TELEGRAM_PROXY_URL or None)
