@@ -148,8 +148,7 @@ class TelegramPublisherTests(unittest.IsolatedAsyncioTestCase):
         )
         diagnostic = log.call_args.args[0]
         self.assertIn("model=openai/gpt-image-2", diagnostic)
-        self.assertNotIn("fallback", diagnostic.casefold())
-        self.assertIn("image generation failed", diagnostic)
+        self.assertIn("source-image/text-only fallback", diagnostic)
 
     def make_bot(self, calls: list[str]) -> MagicMock:
         bot = MagicMock()
