@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import re
 from pathlib import Path
@@ -17,6 +18,19 @@ from vk_publish_queue import (
 
 QUEUE_DIR = Path(os.getenv("VK_PUBLISH_QUEUE_DIR", "/var/lib/void-vk-publisher/queue"))
 VOID_DRAFT_SOURCE_RE = re.compile(r"^void:draft:(\d+)$")
+
+
+def _editorial_plan(draft) -> main.editorial_orchestrator.EditorialPlan | None:
+    raw = str(draft["editorial_plan_json"] or "") if "editorial_plan_json" in draft.keys() else ""
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+        if not isinstance(payload, dict):
+            return None
+        return main.editorial_orchestrator.EditorialPlan.from_dict(payload)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 def parse_scheduled_draft_id(response: str) -> int:
@@ -62,7 +76,18 @@ def enqueue_draft(draft_id: int) -> Path:
     if not track:
         raise RuntimeError("No suitable fresh VK music track is available; draft was not queued")
     track_query = f"{track.get('artist', '')} {track.get('title', '')}".strip()
-    job = build_job(producer="void", target_group_id=str(main.VK_GROUP_ID), text=draft["post"], media=list(media), track_query=track_query, dedupe_key=f"void-draft:{draft_id}", source_ref=f"void:draft:{draft_id}")
+    plan = _editorial_plan(draft)
+    job = build_job(
+        producer="void",
+        target_group_id=str(main.VK_GROUP_ID),
+        text=draft["post"],
+        media=list(media),
+        track_query=track_query,
+        dedupe_key=f"void-draft:{draft_id}",
+        source_ref=f"void:draft:{draft_id}",
+        plan_id=plan.plan_id if plan is not None else "",
+        editorial=main.safe_vk_editorial_metadata(plan) if plan is not None else None,
+    )
     return enqueue_job(QUEUE_DIR, job, media)
 
 

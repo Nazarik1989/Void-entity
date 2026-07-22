@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import void_vk_producer
+import main
 
 from main import (
     SemanticSummary,
@@ -773,22 +774,16 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
         save.assert_not_called()
 
     async def test_semantic_rejection_does_not_reach_telegram_publish(self) -> None:
-        slot = {
-            "name": "Scheduled Signal",
-            "voice": "void",
-            "mode": "signal",
-        }
         with (
-            patch("main.choose_telegram_schedule_slot", return_value=slot),
             patch(
-                "main.save_telegram_void_scheduled_draft",
-                side_effect=RuntimeError("semantic rejection"),
+                "main.create_planned_scheduled_draft",
+                new=AsyncMock(side_effect=main.ScheduledContentReject("local_quality")),
             ),
             patch("main.publish_draft", new=AsyncMock()) as publish,
         ):
             result = await publish_telegram_void_scheduled_once(object())
         publish.assert_not_awaited()
-        self.assertIn("schedule failed", result)
+        self.assertIn("blocked by local quality", result)
 
 
 class ScheduledVkRejectionTests(unittest.TestCase):

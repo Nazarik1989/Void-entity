@@ -33,7 +33,9 @@ from dotenv import load_dotenv
 import character_state as void_character
 import delegated_messaging
 import duo_relationship
+import editorial_orchestrator
 import gaming_vertical
+import void_editorial_catalog
 from void_core import (
     CONTENT_PLAN,
     MATERIAL_VISUAL_PROMPT,
@@ -282,6 +284,13 @@ def init_db() -> None:
         published_at TEXT
     )
     """)
+    draft_columns = {row[1] for row in cur.execute("PRAGMA table_info(drafts)").fetchall()}
+    if "plan_id" not in draft_columns:
+        cur.execute("ALTER TABLE drafts ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''")
+    if "editorial_plan_json" not in draft_columns:
+        cur.execute("ALTER TABLE drafts ADD COLUMN editorial_plan_json TEXT NOT NULL DEFAULT ''")
+    if "generation_package_json" not in draft_columns:
+        cur.execute("ALTER TABLE drafts ADD COLUMN generation_package_json TEXT NOT NULL DEFAULT ''")
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS catches (
@@ -380,6 +389,12 @@ def init_db() -> None:
         cur.execute("ALTER TABLE content_signatures ADD COLUMN semantic_theme TEXT NOT NULL DEFAULT ''")
     if "draft_id" not in signature_columns:
         cur.execute("ALTER TABLE content_signatures ADD COLUMN draft_id INTEGER")
+    if "plan_id" not in signature_columns:
+        cur.execute("ALTER TABLE content_signatures ADD COLUMN plan_id TEXT NOT NULL DEFAULT ''")
+    if "source_ref" not in signature_columns:
+        cur.execute("ALTER TABLE content_signatures ADD COLUMN source_ref TEXT NOT NULL DEFAULT ''")
+    if "editorial_plan_json" not in signature_columns:
+        cur.execute("ALTER TABLE content_signatures ADD COLUMN editorial_plan_json TEXT NOT NULL DEFAULT ''")
     for column in (
         "mode",
         "meaning_key",
@@ -394,6 +409,10 @@ def init_db() -> None:
             )
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_void_signatures_created ON content_signatures(character_id, id)")
+    cur.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_void_signatures_published_plan "
+        "ON content_signatures(character_id, plan_id) WHERE plan_id <> ''"
+    )
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS relationship_states (
@@ -822,7 +841,8 @@ def get_recent_content_signatures(limit: int = 16) -> list[dict[str, str]]:
                signatures.content_kind, signatures.semantic_theme,
                signatures.meaning_key, signatures.moral_axis,
                signatures.scene_axis, signatures.narrative_shape,
-               signatures.hook, signatures.media, signatures.topic,
+               signatures.hook, signatures.media, signatures.topic, signatures.plan_id,
+               signatures.source_ref, signatures.editorial_plan_json,
                signatures.created_at
         FROM content_signatures AS signatures
         JOIN drafts ON drafts.id = signatures.draft_id
@@ -834,22 +854,33 @@ def get_recent_content_signatures(limit: int = 16) -> list[dict[str, str]]:
         (void_character.CHARACTER_ID, max(1, limit)),
     ).fetchall()
     conn.close()
-    return [dict(row) for row in reversed(rows)]
+    result: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        item: dict[str, Any] = dict(row)
+        try:
+            payload = json.loads(str(item.pop("editorial_plan_json", "") or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        if isinstance(payload, dict):
+            item.update(payload)
+        result.append(item)
+    return result
 
 
-def record_content_signature(
-    plan: dict[str, str],
+def _record_content_signature_conn(
+    conn: sqlite3.Connection,
+    plan: dict[str, Any],
     topic: str,
     draft_id: int,
 ) -> None:
-    conn = db()
     conn.execute(
         """
-        INSERT INTO content_signatures(
+        INSERT OR IGNORE INTO content_signatures(
             draft_id, character_id, platform, mode, facet, intent, format,
             content_format, content_kind, semantic_theme, meaning_key,
-            moral_axis, scene_axis, narrative_shape, hook, media, topic, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            moral_axis, scene_axis, narrative_shape, hook, media, topic, plan_id,
+            source_ref, editorial_plan_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             int(draft_id),
@@ -857,18 +888,25 @@ def record_content_signature(
             str(plan.get("platform", "telegram")),
             str(plan.get("mode", "")),
             str(plan.get("facet", "observer")),
-            str(plan.get("intent", "наблюдать")),
-            str(plan.get("format", "тихое наблюдение")),
+            str(plan.get("purpose", plan.get("intent", "наблюдать"))),
+            str(plan.get("structure", plan.get("format", "тихое наблюдение"))),
             str(plan.get("content_format", "text_story")),
-            str(plan.get("content_kind", "text")),
+            (
+                "video"
+                if str(plan.get("production_mode", "")) == "story_first"
+                else str(plan.get("content_kind", "text"))
+            ),
             str(plan.get("semantic_theme", "")),
-            str(plan.get("meaning_key", "")),
-            str(plan.get("moral_axis", "")),
-            str(plan.get("scene_axis", "")),
-            str(plan.get("narrative_shape", "")),
+            str(plan.get("semantic_card", plan.get("meaning_key", ""))),
+            str(plan.get("ending", plan.get("moral_axis", ""))),
+            str(plan.get("visual_subject_direction", plan.get("scene_axis", ""))),
+            str(plan.get("structure", plan.get("narrative_shape", ""))),
             str(plan.get("hook", "деталь")),
-            str(plan.get("media", "кинематографический кадр")),
+            str(plan.get("visual_mode", plan.get("media", "кинематографический кадр"))),
             topic[:1000],
+            str(plan.get("plan_id", ""))[:64],
+            str(plan.get("source_ref", ""))[:1000],
+            json.dumps(plan, ensure_ascii=False, separators=(",", ":"))[:16000],
             now_iso(),
         ),
     )
@@ -884,6 +922,15 @@ def record_content_signature(
         """,
         (void_character.CHARACTER_ID, void_character.CHARACTER_ID),
     )
+
+
+def record_content_signature(
+    plan: dict[str, Any],
+    topic: str,
+    draft_id: int,
+) -> None:
+    conn = db()
+    _record_content_signature_conn(conn, plan, topic, draft_id)
     conn.commit()
     conn.close()
 
@@ -1745,15 +1792,34 @@ def get_candidate(candidate_id: int) -> sqlite3.Row | None:
     return row
 
 
-def save_draft(mode: str, title: str, post: str, source_name: str = "", source_url: str = "", frequency: str = "", publish_score: int = 5) -> int:
+def save_draft(
+    mode: str,
+    title: str,
+    post: str,
+    source_name: str = "",
+    source_url: str = "",
+    frequency: str = "",
+    publish_score: int = 5,
+    *,
+    plan_id: str = "",
+    editorial_plan: dict[str, Any] | None = None,
+    generation_package: dict[str, Any] | None = None,
+) -> int:
     conn = db()
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO drafts(mode, title, post, source_name, source_url, frequency, publish_score, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO drafts(
+            mode, title, post, source_name, source_url, frequency, publish_score,
+            created_at, plan_id, editorial_plan_json, generation_package_json
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (mode, title, post, source_name, source_url, frequency, int(publish_score), now_iso()),
+        (
+            mode, title, post, source_name, source_url, frequency, int(publish_score),
+            now_iso(), str(plan_id)[:64],
+            json.dumps(editorial_plan or {}, ensure_ascii=False, separators=(",", ":"))[:16000],
+            json.dumps(generation_package or {}, ensure_ascii=False, separators=(",", ":"))[:12000],
+        ),
     )
     conn.commit()
     draft_id = int(cur.lastrowid)
@@ -1780,18 +1846,34 @@ def get_draft(draft_id: int) -> sqlite3.Row | None:
 
 def mark_published(draft_id: int, source_url: str = "") -> bool:
     conn = db()
+    draft = conn.execute(
+        "SELECT title, editorial_plan_json FROM drafts WHERE id=?",
+        (draft_id,),
+    ).fetchone()
     published_at = now_iso()
     cursor = conn.execute(
         "UPDATE drafts SET published_at=? WHERE id=? AND published_at IS NULL",
         (published_at, draft_id),
     )
+    published_now = cursor.rowcount > 0
+    if published_now and draft is not None:
+        try:
+            plan = json.loads(str(draft["editorial_plan_json"] or "{}"))
+        except json.JSONDecodeError:
+            plan = {}
+        if isinstance(plan, dict) and str(plan.get("plan_id", "")):
+            _record_content_signature_conn(
+                conn,
+                plan,
+                str(plan.get("topic") or draft["title"] or ""),
+                draft_id,
+            )
     if source_url and source_url.startswith("http"):
         conn.execute(
             "INSERT OR REPLACE INTO published_urls(url, draft_id, published_at) VALUES (?, ?, ?)",
             (source_url, draft_id, published_at),
         )
     conn.commit()
-    published_now = cursor.rowcount > 0
     conn.close()
     return published_now
 
@@ -2045,6 +2127,36 @@ def build_image_prompts_sync(draft: dict | sqlite3.Row) -> list[str]:
     post = draft["post"] or ""
     source_name = draft["source_name"] or ""
     count = image_count_for_draft(mode, post)
+    raw_plan = str(draft["editorial_plan_json"] or "") if "editorial_plan_json" in draft.keys() else ""
+    raw_package = str(draft["generation_package_json"] or "") if "generation_package_json" in draft.keys() else ""
+    if raw_plan and raw_package:
+        try:
+            plan = editorial_orchestrator.EditorialPlan.from_dict(json.loads(raw_plan))
+            package_payload = json.loads(raw_package)
+            package = editorial_orchestrator.GenerationPackage(
+                final_text=str(package_payload["final_text"]),
+                concrete_scene=str(package_payload["concrete_scene"]),
+                visual_subject=str(package_payload["visual_subject"]),
+                visual_relation_to_thesis=str(package_payload["visual_relation_to_thesis"]),
+                image_prompt_seed=str(package_payload["image_prompt_seed"]),
+                track_tags=tuple(str(item) for item in package_payload["track_tags"]),
+            )
+            visual_brief = editorial_orchestrator.package_visual_brief(plan, package)
+            prompts = []
+            for index in range(count):
+                frame = (
+                    MATERIAL_FRAME_DIRECTIONS[index]
+                    if mode == "material" and index < len(MATERIAL_FRAME_DIRECTIONS)
+                    else f"Composition variation {index + 1}; preserve the exact planned subject and thesis relation."
+                )
+                prompts.append(
+                    f"{visual_brief}\n\nCanonical VOID rules (mandatory):\n{VOID_VISUAL_CANON_PROMPT}\n\n"
+                    f"{MATERIAL_VISUAL_PROMPT if mode == 'material' else ''}\n{frame}\n"
+                    "No unrelated people, generic stock scene, text, logos, UI, buttons or watermarks."
+                )
+            return prompts
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("stored orchestrated visual package is invalid") from exc
     visual_directions = image_visual_directions(draft_id, count, mode)
     mode_visual_prompt = MATERIAL_VISUAL_PROMPT if mode == "material" else ""
 
@@ -3222,7 +3334,22 @@ def choose_vk_music_track(
     if not tracks:
         return None
 
-    post_vibes = post_vk_vibes(draft)
+    plan_id = ""
+    post_vibes: set[str]
+    raw_plan = str(draft["editorial_plan_json"] or "") if "editorial_plan_json" in draft.keys() else ""
+    if raw_plan:
+        try:
+            plan_payload = json.loads(raw_plan)
+            plan_id = str(plan_payload.get("plan_id") or "")
+            post_vibes = {
+                str(tag).strip().casefold()
+                for tag in plan_payload.get("track_tags", [])
+                if str(tag).strip()
+            }
+        except (json.JSONDecodeError, TypeError):
+            return None
+    else:
+        post_vibes = post_vk_vibes(draft)
 
     def score(track: dict[str, Any]) -> int:
         track_vibes = track_vk_vibes(track)
@@ -3244,7 +3371,7 @@ def choose_vk_music_track(
         return None
     best = [track for track in candidates if score(track) == best_score]
 
-    draft_seed = str(draft["id"] if "id" in draft.keys() else sorted(post_vibes))
+    draft_seed = plan_id or str(draft["id"] if "id" in draft.keys() else sorted(post_vibes))
     return random.Random(draft_seed).choice(best)
 
 
@@ -3941,6 +4068,248 @@ def build_semantic_retry_content(
     )
 
 
+VOID_GENERATION_PACKAGE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "final_text": {"type": "string"},
+        "concrete_scene": {"type": "string"},
+        "visual_subject": {"type": "string"},
+        "visual_relation_to_thesis": {"type": "string"},
+        "image_prompt_seed": {"type": "string"},
+        "track_tags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "final_text", "concrete_scene", "visual_subject",
+        "visual_relation_to_thesis", "image_prompt_seed", "track_tags",
+    ],
+}
+
+
+class ScheduledTechnicalFailure(RuntimeError):
+    pass
+
+
+class ScheduledContentReject(RuntimeError):
+    pass
+
+
+def scheduled_plan(
+    *,
+    platform: str,
+    slot: str,
+    seed: str,
+    rubric_rows: list[dict[str, Any]],
+    source_rows: list[dict[str, Any]],
+    character: void_character.CharacterState,
+    crosspost_plan_id: str = "",
+) -> editorial_orchestrator.EditorialPlan:
+    """The sole creative decision entrypoint for scheduled VOID routes."""
+    context = void_editorial_catalog.build_context(
+        platform=platform,
+        slot=slot,
+        seed=seed,
+        rubric_rows=rubric_rows,
+        source_rows=source_rows,
+        published_history=get_recent_content_signatures(160),
+        character=character,
+        crosspost_plan_id=crosspost_plan_id,
+    )
+    return editorial_orchestrator.plan_release(context)
+
+
+def generation_package_dict(package: editorial_orchestrator.GenerationPackage) -> dict[str, Any]:
+    return {
+        "final_text": package.final_text,
+        "concrete_scene": package.concrete_scene,
+        "visual_subject": package.visual_subject,
+        "visual_relation_to_thesis": package.visual_relation_to_thesis,
+        "image_prompt_seed": package.image_prompt_seed,
+        "track_tags": list(package.track_tags),
+    }
+
+
+def safe_vk_editorial_metadata(plan: editorial_orchestrator.EditorialPlan) -> dict[str, Any]:
+    return {
+        "persona": plan.persona,
+        "platform": plan.platform,
+        "slot": plan.slot,
+        "rubric": plan.rubric,
+        "source_type": plan.source_type,
+        "purpose": plan.purpose,
+        "semantic_theme": plan.semantic_theme,
+        "semantic_card": plan.semantic_card,
+        "structure": plan.structure,
+        "visual_mode": plan.visual_mode,
+        "track_tags": list(plan.track_tags),
+        "orchestrator_version": plan.orchestrator_version,
+        "content_policy_version": plan.content_policy_version,
+        "visual_policy_version": plan.visual_policy_version,
+        "music_policy_version": plan.music_policy_version,
+    }
+
+
+def scheduled_package_quality_check(
+    plan: editorial_orchestrator.EditorialPlan,
+    package: editorial_orchestrator.GenerationPackage,
+) -> tuple[bool, str]:
+    ok, reason = quality_check(package.final_text)
+    if not ok:
+        return False, reason
+    lowered = package.final_text.casefold()
+    if any(marker in lowered for marker in ("diag:", "traceback", "internal exception", "editorial plan", "plan_id")):
+        return False, "internal_metadata"
+    if package.visual_relation_to_thesis.casefold() in {"n/a", "none", "unrelated"}:
+        return False, "visual_relevance"
+    return True, "ok"
+
+
+async def generate_scheduled_package(
+    plan: editorial_orchestrator.EditorialPlan,
+    character: void_character.CharacterState,
+    *,
+    source_material: str = "",
+) -> editorial_orchestrator.GenerationPackage:
+    technical_reason = ""
+    for attempt in range(2):
+        source_line = (
+            f"Источник: {plan.source_ref}"
+            if plan.source_type == "documented_source"
+            else f"Источник: editorial://void/{plan.mode}"
+        )
+        prompt = editorial_orchestrator.generation_prompt(
+            plan,
+            persona_direction=(
+                f"{void_editorial_catalog.persona_direction(character)} "
+                "The publishable final_text must end with this exact source line: "
+                f"{source_line}"
+            ),
+            source_material=source_material,
+            technical_retry_reason=technical_reason,
+        )
+        raw = await asyncio.to_thread(
+            call_ai,
+            "Execute the supplied VOID EditorialPlan exactly. Return strict JSON only; never expose diagnostics or private material.",
+            prompt,
+            1900,
+            OPENAI_POST_MODEL,
+            response_schema=VOID_GENERATION_PACKAGE_SCHEMA,
+            response_schema_name="void_generation_package",
+        )
+        try:
+            package = editorial_orchestrator.parse_generation_package(raw, plan)
+        except editorial_orchestrator.GenerationPackageError as exc:
+            technical_reason = str(exc)
+            if attempt == 0:
+                continue
+            raise ScheduledTechnicalFailure("generation_package_invalid_twice") from exc
+        ok, reason = scheduled_package_quality_check(plan, package)
+        if not ok:
+            raise ScheduledContentReject(reason)
+        return package
+    raise ScheduledTechnicalFailure("generation_package_unavailable")
+
+
+async def scheduled_inputs(
+    schedule: list[dict[str, Any]],
+    *,
+    now: datetime,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    eligible = [dict(item) for item in eligible_schedule_slots(schedule, now)]
+    rubric_rows: list[dict[str, Any]] = []
+    source_rows: list[dict[str, Any]] = []
+    source_items: dict[str, dict[str, Any]] = {}
+    news_items: list[dict[str, Any]] | None = None
+    for row in eligible:
+        key = void_editorial_catalog.rubric_key(str(row["name"]))
+        row["key"] = key
+        rubric_rows.append(row)
+        if str(row.get("voice") or "void") == "news":
+            if news_items is None:
+                news_items = await asyncio.to_thread(fetch_news)
+            for item in news_items[:10]:
+                ref = str(item.get("url") or "")
+                if not ref:
+                    continue
+                source_rows.append(
+                    {
+                        "source_ref": ref,
+                        "topic": str(item.get("title") or row["brief"]),
+                        "source_type": "documented_source",
+                        "rubric_keys": (key,),
+                        "source_verified": ref.startswith("http"),
+                    }
+                )
+                source_items[ref] = item
+        else:
+            ref = f"void-catalog:{key}:{row.get('mode', 'signal')}:{now:%Y-%m-%d:%H}"
+            source_rows.append(
+                {
+                    "source_ref": ref,
+                    "topic": str(row.get("brief") or "one concrete VOID observation"),
+                    "source_type": "catalog",
+                    "rubric_keys": (key,),
+                }
+            )
+            source_items[ref] = row
+    # A news rubric without a usable source is not compatible and therefore is
+    # removed before plan_release; this is source integrity, not diversity.
+    usable_keys = {key for source in source_rows for key in source.get("rubric_keys", ())}
+    rubric_rows = [row for row in rubric_rows if str(row["key"]) in usable_keys]
+    if not rubric_rows or not source_rows:
+        raise RuntimeError("no source-integrity-compatible scheduled inputs")
+    return rubric_rows, source_rows, source_items
+
+
+async def create_planned_scheduled_draft(
+    schedule: list[dict[str, Any]],
+    *,
+    platform: str,
+    slot: str,
+    now: datetime | None = None,
+) -> tuple[int, editorial_orchestrator.EditorialPlan, str]:
+    current = now or datetime.now(MOSCOW_TZ)
+    rubric_rows, source_rows, source_items = await scheduled_inputs(schedule, now=current)
+    character = void_character.apply_event(load_character_state(), "quiet")
+    seed = f"{platform}:{current:%Y-%m-%d}:{slot}"
+    plan = scheduled_plan(
+        platform=platform,
+        slot=slot,
+        seed=seed,
+        rubric_rows=rubric_rows,
+        source_rows=source_rows,
+        character=character,
+    )
+    source = source_items[plan.source_ref]
+    source_material = ""
+    source_name = f"VOID / {platform} scheduled rubric"
+    source_url = f"manual://{platform}/void/{plan.mode}/{now_iso()}"
+    frequency = str(next(row for row in rubric_rows if row["name"] == plan.rubric).get("frequency", "HUMAN"))
+    if plan.source_type == "documented_source":
+        source_material = (
+            f"Title: {source.get('title', '')}\nSummary: {source.get('summary', '')}\n"
+            f"Source: {source.get('source_name', '')}\nURL: {source.get('url', '')}"
+        )
+        source_name = str(source.get("source_name") or source_name)
+        source_url = str(source.get("url") or source_url)
+        frequency = str(source.get("frequency") or frequency)
+    package = await generate_scheduled_package(plan, character, source_material=source_material)
+    draft_id = await asyncio.to_thread(
+        save_draft,
+        plan.mode,
+        plan.rubric,
+        package.final_text,
+        source_name,
+        source_url,
+        frequency,
+        8,
+        plan_id=plan.plan_id,
+        editorial_plan=plan.to_dict(),
+        generation_package=generation_package_dict(package),
+    )
+    return draft_id, plan, plan.topic
+
+
 def _published_schedule_names(
     schedule: list[dict[str, Any]],
     platform: str,
@@ -4032,78 +4401,10 @@ def telegram_schedule_text(now: datetime | None = None) -> str:
 
 
 async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
-    voice = str(slot.get("voice", "void"))
-    name = str(slot.get("name", "Scheduled Signal"))
-    brief = str(slot.get("brief", "Make an original post for the shared public."))
-    mode = str(slot.get("mode", "signal"))
-    recent_signatures = await asyncio.to_thread(get_recent_content_signatures)
-    semantic_theme = (
-        ""
-        if voice == "news"
-        else choose_semantic_theme(mode, recent_signatures)
-    )
-    _, editorial_plan, character_directive = await asyncio.to_thread(
-        build_character_directive,
-        brief,
-        "vk",
-        mode,
-        False,
-        semantic_theme,
-    )
-
-    content = (
-        f"RUBRIC: {name}\n"
-        f"VOICE: {voice}\n"
-        f"PLATFORM: VK shared public\n"
-        f"BRIEF:\n{brief}\n\n"
-        f"{character_directive}\n\n"
-        "Make an original post for the shared VK public. Do not mention that this came from a schedule."
-    )
-
-    if voice == "news":
-        items = await asyncio.to_thread(fetch_news)
-        for item in items[:10]:
-            news_content = (
-                f"Заголовок: {item['title']}\n"
-                f"Описание: {item.get('summary', '')}\n"
-                f"Источник: {item.get('source_name', '')}\n"
-                f"Ссылка: {item.get('url', '')}"
-                f"\n\n{character_directive}"
-            )
-            draft_id = await generate_and_save(
-                item.get("mode", "news"),
-                news_content,
-                item.get("frequency", "HUMAN"),
-                item.get("source_name", ""),
-                item.get("url", ""),
-                "vk",
-            )
-            draft = get_draft(draft_id)
-            ok, _ = quality_check(draft["post"] if draft else "")
-            if ok:
-                await asyncio.to_thread(
-                    record_content_signature,
-                    editorial_plan,
-                    item.get("title", brief),
-                    draft_id,
-                )
-                return draft_id
-        raise RuntimeError("fresh news signals not found")
-
-    draft_id = await generate_scheduled_draft(
-        mode=mode,
-        content=content,
-        frequency=str(slot.get("frequency", "HUMAN")),
-        source_name="VOID / VK scheduled rubric",
-        source_url=f"manual://vk/schedule/{slot.get('mode', 'signal')}/{now_iso()}",
+    draft_id, _, _ = await create_planned_scheduled_draft(
+        [dict(slot)],
         platform="vk",
-        semantic_theme=semantic_theme,
-    )
-    await asyncio.to_thread(
-        record_content_signature,
-        editorial_plan,
-        f"semantic_theme:{semantic_theme}|{brief}",
-        draft_id,
+        slot=str(slot.get("name") or "scheduled"),
     )
     return draft_id
 
@@ -4111,87 +4412,27 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
 async def save_telegram_void_scheduled_draft(
     slot: dict[str, Any],
 ) -> tuple[int, dict[str, str], str]:
-    voice = str(slot.get("voice", "void"))
-    name = str(slot.get("name", "Telegram VOID"))
-    brief = str(slot.get("brief", "Make an original Telegram post."))
-    mode = str(slot.get("mode", "signal"))
-    recent_signatures = await asyncio.to_thread(get_recent_content_signatures)
-    semantic_theme = (
-        ""
-        if voice == "news"
-        else choose_semantic_theme(mode, recent_signatures)
-    )
-    _, editorial_plan, character_directive = await asyncio.to_thread(
-        build_character_directive,
-        brief,
-        "telegram",
-        mode,
-        False,
-        semantic_theme,
-    )
-
-    if voice == "news":
-        items = await asyncio.to_thread(fetch_news)
-        for item in items[:10]:
-            content = (
-                f"Заголовок: {item['title']}\n"
-                f"Описание: {item.get('summary', '')}\n"
-                f"Источник: {item.get('source_name', '')}\n"
-                f"Ссылка: {item.get('url', '')}"
-                f"\n\n{character_directive}"
-            )
-            draft_id = await generate_and_save(
-                item.get("mode", "news"),
-                content,
-                item.get("frequency", "HUMAN"),
-                item.get("source_name", ""),
-                item.get("url", ""),
-                "telegram",
-            )
-            draft = get_draft(draft_id)
-            ok, _ = quality_check(draft["post"] if draft else "")
-            if ok:
-                return draft_id, editorial_plan, item.get("title", brief)
-        raise RuntimeError("fresh news signals not found")
-
-    content = (
-        f"RUBRIC: {name}\n"
-        f"PLATFORM: Telegram VOID channel\n"
-        f"BRIEF:\n{brief}\n\n"
-        f"{character_directive}\n\n"
-        "Make an original VOID post for Telegram. Do not mention that this came from a schedule."
-    )
-    draft_id = await generate_scheduled_draft(
-        mode=mode,
-        content=content,
-        frequency=str(slot.get("frequency", "HUMAN")),
-        source_name="VOID / Telegram scheduled rubric",
-        source_url=f"manual://telegram/void/{slot.get('mode', 'signal')}/{now_iso()}",
+    draft_id, plan, topic = await create_planned_scheduled_draft(
+        [dict(slot)],
         platform="telegram",
-        semantic_theme=semantic_theme,
+        slot=str(slot.get("name") or "scheduled"),
     )
-    return draft_id, editorial_plan, f"semantic_theme:{semantic_theme}|{brief}"
+    return draft_id, plan.to_dict(), topic
 
 
 async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
-    slot = await asyncio.to_thread(choose_telegram_schedule_slot)
     try:
-        draft_id, editorial_plan, content_topic = await save_telegram_void_scheduled_draft(slot)
-    except Exception as e:
-        if slot.get("voice") == "news":
-            fallback = await asyncio.to_thread(
-                choose_schedule_slot,
-                [
-                    item
-                    for item in TELEGRAM_VOID_SCHEDULE
-                    if item.get("voice") == "void"
-                ],
-                _published_schedule_names(TELEGRAM_VOID_SCHEDULE, "telegram"),
-            )
-            draft_id, editorial_plan, content_topic = await save_telegram_void_scheduled_draft(fallback)
-            slot = fallback
-        else:
-            return f"Telegram VOID schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
+        draft_id, plan, content_topic = await create_planned_scheduled_draft(
+            TELEGRAM_VOID_SCHEDULE,
+            platform="telegram",
+            slot=current_void_schedule_slot() or "scheduled",
+        )
+    except ScheduledTechnicalFailure:
+        return "Telegram VOID schedule failed privately: generation package invalid twice; no public DIAG"
+    except ScheduledContentReject as exc:
+        return f"Telegram VOID schedule blocked by local quality: {exc}"
+    except Exception as exc:
+        return f"Telegram VOID schedule failed before publication: {type(exc).__name__}"
 
     draft = get_draft(draft_id)
     ok, reason = quality_check(draft["post"] if draft else "")
@@ -4200,16 +4441,16 @@ async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
     result = await publish_draft(
         bot,
         draft_id,
-        content_plan=editorial_plan,
+        content_plan=plan.to_dict(),
         content_topic=content_topic,
         apply_planned_character_event=True,
         setting_updates={
             "telegram_void_recent": schedule_recent_value(
-                "telegram_void_recent", str(slot["name"])
+                "telegram_void_recent", plan.rubric
             )
         },
     )
-    return f"Telegram VOID schedule: {slot['name']} -> {result}"
+    return f"Telegram VOID schedule: {plan.rubric} -> {result}"
 
 
 async def autopost_scheduled_once(bot: Bot) -> str:
@@ -4217,9 +4458,12 @@ async def autopost_scheduled_once(bot: Bot) -> str:
 
 
 async def make_scheduled_rubric_draft_once() -> str:
-    slot = await asyncio.to_thread(choose_scheduled_rubric)
-    draft_id = await save_scheduled_rubric_draft(slot)
-    return f"Scheduled VK draft: #{draft_id}\nRubric: {slot['name']} / {slot['voice']}\n/preview {draft_id}"
+    draft_id, plan, _ = await create_planned_scheduled_draft(
+        RUBRIC_SCHEDULE,
+        platform="vk",
+        slot=f"{datetime.now(MOSCOW_TZ):%H:%M}",
+    )
+    return f"Scheduled VK draft: #{draft_id}\nRubric: {plan.rubric}\n/preview {draft_id}"
 
 
 async def auto_loop(bot: Bot) -> None:
@@ -5451,7 +5695,16 @@ async def synthesize_voice_bytes(text: str) -> bytes:
     return audio
 
 
-async def generate_dialog_answer(user_id: int, text: str) -> str:
+def persist_dialog_turn(user_id: int, text: str, reply: str) -> None:
+    """Stable VOID owns all durable dialog writes, including hybrid finals."""
+    save_dialog_message(user_id, "user", text)
+    save_dialog_message(user_id, "assistant", reply)
+    new_memory = build_memory_note(text, reply)
+    if new_memory:
+        save_dialog_message(user_id, "memory", new_memory)
+
+
+async def generate_dialog_answer(user_id: int, text: str, *, persist: bool = True) -> str:
     session = get_dialog_session(user_id)
     history = get_dialog_context(user_id, limit=8)
     personality = session.get("personality", "observer")
@@ -5464,12 +5717,98 @@ async def generate_dialog_answer(user_id: int, text: str) -> str:
         model=OPENAI_DIALOG_MODEL,
     )
     reply = (reply or "").strip() or "Я не успел сформулировать ответ. Попробуй ещё раз."
-    save_dialog_message(user_id, "user", text)
-    save_dialog_message(user_id, "assistant", reply)
-    new_memory = build_memory_note(text, reply)
-    if new_memory:
-        save_dialog_message(user_id, "memory", new_memory)
+    if persist:
+        persist_dialog_turn(user_id, text, reply)
     return reply
+
+
+def void_v14_allowlisted_user_ids() -> frozenset[int]:
+    values: set[int] = set()
+    for item in os.getenv("VOID_V14_ALLOWLIST", "").split(","):
+        item = item.strip()
+        if item and item.lstrip("-").isdigit():
+            values.add(int(item))
+    return frozenset(values)
+
+
+def build_void_v14_router():
+    """Lazy laboratory wiring; stable and scheduled paths never call this."""
+    from void_v14.config import VoidV14Config
+    from void_v14.engine import VoidV14Engine
+    from void_v14.memory import ExperimentalMemory
+    from void_v14.provider import OpenAIProvider
+    from void_v14.router import VoidV14Router
+
+    config = VoidV14Config(
+        memory_path=Path(
+            os.getenv(
+                "VOID_V14_MEMORY_PATH",
+                "/var/lib/void-entity/v14/experimental.sqlite3",
+            )
+        ),
+        allowlisted_user_ids=void_v14_allowlisted_user_ids(),
+    )
+    memory = ExperimentalMemory(
+        config.memory_path,
+        retention_days=config.retention_days,
+        forbidden_paths=(Path(DB_PATH),),
+    )
+    provider = OpenAIProvider(
+        config=config,
+        api_key=OPENAI_API_KEY,
+        base_url=OPENAI_BASE_URL,
+        model=OPENAI_DIALOG_MODEL,
+    )
+    return VoidV14Router(
+        config=config,
+        admin_id=ADMIN_ID,
+        engine=VoidV14Engine(provider, config, memory=memory),
+    )
+
+
+async def deliver_void_v14_outcome(message: Message, outcome: Any, request: str) -> None:
+    """Persist a hybrid final only after Telegram confirms the send."""
+    await message.answer(outcome.response, reply_markup=reply_main_keyboard())
+    if outcome.persist_stable_after_send:
+        persist_dialog_turn(message.from_user.id, request, outcome.response)
+
+
+@router.message(Command("v14"))
+async def void_v14_command(message: Message) -> None:
+    if not message.from_user:
+        return
+    user_id = message.from_user.id
+    if user_id != ADMIN_ID and user_id not in void_v14_allowlisted_user_ids():
+        await message.answer("VOID v14 недоступен для этого пользователя.")
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    if len(parts) < 3 or parts[1].casefold() not in {"stable", "experimental", "hybrid"}:
+        await message.answer("Используй: /v14 stable|experimental|hybrid <запрос>")
+        return
+    mode, request = parts[1].casefold(), parts[2].strip()
+    if not request:
+        await message.answer("Запрос VOID v14 пуст.")
+        return
+    if mode == "stable":
+        # Exact existing route: no v14 engine/provider and no additional model call.
+        response = await generate_dialog_answer(user_id, request)
+        await message.answer(response, reply_markup=reply_main_keyboard())
+        return
+
+    async def stable_generate(text: str, persist: bool) -> str:
+        return await generate_dialog_answer(user_id, text, persist=persist)
+
+    try:
+        outcome = await build_void_v14_router().route(
+            mode=mode,
+            user_id=user_id,
+            request=request,
+            stable_generate=stable_generate,
+        )
+        await deliver_void_v14_outcome(message, outcome, request)
+    except Exception as exc:
+        print(f"VOID v14 command failed: {type(exc).__name__}", flush=True)
+        await message.answer("VOID v14 временно недоступен. Stable VOID не изменён.")
 
 
 @router.message(F.voice | F.audio)
