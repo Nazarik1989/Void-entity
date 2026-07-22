@@ -85,31 +85,6 @@ class VoidEditorialPolicyTests(unittest.TestCase):
         self.assertFalse(decision.accepted)
         self.assertEqual(decision.reason_code, "image_thesis_mismatch")
 
-    def test_text_gate_schema_enumerates_codes_and_excludes_visual_policy(self):
-        brief = make_brief()
-        payload = json.loads(policy.build_text_gate_prompt(brief, "fixture candidate"))
-        self.assertEqual(
-            set(policy.text_gate_response_schema()["properties"]["reason_code"]["enum"]),
-            set(policy.TEXT_GATE_REASON_CODES),
-        )
-        self.assertNotIn("visual_subject", payload["brief"])
-        self.assertNotIn("required_elements", payload["brief"])
-
-    def test_text_gate_parser_classifies_unknown_reason_code(self):
-        payload = {
-            "accepted": False,
-            "reason_code": "topic_mismatch",
-            "entry_context_clear": True,
-            "self_contained": True,
-            "invented_current_event": False,
-            "topic_matches": False,
-            "persona_matches": True,
-        }
-        with self.assertRaises(policy.GateResponseError) as raised:
-            policy.parse_text_gate_response(json.dumps(payload))
-        self.assertEqual(raised.exception.reason_code, "schema_unknown_reason_code")
-        self.assertEqual(raised.exception.field_names, ("reason_code",))
-
     def test_job_metadata_has_policy_versions_without_prompt_or_text(self):
         metadata = make_brief(destination="vk", scheduled_slot="vk:culture", music_required=True).job_metadata()
         self.assertEqual(set(metadata), METADATA_FIELDS)

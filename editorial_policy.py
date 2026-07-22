@@ -42,44 +42,13 @@ REASON_CODES = frozenset({
     "image_subject_mismatch", "image_thesis_mismatch", "image_unexplained_people",
     "image_unexplained_elements", "image_visual_bible_mismatch", "image_why_here",
     "validator_unavailable", "generation_failed", "regeneration_exhausted", "fallback_forbidden",
-    "schema_json_parse_failed", "schema_missing_fields", "schema_invalid_field_types",
-    "schema_unknown_reason_code", "schema_conflicting_fields",
 })
-TEXT_GATE_REASON_CODES = frozenset({
-    "accepted", "text_missing_entry_context", "text_unknown_conversation",
-    "text_invented_current_event", "text_topic_drift", "text_persona_mismatch",
-})
-NON_RETRYABLE_GATE_REASON_CODES = frozenset({
-    "invalid_brief", "unknown_source_type", "missing_source_reference", "unknown_rubric",
-    "unknown_visual_code_version", "conflicting_visual_rules", "missing_people_justification",
-    "validator_unavailable", "schema_json_parse_failed", "schema_missing_fields",
-    "schema_invalid_field_types", "schema_unknown_reason_code", "schema_conflicting_fields",
-})
-TEXT_GATE_BOOLEAN_FIELDS = (
-    "accepted", "entry_context_clear", "self_contained", "invented_current_event",
-    "topic_matches", "persona_matches",
-)
-TEXT_GATE_REASON_BY_FAILED_CHECK = {
-    "entry_context_clear": "text_missing_entry_context",
-    "self_contained": "text_unknown_conversation",
-    "invented_current_event": "text_invented_current_event",
-    "topic_matches": "text_topic_drift",
-    "persona_matches": "text_persona_mismatch",
-}
 
 
 class BriefValidationError(ValueError):
     def __init__(self, reason_code: str, message: str):
         super().__init__(message)
         self.reason_code = reason_code
-
-
-class GateResponseError(ValueError):
-    def __init__(self, reason_code: str, field_names: Iterable[str] = ()):
-        names = tuple(dict.fromkeys(str(name) for name in field_names if str(name)))
-        super().__init__(reason_code)
-        self.reason_code = reason_code
-        self.field_names = names
 
 
 @dataclass(frozen=True, slots=True)
@@ -248,98 +217,6 @@ Forbidden elements:
 CANONICAL VOID VISUAL BIBLE:
 {visual_rules.strip()}
 The image must answer why it belongs to this exact post. No fallback subject or unrelated decoration.""".strip()
-
-
-def text_gate_brief_payload(brief: ContentBrief) -> dict[str, Any]:
-    return {
-        "editorial_contract_version": brief.editorial_contract_version,
-        "post_id": brief.post_id,
-        "persona": brief.persona,
-        "persona_policy_version": brief.persona_policy_version,
-        "destination": brief.destination,
-        "scheduled_slot": brief.scheduled_slot,
-        "source_type": brief.source_type,
-        "source_reference": brief.source_reference,
-        "rubric": brief.rubric,
-        "thesis": brief.thesis,
-        "context_reason": brief.context_reason,
-    }
-
-
-def text_gate_response_schema() -> dict[str, Any]:
-    return {
-        "type": "object",
-        "properties": {
-            "accepted": {"type": "boolean"},
-            "reason_code": {"type": "string", "enum": sorted(TEXT_GATE_REASON_CODES)},
-            "entry_context_clear": {"type": "boolean"},
-            "self_contained": {"type": "boolean"},
-            "invented_current_event": {"type": "boolean"},
-            "topic_matches": {"type": "boolean"},
-            "persona_matches": {"type": "boolean"},
-        },
-        "required": ["reason_code", *TEXT_GATE_BOOLEAN_FIELDS],
-        "additionalProperties": False,
-    }
-
-
-def build_text_gate_prompt(brief: ContentBrief, candidate: str) -> str:
-    return json.dumps({
-        "task": "accept_or_reject_text_only",
-        "brief": text_gate_brief_payload(brief),
-        "candidate": candidate,
-        "checks": [
-            "first paragraph gives entry context", "self-contained",
-            "no invented current event", "topic matches", "VOID persona matches",
-        ],
-        "allowed_reason_codes": sorted(TEXT_GATE_REASON_CODES),
-        "reason_code_by_failed_check": TEXT_GATE_REASON_BY_FAILED_CHECK,
-        "schema": text_gate_response_schema(),
-    }, ensure_ascii=False, separators=(",", ":"))
-
-
-def parse_text_gate_response(raw: str) -> tuple[bool, str]:
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", str(raw or "").strip(), flags=re.I)
-    try:
-        value = json.loads(cleaned)
-    except (TypeError, ValueError) as exc:
-        raise GateResponseError("schema_json_parse_failed") from exc
-    if not isinstance(value, dict):
-        raise GateResponseError("schema_invalid_field_types", ("response",))
-    required_fields = ("reason_code", *TEXT_GATE_BOOLEAN_FIELDS)
-    missing = tuple(name for name in required_fields if name not in value)
-    if missing:
-        raise GateResponseError("schema_missing_fields", missing)
-    reason = str(value.get("reason_code") or "")
-    if reason not in TEXT_GATE_REASON_CODES:
-        raise GateResponseError("schema_unknown_reason_code", ("reason_code",))
-    fields = {name: value.get(name) for name in TEXT_GATE_BOOLEAN_FIELDS}
-    invalid_types = tuple(name for name, item in fields.items() if not isinstance(item, bool))
-    if invalid_types:
-        raise GateResponseError("schema_invalid_field_types", invalid_types)
-    checks_accept = (
-        fields["entry_context_clear"] and fields["self_contained"]
-        and not fields["invented_current_event"] and fields["topic_matches"]
-        and fields["persona_matches"]
-    )
-    accepted = fields["accepted"]
-    failed_reasons = {
-        TEXT_GATE_REASON_BY_FAILED_CHECK[name]
-        for name in TEXT_GATE_REASON_BY_FAILED_CHECK
-        if (fields[name] is False and name != "invented_current_event")
-        or (name == "invented_current_event" and fields[name] is True)
-    }
-    if accepted != checks_accept:
-        raise GateResponseError("schema_conflicting_fields", TEXT_GATE_BOOLEAN_FIELDS)
-    if accepted and reason != "accepted":
-        raise GateResponseError("schema_conflicting_fields", ("accepted", "reason_code"))
-    if not accepted and reason not in failed_reasons:
-        raise GateResponseError("schema_conflicting_fields", ("reason_code",))
-    return accepted, reason
-
-
-def is_retryable_gate_reason(reason_code: str) -> bool:
-    return reason_code not in NON_RETRYABLE_GATE_REASON_CODES
 
 
 def build_image_gate_prompt(brief: ContentBrief) -> str:
