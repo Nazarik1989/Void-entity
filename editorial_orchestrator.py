@@ -64,6 +64,7 @@ class EditorialContext:
     sources: tuple[EditorialSource, ...]
     rubrics: tuple[EditorialRubric, ...]
     pools: Mapping[str, tuple[str, ...]]
+    persona_pool_sizes: Mapping[str, int] = field(default_factory=dict)
     semantic_cards: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
     published_history: tuple[Mapping[str, Any], ...] = ()
     preferred: Mapping[str, str] = field(default_factory=dict)
@@ -137,7 +138,7 @@ class GenerationPackage:
 def cooldown_depth(pool_size: int) -> int:
     if pool_size <= 0:
         return 0
-    return max(1, int(pool_size * 0.60))
+    return max(1, round(pool_size * 0.60))
 
 
 def _stable_rank(plan_id: str, axis: str, value: str) -> str:
@@ -158,11 +159,15 @@ def _last_position(history: Sequence[Mapping[str, Any]], axis: str, value: str) 
 def _choose(
     *, plan_id: str, axis: str, values: Iterable[str],
     history: Sequence[Mapping[str, Any]], preferred: str = "",
+    persona_wide_pool_size: int | None = None,
 ) -> str:
     candidates = _unique(values)
     if not candidates:
         raise EditorialPlanError(f"empty compatible pool for {axis}")
-    depth = cooldown_depth(len(candidates))
+    pool_size = len(candidates) if persona_wide_pool_size is None else int(persona_wide_pool_size)
+    if pool_size < len(candidates):
+        raise EditorialPlanError(f"persona-wide pool is smaller than compatible pool for {axis}")
+    depth = cooldown_depth(pool_size)
     blocked = {
         str(item.get(axis, "")) for item in history[-depth:]
         if str(item.get(axis, ""))
@@ -193,6 +198,15 @@ def _axis_values(context: EditorialContext, rubric: EditorialRubric, axis: str) 
     return constrained or tuple(context.pools.get(axis, ()))
 
 
+def _persona_pool_size(context: EditorialContext, axis: str, candidates: Iterable[str]) -> int:
+    """Return the full persona-wide axis size while selection stays constrained."""
+    explicit = context.persona_pool_sizes.get(axis)
+    if explicit is not None:
+        return int(explicit)
+    persona_values = _unique(context.pools.get(axis, ()))
+    return len(persona_values) if persona_values else len(_unique(candidates))
+
+
 def story_first_eligible(source: EditorialSource) -> bool:
     return bool(
         source.source_type == "work_chronicle" and source.source_verified
@@ -216,6 +230,9 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
     rubric_name = _choose(
         plan_id=plan_id, axis="rubric", values=(item.name for item in compatible_rubrics),
         history=history, preferred=str(context.preferred.get("rubric", "")),
+        persona_wide_pool_size=_persona_pool_size(
+            context, "rubric", (item.name for item in compatible_rubrics)
+        ),
     )
     rubric = next(item for item in compatible_rubrics if item.name == rubric_name)
     sources = [
@@ -224,6 +241,9 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
     ]
     source_ref = _choose(
         plan_id=plan_id, axis="source_ref", values=(item.source_ref for item in sources), history=history,
+        persona_wide_pool_size=_persona_pool_size(
+            context, "source_ref", (item.source_ref for item in sources)
+        ),
     )
     source = next(item for item in sources if item.source_ref == source_ref)
     selected: dict[str, str] = {}
@@ -231,10 +251,12 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
     selected["content_format"] = _choose(
         plan_id=plan_id, axis="content_format",
         values=("story_pack",) if story_first else ("text_post",), history=history,
+        persona_wide_pool_size=_persona_pool_size(context, "content_format", ("story_pack", "text_post")),
     )
     selected["production_mode"] = _choose(
         plan_id=plan_id, axis="production_mode",
         values=("story_first",) if story_first else ("standard",), history=history,
+        persona_wide_pool_size=_persona_pool_size(context, "production_mode", ("story_first", "standard")),
     )
     for axis in (
         "thesis_direction", "epistemic_state", "tension", "semantic_theme",
@@ -243,16 +265,20 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         "humor", "imagery", "visual_mode", "visual_subject_direction",
         "visual_relation", "track_tags",
     ):
+        candidates = _axis_values(context, rubric, axis)
         selected[axis] = _choose(
-            plan_id=plan_id, axis=axis, values=_axis_values(context, rubric, axis),
+            plan_id=plan_id, axis=axis, values=candidates,
             history=history, preferred=str(context.preferred.get(axis, "")),
+            persona_wide_pool_size=_persona_pool_size(context, axis, candidates),
         )
+    semantic_candidates = context.semantic_cards.get(
+        selected["semantic_theme"], _axis_values(context, rubric, "semantic_card")
+    )
     selected["semantic_card"] = _choose(
         plan_id=plan_id, axis="semantic_card",
-        values=context.semantic_cards.get(
-            selected["semantic_theme"], _axis_values(context, rubric, "semantic_card")
-        ),
+        values=semantic_candidates,
         history=history, preferred=str(context.preferred.get("semantic_card", "")),
+        persona_wide_pool_size=_persona_pool_size(context, "semantic_card", semantic_candidates),
     )
     track_tags = tuple(
         item.strip() for item in selected.pop("track_tags").split(",") if item.strip()
