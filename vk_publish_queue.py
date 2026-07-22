@@ -14,7 +14,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 SCHEMA = "vk_publish_job.v1"
-FIELDS = frozenset({"schema", "job_id", "producer", "target_group_id", "text", "media", "track_query", "created_at", "not_before", "dedupe_key", "source_ref"})
+REQUIRED_FIELDS = frozenset({"schema", "job_id", "producer", "target_group_id", "text", "media", "track_query", "created_at", "not_before", "dedupe_key", "source_ref"})
+OPTIONAL_FIELDS = frozenset({"plan_id", "editorial"})
+FIELDS = REQUIRED_FIELDS | OPTIONAL_FIELDS
 PRODUCERS = frozenset({"naz", "void"})
 STATES = ("pending", "processing", "done", "failed")
 MAX_TEXT_LENGTH = 16_000
@@ -213,7 +215,7 @@ def _safe_media_name(value: Any) -> str:
 
 
 def _validate_shape(job: Any, allowed_group_id: str | None = None) -> dict[str, Any]:
-    if not isinstance(job, dict) or set(job) != FIELDS:
+    if not isinstance(job, dict) or not REQUIRED_FIELDS.issubset(job) or not set(job).issubset(FIELDS):
         raise QueueValidationError("unknown or missing job fields")
     if job["schema"] != SCHEMA:
         raise QueueValidationError("unknown schema")
@@ -238,6 +240,26 @@ def _validate_shape(job: Any, allowed_group_id: str | None = None) -> dict[str, 
         raise QueueValidationError("invalid metadata")
     if not job["created_at"] or not job["source_ref"]:
         raise QueueValidationError("created_at and source_ref are required")
+    if "editorial" in job and "plan_id" not in job:
+        raise QueueValidationError("editorial metadata requires plan_id")
+    if "plan_id" in job:
+        if not isinstance(job["plan_id"], str) or not re.fullmatch(r"[A-Za-z0-9._:-]{8,64}", job["plan_id"]):
+            raise QueueValidationError("invalid plan_id")
+        editorial = job.get("editorial")
+        if not isinstance(editorial, dict) or len(editorial) > 32:
+            raise QueueValidationError("invalid editorial metadata")
+        if any(
+            not isinstance(key, str)
+            or not re.fullmatch(r"[A-Za-z0-9_]{1,64}", key)
+            or not isinstance(value, (str, list))
+            or (isinstance(value, str) and len(value) > 1000)
+            or (
+                isinstance(value, list)
+                and (len(value) > 16 or any(not isinstance(item, str) or len(item) > 200 for item in value))
+            )
+            for key, value in editorial.items()
+        ):
+            raise QueueValidationError("editorial metadata must be string/list only")
     for key in ("created_at", "not_before"):
         if job[key]:
             try:
@@ -292,8 +314,11 @@ def _dedupe_seen(queue_root: Path, key: str, current: Path | None = None) -> boo
     return False
 
 
-def build_job(*, producer: str, target_group_id: str, text: str, media: list[str], track_query: str = "", not_before: str = "", dedupe_key: str, source_ref: str, created_at: str | None = None) -> dict[str, Any]:
+def build_job(*, producer: str, target_group_id: str, text: str, media: list[str], track_query: str = "", not_before: str = "", dedupe_key: str, source_ref: str, created_at: str | None = None, plan_id: str = "", editorial: dict[str, Any] | None = None) -> dict[str, Any]:
     job = {"schema": SCHEMA, "job_id": canonical_job_id(producer, dedupe_key), "producer": producer, "target_group_id": str(target_group_id), "text": text, "media": media, "track_query": track_query, "created_at": created_at or _utc_now(), "not_before": not_before, "dedupe_key": dedupe_key, "source_ref": source_ref}
+    if plan_id:
+        job["plan_id"] = str(plan_id)
+        job["editorial"] = dict(editorial or {})
     return _validate_shape(job)
 
 
