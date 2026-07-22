@@ -2178,32 +2178,17 @@ def evaluate_editorial_image_sync(
                 ],
             }],
             max_output_tokens=450,
-            text={
-                "format": {
-                    "type": "json_schema",
-                    "name": "void_editorial_image_gate",
-                    "strict": True,
-                    "schema": editorial_policy.image_gate_response_schema(),
-                }
-            },
         )
         return editorial_policy.parse_image_gate_response(response.output_text.strip())
-    except editorial_policy.GateResponseError as exc:
-        print(
-            f"EDITORIAL_IMAGE_GATE post_id={brief.post_id} accepted=false "
-            f"reason_code={exc.reason_code} "
-            f"field_names={','.join(exc.field_names) or 'none'} "
-            f"error_type={type(exc).__name__}",
-            flush=True,
-        )
-        raise
     except Exception as exc:
         print(
             f"EDITORIAL_IMAGE_GATE post_id={brief.post_id} accepted=false "
             f"reason_code=validator_unavailable error_type={type(exc).__name__}",
             flush=True,
         )
-        raise editorial_policy.GateResponseError("validator_unavailable") from exc
+        return editorial_policy.ImageGateDecision(
+            False, "validator_unavailable", "", False, False, False, False, False, True
+        )
 
 
 def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
