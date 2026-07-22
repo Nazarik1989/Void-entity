@@ -1,6 +1,7 @@
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -178,6 +179,16 @@ class TelegramPublisherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, ["send_photo", "send_message"])
         self.assertNotIn("caption", bot.send_photo.await_args.kwargs)
         self.assertEqual(bot.send_message.await_args.kwargs["text"], "Полный текст")
+
+    async def test_success_captures_safe_telegram_receipt_ids(self) -> None:
+        bot = MagicMock()
+        bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=321))
+        package = TelegramPostPackage(text="Полный текст", draft_id=70)
+        with patch("main.CHANNEL_ID", "@void-channel"):
+            outcome = await send_telegram_post(bot, package)
+        self.assertTrue(outcome.success)
+        self.assertEqual(outcome.chat_id, "@void-channel")
+        self.assertEqual(outcome.message_id, 321)
 
     async def test_media_group_is_sent_before_full_text(self) -> None:
         calls: list[str] = []

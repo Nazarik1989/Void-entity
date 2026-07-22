@@ -6,10 +6,11 @@ VOID v14 is an orthogonal, manual experiment inside this repository. It is not a
 
 - Normal messages remain on the existing stable VOID route.
 - `/v14 stable <request>` invokes that exact stable route and does not build or call a v14 provider.
-- `/v14 experimental <request>` is admin/allowlist-only, runs only v14, and writes metadata only to its separate experimental SQLite file.
+- `/v14 experimental <request>` is available only to `ADMIN_ID` when the explicit `VOID_V14_ENABLED=true` feature flag is set, runs only v14, and writes metadata only to its separate experimental SQLite file.
 - `/v14 hybrid <request>` asks stable VOID for a non-persistent candidate, runs v14 independently, and persists only the final synthesis after Telegram confirms delivery.
 
 No mode becomes a persistent default. Contacts never enter experimental or hybrid mode automatically.
+The feature flag defaults to false. `VOID_V14_ALLOWLIST` is not an authorization mechanism.
 
 ## Boundaries
 

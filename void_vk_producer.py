@@ -51,7 +51,11 @@ def sync_published_drafts() -> list[int]:
         draft = main.get_draft(draft_id)
         if not draft:
             continue
-        if main.mark_published(draft_id):
+        if main.mark_published(
+            draft_id,
+            vk_job_id=receipt["job_id"],
+            vk_receipt_id=receipt["job_id"],
+        ):
             main.apply_character_event(
                 main.character_event_for_mode(str(draft["mode"] or ""))
             )
@@ -88,7 +92,9 @@ def enqueue_draft(draft_id: int) -> Path:
         plan_id=plan.plan_id if plan is not None else "",
         editorial=main.safe_vk_editorial_metadata(plan) if plan is not None else None,
     )
-    return enqueue_job(QUEUE_DIR, job, media)
+    path = enqueue_job(QUEUE_DIR, job, media)
+    main.record_vk_enqueue(draft_id, job["job_id"])
+    return path
 
 
 def produce_scheduled() -> Path:
