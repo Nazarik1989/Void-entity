@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tempfile
@@ -22,7 +23,19 @@ from vk_publish_queue import (
     requeue_failed,
     validate_job,
 )
-from vk_queue_consumer import _attach_track, _click_first_text, _open_composer
+from vk_queue_consumer import (
+    AUTH_SELECTORS,
+    COMPOSER_INPUT_SELECTORS,
+    COMPOSER_TRIGGER_SELECTORS,
+    VkAuthenticationRequiredError,
+    VkComposerStructureError,
+    _attach_track,
+    _authentication_required,
+    _click_first_text,
+    _open_composer,
+    _open_composer_once,
+    _record_admin_notice,
+)
 from void_vk_producer import sync_published_drafts
 
 
@@ -106,6 +119,30 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertEqual(consume_once(self.root, self.group, publish), 0)
         publish.assert_not_called()
 
+    def test_retry_keeps_same_job_and_plan_then_writes_one_receipt(self):
+        job = self.job(
+            dedupe_key="composer-retry",
+            plan_id="void-plan-retry-0001",
+        )
+        directory = self.enqueue(job)
+        first = Mock(side_effect=RetryablePublishError("composer temporarily unavailable"))
+        self.assertEqual(consume_once(self.root, self.group, first), 0)
+
+        pending = self.root / "pending" / directory.name
+        retry_file = pending / "retry.txt"
+        self.assertEqual(validate_job(pending, self.group)["job_id"], job["job_id"])
+        self.assertEqual(validate_job(pending, self.group)["plan_id"], job["plan_id"])
+        self.assertEqual(publication_receipts(self.root), [])
+
+        os.utime(retry_file, (0, 0))
+        success = Mock()
+        self.assertEqual(consume_once(self.root, self.group, success), 0)
+        success.assert_called_once()
+        self.assertEqual(len(publication_receipts(self.root)), 1)
+        self.assertEqual(consume_once(self.root, self.group, success), 0)
+        success.assert_called_once()
+        self.assertEqual(len(publication_receipts(self.root)), 1)
+
     def test_only_successful_publication_receipt_activates_draft_memory(self):
         with tempfile.TemporaryDirectory() as database_dir:
             database_path = os.path.join(database_dir, "void-test.db")
@@ -136,7 +173,10 @@ class VkPublishQueueTests(unittest.TestCase):
                 self.assertEqual(len(receipts), 1)
                 self.assertNotIn("text", receipts[0])
                 self.assertEqual(sync_published_drafts(), [draft_id])
-                self.assertIsNotNone(get_draft(draft_id)["published_at"])
+                published = get_draft(draft_id)
+                self.assertIsNotNone(published["published_at"])
+                self.assertEqual(published["vk_job_id"], job["job_id"])
+                self.assertEqual(published["vk_receipt_id"], job["job_id"])
                 self.assertEqual(sync_published_drafts(), [])
 
     def test_consumer_backfills_receipts_for_existing_done_jobs(self):
@@ -293,16 +333,73 @@ class VkPublishQueueTests(unittest.TestCase):
 
     @patch("vk_queue_consumer._click_first_text")
     def test_consumer_scrolls_to_lazy_composer(self, click_text):
-        publish_button = Mock()
-        publish_button.count.return_value = 0
+        editor = Mock()
         page = Mock()
-        page.locator.return_value.first = publish_button
-
-        _open_composer(page)
+        with (
+            patch("vk_queue_consumer._authentication_required", return_value=False),
+            patch("vk_queue_consumer._composer_input", side_effect=[None, None, editor]),
+            patch("vk_queue_consumer._first_visible", return_value=None),
+        ):
+            _open_composer_once(page)
 
         page.mouse.wheel.assert_called_once_with(0, 900)
         page.wait_for_timeout.assert_any_call(1_500)
-        click_text.assert_any_call(page, ("Создать",))
+        self.assertGreaterEqual(click_text.call_count, 2)
+
+    def test_composer_uses_data_role_aria_and_contenteditable_selectors(self):
+        selectors = " ".join(COMPOSER_TRIGGER_SELECTORS + COMPOSER_INPUT_SELECTORS)
+        self.assertIn("data-testid", selectors)
+        self.assertIn("role=", selectors)
+        self.assertIn("aria-label", selectors)
+        self.assertIn("contenteditable", selectors)
+
+    def test_transient_composer_absence_reloads_once(self):
+        page = Mock()
+        with patch(
+            "vk_queue_consumer._open_composer_once",
+            side_effect=[RetryablePublishError("temporary"), None],
+        ) as attempt:
+            _open_composer(page)
+        self.assertEqual(attempt.call_count, 2)
+        page.reload.assert_called_once_with(wait_until="domcontentloaded", timeout=15_000)
+
+    def test_session_expiry_is_distinct_and_never_reloaded(self):
+        page = Mock()
+        with (
+            patch(
+                "vk_queue_consumer._open_composer_once",
+                side_effect=VkAuthenticationRequiredError("authentication required"),
+            ),
+            self.assertRaises(VkAuthenticationRequiredError),
+        ):
+            _open_composer(page)
+        page.reload.assert_not_called()
+
+    def test_login_page_is_recognized_without_credentials(self):
+        page = Mock(url="https://vk.com/login")
+        self.assertTrue(_authentication_required(page))
+
+    def test_post_author_marker_is_not_misclassified_as_authentication(self):
+        hidden = Mock()
+        hidden.count.return_value = 0
+        page = Mock(url="https://vk.com/club237593988?post_author=1")
+        page.locator.return_value = hidden
+        self.assertFalse(_authentication_required(page))
+        self.assertNotIn('[data-testid*="auth"]', " ".join(AUTH_SELECTORS))
+
+    def test_auth_admin_notice_contains_metadata_only(self):
+        with patch("vk_queue_consumer.QUEUE_DIR", self.root):
+            path = _record_admin_notice("void-1234567890abcdef12345678", "vk_session_authentication_required")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["code"], "vk_session_authentication_required")
+        self.assertEqual(set(payload), {"schema", "job_id", "code", "created_at"})
+
+    def test_unknown_composer_structure_is_terminal(self):
+        directory = self.enqueue(self.job(dedupe_key="terminal-structure"))
+        publish = Mock(side_effect=VkComposerStructureError("unknown structure"))
+        self.assertEqual(consume_once(self.root, self.group, publish), 1)
+        self.assertTrue((self.root / "failed" / directory.name).is_dir())
+        self.assertEqual(publication_receipts(self.root), [])
 
 
     def test_consumer_refuses_to_publish_when_vk_has_no_matching_track(self):

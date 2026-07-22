@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import time
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from vk_publish_queue import RetryablePublishError, consume_once, requeue_failed
 
@@ -16,6 +20,8 @@ KILL_SWITCH = Path(os.getenv("VK_PUBLISH_KILL_SWITCH", "/etc/void-vk-publisher.d
 GROUP_ID = os.getenv("VK_GROUP_ID", "").strip()
 COMMUNITY_URL = os.getenv("VK_COMMUNITY_URL", "").strip().rstrip("/")
 HEADLESS = os.getenv("VK_BROWSER_HEADLESS", "true").strip().lower() in {"1", "true", "yes", "on"}
+ADMIN_NOTICES_DIRNAME = "admin-notices"
+ADMIN_NOTICE_SCHEMA = "vk_admin_notice.v1"
 
 CREATE_TEXT = "Создать"
 POST_TEXTS = ("Пост", "Запись", "Публикация")
@@ -23,6 +29,39 @@ NEXT_TEXT = "Далее"
 DONE_TEXT = "Готово"
 PUBLISH_TEXT = "Опубликовать"
 POST_INPUT_LABEL = "Напишите что-нибудь..."
+
+COMPOSER_TRIGGER_SELECTORS = (
+    '[data-testid="group_publish_block"] button',
+    '[data-testid="group_publish_block"] [role="button"]',
+    '[data-testid*="group_publish"] [role="button"]',
+    '[role="button"][aria-label*="Создать запись"]',
+    '[role="button"][aria-label*="Создать публикацию"]',
+    '[data-testid*="composer"] [role="button"]',
+)
+COMPOSER_INPUT_SELECTORS = (
+    f'[aria-label="{POST_INPUT_LABEL}"]',
+    '[data-testid*="composer"] [contenteditable="true"]',
+    '[contenteditable="true"][role="textbox"]',
+    '[role="textbox"][aria-label*="запис"]',
+    '[role="textbox"][aria-label*="публикац"]',
+)
+AUTH_SELECTORS = (
+    'form[action^="/login"]',
+    'form[action^="https://login.vk.com/"]',
+    'input[name="email"][autocomplete="username"]',
+    'input[name="login"][autocomplete="username"]',
+    'input[type="password"][name="pass"]',
+    '[data-testid="login_form"]',
+    '[data-testid="login_button"]',
+)
+
+
+class VkAuthenticationRequiredError(RuntimeError):
+    """The persistent browser profile needs explicit administrator attention."""
+
+
+class VkComposerStructureError(RuntimeError):
+    """VK returned an unknown composer structure; retrying blindly is unsafe."""
 
 
 def allowed_community_url() -> str:
@@ -34,7 +73,34 @@ def allowed_community_url() -> str:
     return expected
 
 
-def _click_first_text(page: Any, labels: tuple[str, ...], timeout: int = 15_000) -> None:
+def _record_admin_notice(job_id: str, code: str) -> Path:
+    """Write a metadata-only notice; never include profile or credential data."""
+    notices = QUEUE_DIR / ADMIN_NOTICES_DIRNAME
+    if notices.is_symlink():
+        raise RuntimeError("VK admin notice directory is unsafe")
+    notices.mkdir(mode=0o770, parents=True, exist_ok=True)
+    final = notices / f"{job_id}.json"
+    temp = notices / f".{job_id}.tmp-{uuid.uuid4().hex}"
+    payload = {
+        "schema": ADMIN_NOTICE_SCHEMA,
+        "job_id": str(job_id),
+        "code": str(code),
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    temp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.chmod(temp, 0o640)
+    os.replace(temp, final)
+    print(f"VK publisher admin notice: {code} job_id={job_id}", flush=True)
+    return final
+
+
+def _click_first_text(
+    page: Any,
+    labels: tuple[str, ...],
+    timeout: int = 15_000,
+    *,
+    missing_error: type[Exception] = VkComposerStructureError,
+) -> None:
     deadline = time.monotonic() + timeout / 1000
     while time.monotonic() < deadline:
         for label in labels:
@@ -48,32 +114,110 @@ def _click_first_text(page: Any, labels: tuple[str, ...], timeout: int = 15_000)
                     return
                 except Exception as exc:
                     if type(exc).__name__ != "TimeoutError":
-                        raise
+                        raise VkComposerStructureError("VK composer control failed structurally") from exc
                     continue
         page.wait_for_timeout(250)
-    raise RuntimeError("required VK composer control not found")
+    raise missing_error("required VK composer control not found")
+
+
+def _authentication_required(page: Any) -> bool:
+    current_url = str(getattr(page, "url", "") or "")
+    parsed = urlparse(current_url)
+    path = parsed.path.rstrip("/").casefold()
+    query = parse_qs(parsed.query)
+    if (
+        parsed.hostname == "login.vk.com"
+        or path == "/login"
+        or path.startswith("/login/")
+        or any(value.casefold() == "login" for value in query.get("act", ()))
+    ):
+        return True
+    return _first_visible(page, AUTH_SELECTORS) is not None
+
+
+def _composer_input(page: Any) -> Any | None:
+    return _first_visible(page, COMPOSER_INPUT_SELECTORS)
+
+
+def _open_composer_once(page: Any) -> None:
+    if _authentication_required(page):
+        raise VkAuthenticationRequiredError("VK browser session authentication is required")
+    if _composer_input(page) is not None:
+        return
+
+    trigger = _first_visible(page, COMPOSER_TRIGGER_SELECTORS)
+    if trigger is None:
+        # Admin cards can push the lazy-rendered composer below the viewport.
+        page.mouse.wheel(0, 900)
+        page.wait_for_timeout(1_500)
+        trigger = _first_visible(page, COMPOSER_TRIGGER_SELECTORS)
+    try:
+        if trigger is not None:
+            trigger.click(timeout=5_000, force=True, no_wait_after=True)
+        else:
+            _click_first_text(
+                page,
+                (CREATE_TEXT,),
+                timeout=3_000,
+                missing_error=RetryablePublishError,
+            )
+    except RetryablePublishError:
+        raise
+    except VkComposerStructureError:
+        raise
+    except Exception as exc:
+        if type(exc).__name__ == "TimeoutError":
+            raise RetryablePublishError("VK composer trigger is temporarily unavailable") from exc
+        raise VkComposerStructureError("VK composer trigger failed structurally") from exc
+
+    page.wait_for_timeout(700)
+    if _authentication_required(page):
+        raise VkAuthenticationRequiredError("VK browser session authentication is required")
+    if _composer_input(page) is not None:
+        return
+    _click_first_text(
+        page,
+        POST_TEXTS,
+        timeout=3_000,
+        missing_error=RetryablePublishError,
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if _authentication_required(page):
+            raise VkAuthenticationRequiredError("VK browser session authentication is required")
+        if _composer_input(page) is not None:
+            return
+        page.wait_for_timeout(250)
+    raise RetryablePublishError("VK composer is temporarily unavailable")
 
 
 def _open_composer(page: Any) -> None:
-    button = page.locator('[data-testid="group_publish_block"] button').first
-    if button.count() and button.is_visible():
-        button.click(timeout=15_000, force=True, no_wait_after=True)
-    else:
-        # Admin cards can push the lazy-rendered composer below the initial
-        # viewport. Scroll to the feed before falling back to the text button.
-        page.mouse.wheel(0, 900)
-        page.wait_for_timeout(1_500)
-        _click_first_text(page, (CREATE_TEXT,))
-    page.wait_for_timeout(700)
-    _click_first_text(page, POST_TEXTS)
-    page.wait_for_timeout(1_200)
+    """Open composer with one bounded safe reload, never a publish action."""
+    try:
+        _open_composer_once(page)
+        return
+    except VkAuthenticationRequiredError:
+        raise
+    except RetryablePublishError:
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=15_000)
+            page.wait_for_timeout(1_500)
+        except Exception as exc:
+            raise RetryablePublishError("VK community reload failed; retry later") from exc
+        try:
+            _open_composer_once(page)
+            return
+        except VkAuthenticationRequiredError:
+            raise
+        except RetryablePublishError as exc:
+            raise RetryablePublishError("VK composer is temporarily unavailable; retry later") from exc
 
 
 def _post_input(page: Any) -> Any:
-    for locator in (page.locator(f'[aria-label="{POST_INPUT_LABEL}"]'), page.locator('[contenteditable="true"][role="textbox"]'), page.locator('[contenteditable="true"]')):
-        if locator.count() and locator.last.is_visible():
-            return locator.last
-    raise RuntimeError("VK post editor input not found")
+    candidate = _composer_input(page)
+    if candidate is not None:
+        return candidate
+    raise VkComposerStructureError("VK post editor input not found")
 
 
 def _tokens(value: str) -> set[str]:
@@ -186,7 +330,11 @@ def publish_job(job: dict[str, Any], media: list[Path]) -> None:
             page = context.new_page()
             page.goto(url, wait_until="domcontentloaded")
             page.wait_for_timeout(2_500)
-            _open_composer(page)
+            try:
+                _open_composer(page)
+            except VkAuthenticationRequiredError:
+                _record_admin_notice(job["job_id"], "vk_session_authentication_required")
+                raise
             if media:
                 page.locator("input[type=file]").last.set_input_files([str(path) for path in media])
                 page.wait_for_timeout(4_000)
