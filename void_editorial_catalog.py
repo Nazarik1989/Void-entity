@@ -7,7 +7,15 @@ from typing import Any, Iterable, Mapping
 
 import character_state as void_character
 from editorial_orchestrator import EditorialContext, EditorialRubric, EditorialSource
-from void_core import MEANING_CARDS, MODE_SEMANTIC_THEMES, NARRATIVE_SHAPES, SCENE_AXES, SEMANTIC_THEMES
+from void_core import (
+    MEANING_CARDS,
+    MODE_SEMANTIC_THEMES,
+    NARRATIVE_SHAPES,
+    RUBRIC_SCHEDULE,
+    SCENE_AXES,
+    SEMANTIC_THEMES,
+    TELEGRAM_VOID_SCHEDULE,
+)
 
 
 POLICY_VERSIONS = {
@@ -77,6 +85,23 @@ BASE_POOLS: dict[str, tuple[str, ...]] = {
 }
 
 
+_ALL_RUBRIC_NAMES = tuple(
+    dict.fromkeys(str(row["name"]) for row in (*RUBRIC_SCHEDULE, *TELEGRAM_VOID_SCHEDULE))
+)
+PERSONA_POOL_SIZES: dict[str, int] = {
+    axis: len(tuple(dict.fromkeys(values)))
+    for axis, values in BASE_POOLS.items()
+}
+PERSONA_POOL_SIZES.update(
+    {
+        "rubric": len(_ALL_RUBRIC_NAMES),
+        "source_ref": len(_ALL_RUBRIC_NAMES),
+        "content_format": 2,
+        "production_mode": 2,
+    }
+)
+
+
 SEMANTIC_CARDS = {
     theme: tuple(str(card["key"]) for card in MEANING_CARDS.get(theme, ()))
     for theme in SEMANTIC_THEMES
@@ -103,6 +128,7 @@ def build_context(
     rubric_rows: Iterable[Mapping[str, Any]], source_rows: Iterable[Mapping[str, Any]],
     published_history: Iterable[Mapping[str, Any]], character: void_character.CharacterState,
     crosspost_plan_id: str = "",
+    persona_pool_sizes: Mapping[str, int] | None = None,
 ) -> EditorialContext:
     rubrics: list[EditorialRubric] = []
     for row in rubric_rows:
@@ -151,9 +177,14 @@ def build_context(
         for index, row in enumerate(source_rows)
     )
     preferred_energy = "very low" if character.energy <= 38 else "low"
+    explicit_sizes = dict(PERSONA_POOL_SIZES)
+    explicit_sizes.update({
+        str(axis): int(size) for axis, size in (persona_pool_sizes or {}).items()
+    })
     return EditorialContext(
         persona="void", platform=platform, slot=slot, seed=seed,
         sources=sources, rubrics=tuple(rubrics), pools=BASE_POOLS,
+        persona_pool_sizes=explicit_sizes,
         semantic_cards=SEMANTIC_CARDS, published_history=tuple(published_history),
         preferred={"facet": character.facet, "energy": preferred_energy},
         policy_versions=POLICY_VERSIONS, crosspost_plan_id=crosspost_plan_id,

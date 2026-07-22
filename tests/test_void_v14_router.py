@@ -46,6 +46,20 @@ class VoidV14RouterTests(unittest.IsolatedAsyncioTestCase):
         stable.assert_not_awaited()
         engine.run.assert_not_awaited()
 
+    async def test_legacy_allowlist_is_not_authorization(self):
+        engine = AsyncMock()
+        stable = AsyncMock()
+        router = VoidV14Router(
+            config=VoidV14Config(allowlisted_user_ids=frozenset({99})),
+            admin_id=7,
+            engine=engine,
+        )
+        outcome = await router.route(
+            mode="experimental", user_id=99, request="hello", stable_generate=stable
+        )
+        self.assertFalse(outcome.allowed)
+        engine.run.assert_not_awaited()
+
     async def test_experimental_uses_no_stable_memory_path(self):
         engine = AsyncMock()
         engine.run.return_value = experimental_result()

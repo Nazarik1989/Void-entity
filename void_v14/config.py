@@ -41,4 +41,7 @@ class VoidV14Config:
             raise ValueError("at least one experimental agent is required")
 
     def allows(self, user_id: int, *, admin_id: int) -> bool:
-        return bool(user_id and (user_id == admin_id or user_id in self.allowlisted_user_ids))
+        # Compatibility keeps the old field readable, but an allowlist is not
+        # authorization. The main runtime additionally requires its disabled-
+        # by-default feature flag before constructing this router.
+        return bool(user_id and user_id == admin_id)

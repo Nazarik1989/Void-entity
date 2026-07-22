@@ -70,3 +70,9 @@ sudo -u publisher sh -c 'set -a; . /etc/void-vk-publisher.env; exec /opt/void_en
 ```
 
 Do not manufacture a replacement job to retry a failed dedupe key. Inspect status with `systemctl status` and sanitized errors with `journalctl -u void-vk-autopost.service`.
+
+Composer discovery uses bounded data/role/ARIA/contenteditable selectors and one safe page reload. A temporary absence stays pending under the existing backoff. An expired browser session is terminal and creates a metadata-only `admin-notices/<job_id>.json` notice; it never stores credentials, cookies, post text, or profile contents. Existing failed jobs are never requeued automatically.
+
+The selector contract is covered by static and mock-DOM tests. When a live browser session is unavailable during development, final DOM compatibility can only be confirmed read-only on the authorized community page or by the next natural consumer run; no test post is created for that check.
+
+Before a coordinated Naz/VOID deploy, pipe the resolved schedule-only JSON snapshot to `python deploy_preflight.py --resolved-schedules -`. The preflight reads no env or queue payloads, checks the exact systemd units, both runtime marker schemas, queue processing state and the consumer lock, and exits `75` while any natural slot embargo or in-flight work is present. Stdin avoids leaving a schedule snapshot on disk.

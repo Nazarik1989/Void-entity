@@ -12,11 +12,13 @@ import re
 import socket
 import sqlite3
 import sys
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -86,6 +88,7 @@ TELEGRAM_PROXY_URL = os.getenv("TELEGRAM_PROXY_URL", "")
 # Voice messages use the official OpenAI API independently from OpenRouter.
 VOICE_MESSAGES_ENABLED = os.getenv("VOICE_MESSAGES_ENABLED", "false").strip().lower() not in {"0", "false", "no", "off"}
 VOICE_MESSAGES_ADMIN_ONLY = os.getenv("VOICE_MESSAGES_ADMIN_ONLY", "true").strip().lower() not in {"0", "false", "no", "off"}
+VOID_V14_ENABLED = os.getenv("VOID_V14_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
 OPENAI_VOICE_API_KEY = os.getenv("OPENAI_VOICE_API_KEY", "").strip()
 OPENAI_VOICE_BASE_URL = os.getenv("OPENAI_VOICE_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
 OPENAI_TRANSCRIBE_MODEL = os.getenv("OPENAI_TRANSCRIBE_MODEL", "gpt-4o-transcribe").strip()
@@ -101,7 +104,12 @@ CROSSPOST_EXCHANGE_AUTO_PUBLISH = os.getenv("CROSSPOST_EXCHANGE_AUTO_PUBLISH", "
 CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exchange").strip())
 CROSSPOST_EXCHANGE_INTERVAL_SECONDS = max(60, int(os.getenv("CROSSPOST_EXCHANGE_INTERVAL_SECONDS", "300") or "300"))
 CROSSPOST_EXCHANGE_MAX_PER_RUN = max(1, min(int(os.getenv("CROSSPOST_EXCHANGE_MAX_PER_RUN", "1") or "1"), 5))
+EDITORIAL_DELIVERY_STALE_SECONDS = 30 * 60
 VOID_TELEGRAM_AUTO_TIMES_RAW = os.getenv("VOID_TELEGRAM_AUTO_TIMES", "12:00,16:00,20:00,00:00").strip()
+VOID_SCHEDULED_WORK_DIR = Path(
+    os.getenv("VOID_SCHEDULED_WORK_DIR", "/run/void-entity-scheduled-work").strip()
+)
+_PROCESS_START_FALLBACK = uuid.uuid4().hex
 
 VK_USER_ACCESS_TOKEN = os.getenv("VK_USER_ACCESS_TOKEN", "")
 VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
@@ -142,6 +150,131 @@ def parse_daily_times(value: str) -> tuple[str, ...]:
 VOID_TELEGRAM_AUTO_TIMES = parse_daily_times(VOID_TELEGRAM_AUTO_TIMES_RAW)
 
 
+def resolved_void_schedule_snapshot() -> dict[str, Any]:
+    """Return schedule metadata only; never expose environment or credentials."""
+    return {
+        "void.telegram": {
+            "daily_times": tuple(VOID_TELEGRAM_AUTO_TIMES),
+            "weekly_times": (),
+        },
+        "void.vk": {
+            "daily_times": ("13:30", "20:30"),
+            "weekly_times": (((4, 5), "23:30"),),
+        },
+    }
+
+
+def process_start_identity(pid: int) -> str:
+    """Return boot+process start identity on Linux, with a local test fallback."""
+    try:
+        boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        stat = Path(f"/proc/{int(pid)}/stat").read_text(encoding="ascii")
+        # Field 22 is starttime; the command field may contain spaces/parentheses.
+        starttime = stat.rsplit(")", maxsplit=1)[1].split()[19]
+        if boot_id and starttime:
+            return f"linux:{boot_id}:{starttime}"
+    except (FileNotFoundError, OSError, IndexError, ValueError):
+        pass
+    if int(pid) == os.getpid():
+        return f"local:{_PROCESS_START_FALLBACK}"
+    return ""
+
+
+def marker_process_is_live(payload: dict[str, Any]) -> bool:
+    try:
+        pid = int(payload.get("pid"))
+    except (TypeError, ValueError):
+        return False
+    expected_identity = str(payload.get("process_start_identity") or "")
+    if pid <= 0 or not expected_identity:
+        return False
+    if pid == os.getpid():
+        return process_start_identity(pid) == expected_identity
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    except OSError:
+        return False
+    actual_identity = process_start_identity(pid)
+    return bool(actual_identity and actual_identity == expected_identity)
+
+
+@contextmanager
+def scheduled_work_marker(kind: str) -> Iterator[Path]:
+    """Expose only active natural work to deploy preflight, with exact cleanup."""
+    normalized = str(kind).strip()
+    if not re.fullmatch(r"void\.(telegram|crosspost)", normalized):
+        raise ValueError("unknown VOID scheduled work kind")
+    root = VOID_SCHEDULED_WORK_DIR
+    if root.is_symlink():
+        raise RuntimeError("scheduled work marker directory is unsafe")
+    root.mkdir(mode=0o750, parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    marker = root / f"{token}.json"
+    payload = {
+        "schema": "void_scheduled_work.v1",
+        "kind": normalized,
+        "token": token,
+        "pid": os.getpid(),
+        "process_start_identity": process_start_identity(os.getpid()),
+        "started_at": now_iso(),
+    }
+    descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+    try:
+        os.write(descriptor, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+    finally:
+        os.close(descriptor)
+    try:
+        yield marker
+    finally:
+        try:
+            current = json.loads(marker.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, json.JSONDecodeError):
+            current = {}
+        if current.get("token") == token and not marker.is_symlink():
+            marker.unlink(missing_ok=True)
+
+
+def scheduled_work_snapshot() -> dict[str, Any]:
+    """Read a metadata-only in-flight snapshot for coordinated preflight."""
+    root = VOID_SCHEDULED_WORK_DIR
+    if not root.exists():
+        return {"active": False, "count": 0, "kinds": (), "stale_count": 0}
+    if root.is_symlink() or not root.is_dir():
+        return {"active": True, "count": 1, "kinds": ("unknown",), "stale_count": 0}
+    kinds: list[str] = []
+    stale_count = 0
+    for marker in sorted(root.glob("*.json")):
+        try:
+            payload = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            kinds.append("unknown")
+            continue
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "void_scheduled_work.v1"
+            or not re.fullmatch(r"void\.(telegram|crosspost)", str(payload.get("kind") or ""))
+            or not str(payload.get("token") or "")
+            or not str(payload.get("process_start_identity") or "")
+            or not isinstance(payload.get("pid"), int)
+        ):
+            kinds.append("unknown")
+            continue
+        if not marker_process_is_live(payload):
+            stale_count += 1
+            continue
+        kinds.append(str(payload.get("kind") or "unknown"))
+    return {
+        "active": bool(kinds),
+        "count": len(kinds),
+        "kinds": tuple(kinds),
+        "stale_count": stale_count,
+    }
+
+
 def current_void_schedule_slot(
     now: datetime | None = None,
     schedule: tuple[str, ...] | None = None,
@@ -177,6 +310,8 @@ class TelegramPublishOutcome:
     success: bool
     image_count: int = 0
     error: str | None = None
+    chat_id: str = ""
+    message_id: int | None = None
 
 
 RSS_SOURCES = [
@@ -291,6 +426,53 @@ def init_db() -> None:
         cur.execute("ALTER TABLE drafts ADD COLUMN editorial_plan_json TEXT NOT NULL DEFAULT ''")
     if "generation_package_json" not in draft_columns:
         cur.execute("ALTER TABLE drafts ADD COLUMN generation_package_json TEXT NOT NULL DEFAULT ''")
+    observability_columns = {
+        "slot_captured_at": "TEXT NOT NULL DEFAULT ''",
+        "generation_package_status": "TEXT NOT NULL DEFAULT 'not_run'",
+        "image_qa_status": "TEXT NOT NULL DEFAULT 'not_run'",
+        "telegram_chat_id": "TEXT NOT NULL DEFAULT ''",
+        "telegram_message_id": "INTEGER",
+        "vk_job_id": "TEXT NOT NULL DEFAULT ''",
+        "vk_receipt_id": "TEXT NOT NULL DEFAULT ''",
+        "history_commit_status": "TEXT NOT NULL DEFAULT 'not_run'",
+    }
+    for column, declaration in observability_columns.items():
+        if column not in draft_columns:
+            cur.execute(f"ALTER TABLE drafts ADD COLUMN {column} {declaration}")
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS editorial_release_observability_v2 (
+            plan_id TEXT NOT NULL,
+            persona TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            slot TEXT NOT NULL,
+            slot_captured_at TEXT NOT NULL,
+            generation_package_status TEXT NOT NULL DEFAULT 'not_run',
+            image_qa_status TEXT NOT NULL DEFAULT 'not_run',
+            draft_id INTEGER,
+            telegram_chat_id TEXT NOT NULL DEFAULT '',
+            telegram_message_id INTEGER,
+            vk_job_id TEXT NOT NULL DEFAULT '',
+            vk_receipt_id TEXT NOT NULL DEFAULT '',
+            history_commit_status TEXT NOT NULL DEFAULT 'not_run',
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(plan_id, destination)
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS editorial_delivery_state (
+            plan_id TEXT NOT NULL,
+            destination TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('sending', 'committed', 'failed')),
+            draft_id INTEGER,
+            attempt_started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(plan_id, destination)
+        )
+        """
+    )
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS catches (
@@ -872,8 +1054,8 @@ def _record_content_signature_conn(
     plan: dict[str, Any],
     topic: str,
     draft_id: int,
-) -> None:
-    conn.execute(
+) -> bool:
+    cursor = conn.execute(
         """
         INSERT OR IGNORE INTO content_signatures(
             draft_id, character_id, platform, mode, facet, intent, format,
@@ -922,6 +1104,7 @@ def _record_content_signature_conn(
         """,
         (void_character.CHARACTER_ID, void_character.CHARACTER_ID),
     )
+    return cursor.rowcount > 0
 
 
 def record_content_signature(
@@ -1804,21 +1987,30 @@ def save_draft(
     plan_id: str = "",
     editorial_plan: dict[str, Any] | None = None,
     generation_package: dict[str, Any] | None = None,
+    slot_captured_at: str = "",
+    generation_package_status: str = "not_run",
+    image_qa_status: str = "not_run",
 ) -> int:
+    if generation_package_status not in {"not_run", "accepted", "rejected", "invalid", "unavailable"}:
+        raise ValueError("invalid generation package status")
+    if image_qa_status not in {"not_run", "accepted", "rejected", "unavailable"}:
+        raise ValueError("invalid image QA status")
     conn = db()
     cur = conn.cursor()
     cur.execute(
         """
         INSERT INTO drafts(
             mode, title, post, source_name, source_url, frequency, publish_score,
-            created_at, plan_id, editorial_plan_json, generation_package_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            created_at, plan_id, editorial_plan_json, generation_package_json,
+            slot_captured_at, generation_package_status, image_qa_status
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             mode, title, post, source_name, source_url, frequency, int(publish_score),
             now_iso(), str(plan_id)[:64],
             json.dumps(editorial_plan or {}, ensure_ascii=False, separators=(",", ":"))[:16000],
             json.dumps(generation_package or {}, ensure_ascii=False, separators=(",", ":"))[:12000],
+            str(slot_captured_at)[:64], generation_package_status, image_qa_status,
         ),
     )
     conn.commit()
@@ -1844,7 +2036,255 @@ def get_draft(draft_id: int) -> sqlite3.Row | None:
     return row
 
 
-def mark_published(draft_id: int, source_url: str = "") -> bool:
+def record_release_observability(
+    plan: editorial_orchestrator.EditorialPlan,
+    *,
+    slot_captured_at: str,
+    generation_package_status: str,
+    image_qa_status: str = "not_run",
+    draft_id: int | None = None,
+) -> None:
+    if generation_package_status not in {"not_run", "accepted", "rejected", "invalid", "unavailable"}:
+        raise ValueError("invalid generation package status")
+    if image_qa_status not in {"not_run", "accepted", "rejected", "unavailable"}:
+        raise ValueError("invalid image QA status")
+    conn = db()
+    conn.execute(
+        """
+        INSERT INTO editorial_release_observability_v2(
+            plan_id, persona, destination, slot, slot_captured_at,
+            generation_package_status, image_qa_status, draft_id, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(plan_id, destination) DO UPDATE SET
+            persona=excluded.persona,
+            destination=excluded.destination,
+            slot=excluded.slot,
+            slot_captured_at=excluded.slot_captured_at,
+            generation_package_status=excluded.generation_package_status,
+            image_qa_status=excluded.image_qa_status,
+            draft_id=COALESCE(excluded.draft_id, editorial_release_observability_v2.draft_id),
+            updated_at=excluded.updated_at
+        """,
+        (
+            plan.plan_id, plan.persona, plan.platform, plan.slot,
+            str(slot_captured_at)[:64], generation_package_status,
+            image_qa_status, draft_id, now_iso(),
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_release_observability(plan_id: str, destination: str) -> sqlite3.Row | None:
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT * FROM editorial_release_observability_v2
+        WHERE plan_id=? AND destination=?
+        """,
+        (str(plan_id)[:64], str(destination)[:32]),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def claim_editorial_delivery(
+    plan_id: str,
+    destination: str,
+    *,
+    stale_seconds: int = EDITORIAL_DELIVERY_STALE_SECONDS,
+) -> str:
+    """Atomically claim one delivery or return its existing terminal/in-flight state."""
+    normalized_plan_id = str(plan_id).strip()
+    normalized_destination = str(destination).strip()
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,64}", normalized_plan_id):
+        raise ValueError("invalid editorial delivery plan_id")
+    if normalized_destination not in {"telegram", "vk"}:
+        raise ValueError("invalid editorial delivery destination")
+    current = datetime.now(timezone.utc)
+    current_iso = current.isoformat()
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT state, draft_id, attempt_started_at
+            FROM editorial_delivery_state
+            WHERE plan_id=? AND destination=?
+            """,
+            (normalized_plan_id, normalized_destination),
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """
+                INSERT INTO editorial_delivery_state(
+                    plan_id, destination, state, draft_id, attempt_started_at, updated_at
+                ) VALUES (?, ?, 'sending', NULL, ?, ?)
+                """,
+                (normalized_plan_id, normalized_destination, current_iso, current_iso),
+            )
+            conn.commit()
+            return "claimed"
+
+        state = str(row["state"] or "")
+        if state in {"committed", "failed"}:
+            conn.commit()
+            return state
+        if state != "sending":
+            raise RuntimeError("invalid editorial delivery state")
+
+        draft_id = row["draft_id"]
+        if draft_id is not None:
+            draft = conn.execute(
+                "SELECT published_at FROM drafts WHERE id=?", (int(draft_id),)
+            ).fetchone()
+            if draft is not None and str(draft["published_at"] or ""):
+                conn.execute(
+                    """
+                    UPDATE editorial_delivery_state
+                    SET state='committed', updated_at=?
+                    WHERE plan_id=? AND destination=? AND state='sending'
+                    """,
+                    (current_iso, normalized_plan_id, normalized_destination),
+                )
+                conn.commit()
+                return "committed"
+
+        try:
+            started = datetime.fromisoformat(str(row["attempt_started_at"]).replace("Z", "+00:00"))
+            elapsed = (current - started.astimezone(timezone.utc)).total_seconds()
+        except (TypeError, ValueError):
+            elapsed = float("inf")
+        if elapsed <= max(1, int(stale_seconds)):
+            conn.commit()
+            return "sending"
+        if draft_id is not None:
+            # A crash may have happened after Telegram accepted the send but
+            # before its receipt was persisted. Never auto-retry that ambiguity.
+            conn.execute(
+                """
+                UPDATE editorial_delivery_state
+                SET state='failed', updated_at=?
+                WHERE plan_id=? AND destination=? AND state='sending'
+                """,
+                (current_iso, normalized_plan_id, normalized_destination),
+            )
+            conn.commit()
+            return "failed"
+
+        conn.execute(
+            """
+            UPDATE editorial_delivery_state
+            SET attempt_started_at=?, updated_at=?
+            WHERE plan_id=? AND destination=? AND state='sending'
+            """,
+            (current_iso, current_iso, normalized_plan_id, normalized_destination),
+        )
+        conn.commit()
+        return "claimed"
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def attach_editorial_delivery_draft(
+    plan_id: str, destination: str, draft_id: int
+) -> None:
+    conn = db()
+    cursor = conn.execute(
+        """
+        UPDATE editorial_delivery_state
+        SET draft_id=?, updated_at=?
+        WHERE plan_id=? AND destination=? AND state='sending'
+          AND (draft_id IS NULL OR draft_id=?)
+        """,
+        (int(draft_id), now_iso(), str(plan_id)[:64], str(destination)[:32], int(draft_id)),
+    )
+    conn.commit()
+    conn.close()
+    if cursor.rowcount != 1:
+        raise RuntimeError("editorial delivery claim is unavailable")
+
+
+def finish_editorial_delivery(
+    plan_id: str, destination: str, state: str, *, draft_id: int | None = None
+) -> str:
+    """Finish a claimed delivery; committed requires a persisted publication receipt."""
+    if state not in {"committed", "failed"}:
+        raise ValueError("invalid editorial delivery terminal state")
+    conn = db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """
+            SELECT state, draft_id FROM editorial_delivery_state
+            WHERE plan_id=? AND destination=?
+            """,
+            (str(plan_id)[:64], str(destination)[:32]),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("editorial delivery claim is missing")
+        existing = str(row["state"] or "")
+        if existing in {"committed", "failed"}:
+            conn.commit()
+            return existing
+        effective_draft_id = draft_id if draft_id is not None else row["draft_id"]
+        draft_has_receipt = False
+        if effective_draft_id is not None:
+            draft = conn.execute(
+                "SELECT published_at FROM drafts WHERE id=?", (int(effective_draft_id),)
+            ).fetchone()
+            draft_has_receipt = bool(draft is not None and str(draft["published_at"] or ""))
+        terminal_state = "committed" if draft_has_receipt else state
+        if terminal_state == "committed":
+            if effective_draft_id is None or not draft_has_receipt:
+                raise RuntimeError("committed editorial delivery has no draft receipt")
+        elif state == "committed":
+            raise RuntimeError("committed editorial delivery has no publication receipt")
+        conn.execute(
+            """
+            UPDATE editorial_delivery_state
+            SET state=?, draft_id=COALESCE(?, draft_id), updated_at=?
+            WHERE plan_id=? AND destination=? AND state='sending'
+            """,
+            (
+                terminal_state, effective_draft_id, now_iso(),
+                str(plan_id)[:64], str(destination)[:32],
+            ),
+        )
+        conn.commit()
+        return terminal_state
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_editorial_delivery_state(plan_id: str, destination: str) -> sqlite3.Row | None:
+    conn = db()
+    row = conn.execute(
+        """
+        SELECT * FROM editorial_delivery_state
+        WHERE plan_id=? AND destination=?
+        """,
+        (str(plan_id)[:64], str(destination)[:32]),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def mark_published(
+    draft_id: int,
+    source_url: str = "",
+    *,
+    telegram_chat_id: str = "",
+    telegram_message_id: int | None = None,
+    vk_job_id: str = "",
+    vk_receipt_id: str = "",
+) -> bool:
     conn = db()
     draft = conn.execute(
         "SELECT title, editorial_plan_json FROM drafts WHERE id=?",
@@ -1856,17 +2296,50 @@ def mark_published(draft_id: int, source_url: str = "") -> bool:
         (published_at, draft_id),
     )
     published_now = cursor.rowcount > 0
+    history_commit_status = "not_run"
+    plan: dict[str, Any] = {}
     if published_now and draft is not None:
         try:
-            plan = json.loads(str(draft["editorial_plan_json"] or "{}"))
+            parsed_plan = json.loads(str(draft["editorial_plan_json"] or "{}"))
         except json.JSONDecodeError:
-            plan = {}
+            parsed_plan = {}
+        plan = parsed_plan if isinstance(parsed_plan, dict) else {}
         if isinstance(plan, dict) and str(plan.get("plan_id", "")):
-            _record_content_signature_conn(
+            inserted = _record_content_signature_conn(
                 conn,
                 plan,
                 str(plan.get("topic") or draft["title"] or ""),
                 draft_id,
+            )
+            history_commit_status = "inserted" if inserted else "already_recorded"
+    if published_now:
+        conn.execute(
+            """
+            UPDATE drafts
+            SET telegram_chat_id=?, telegram_message_id=?, vk_job_id=?,
+                vk_receipt_id=?, history_commit_status=?
+            WHERE id=?
+            """,
+            (
+                str(telegram_chat_id)[:128], telegram_message_id,
+                str(vk_job_id)[:128], str(vk_receipt_id)[:128],
+                history_commit_status, draft_id,
+            ),
+        )
+        if isinstance(plan, dict) and str(plan.get("plan_id", "")):
+            conn.execute(
+                """
+                UPDATE editorial_release_observability_v2
+                SET telegram_chat_id=?, telegram_message_id=?, vk_job_id=?,
+                    vk_receipt_id=?, history_commit_status=?, updated_at=?
+                WHERE plan_id=? AND destination=?
+                """,
+                (
+                    str(telegram_chat_id)[:128], telegram_message_id,
+                    str(vk_job_id)[:128], str(vk_receipt_id)[:128],
+                    history_commit_status, now_iso(), str(plan.get("plan_id"))[:64],
+                    str(plan.get("platform") or "telegram")[:32],
+                ),
             )
     if source_url and source_url.startswith("http"):
         conn.execute(
@@ -1876,6 +2349,25 @@ def mark_published(draft_id: int, source_url: str = "") -> bool:
     conn.commit()
     conn.close()
     return published_now
+
+
+def record_vk_enqueue(draft_id: int, job_id: str) -> None:
+    """Persist only the safe queue identifier; enqueue never commits history."""
+    conn = db()
+    conn.execute(
+        "UPDATE drafts SET vk_job_id=? WHERE id=?",
+        (str(job_id)[:128], int(draft_id)),
+    )
+    conn.execute(
+        """
+        UPDATE editorial_release_observability_v2
+        SET vk_job_id=?, updated_at=?
+        WHERE plan_id=(SELECT plan_id FROM drafts WHERE id=?) AND destination='vk'
+        """,
+        (str(job_id)[:128], now_iso(), int(draft_id)),
+    )
+    conn.commit()
+    conn.close()
 
 
 def already_published(url: str) -> bool:
@@ -2545,11 +3037,138 @@ def move_exchange_file(path: Path, direction: str, box: str) -> None:
     os.replace(path, target)
 
 
+def safe_naz_crosspost_summary(payload: dict[str, Any], source_text: str) -> str:
+    """Reduce private exchange material to a non-reconstructable topic class."""
+    declared = str(payload.get("public_summary") or "").strip()
+    declared_hint = declared if payload.get("public_summary_safe") is True else ""
+    # Even an upstream-declared safe summary is only a classification hint.
+    # Persisting arbitrary prose here would make the private source reconstructable.
+    haystack = f"{payload.get('topic', '')} {declared_hint} {source_text}".casefold()
+    topic_classes = (
+        (("automation", "agent", "workflow", "автомат", "агент"), "a private practical observation about automation and human responsibility"),
+        (("design", "creative", "music", "image", "дизайн", "музык", "творч"), "a private practical observation about creative work and tools"),
+        (("attention", "feed", "screen", "вниман", "лента", "экран"), "a private observation about attention in a digital environment"),
+        (("memory", "archive", "истори", "памят", "архив"), "a private observation about memory and what technology preserves"),
+    )
+    for markers, summary in topic_classes:
+        if any(marker in haystack for marker in markers):
+            return summary
+    return "a private practical observation from Naz about a human choice around digital tools"
+
+
+def naz_crosspost_plan_id(payload: dict[str, Any], fallback_id: str) -> str:
+    upstream = str(payload.get("plan_id") or "").strip()
+    if upstream and re.fullmatch(r"[A-Za-z0-9._:-]{8,64}", upstream):
+        return upstream
+    import hashlib
+
+    stable_source_id = str(payload.get("id") or fallback_id)[:256]
+    return f"void-crosspost-{hashlib.sha256(stable_source_id.encode('utf-8')).hexdigest()[:24]}"
+
+
+async def create_planned_naz_crosspost_draft(
+    payload: dict[str, Any],
+    source_text: str,
+    *,
+    fallback_id: str,
+    now: datetime | None = None,
+) -> tuple[int, editorial_orchestrator.EditorialPlan]:
+    """Use the scheduled orchestrator without persisting private source text."""
+    current = now or datetime.now(MOSCOW_TZ)
+    plan_id = naz_crosspost_plan_id(payload, fallback_id)
+    summary = safe_naz_crosspost_summary(payload, source_text)
+    rubric_name = "THOUGHTS AFTER A CONVERSATION / VOID"
+    rubric_key = void_editorial_catalog.rubric_key(rubric_name)
+    source_ref = f"exchange://naz/{plan_id}"
+    character = void_character.apply_event(load_character_state(), "quiet")
+    plan = scheduled_plan(
+        platform="telegram",
+        slot=f"crosspost:{current:%Y-%m-%d}",
+        seed=f"telegram:{current:%Y-%m-%d}:crosspost:{plan_id}",
+        rubric_rows=[
+            {
+                "key": rubric_key,
+                "name": rubric_name,
+                "mode": "observation",
+                "voice": "void",
+                "brief": "form one original public observation after privately digesting a conversation",
+                "frequency": "HUMAN",
+            }
+        ],
+        source_rows=[
+            {
+                "source_ref": source_ref,
+                "topic": summary,
+                "source_type": "private_exchange",
+                "rubric_keys": (rubric_key,),
+            }
+        ],
+        character=character,
+        crosspost_plan_id=plan_id,
+    )
+    captured_at = current.isoformat(timespec="seconds")
+    record_release_observability(
+        plan,
+        slot_captured_at=captured_at,
+        generation_package_status="not_run",
+    )
+    try:
+        package = await generate_scheduled_package(
+            plan,
+            character,
+            source_material=(
+                f"SAFE SOURCE SUMMARY: {summary}. The private source text is intentionally omitted. "
+                "Do not quote, reconstruct, or expose the conversation."
+            ),
+        )
+    except ScheduledTechnicalFailure:
+        record_release_observability(
+            plan, slot_captured_at=captured_at, generation_package_status="invalid"
+        )
+        raise
+    except ScheduledContentReject:
+        record_release_observability(
+            plan, slot_captured_at=captured_at, generation_package_status="rejected"
+        )
+        raise
+    except Exception:
+        record_release_observability(
+            plan, slot_captured_at=captured_at, generation_package_status="unavailable"
+        )
+        raise
+    draft_id = await asyncio.to_thread(
+        save_draft,
+        plan.mode,
+        plan.rubric,
+        package.final_text,
+        "Naz AI Bot",
+        source_ref,
+        "crosspost",
+        8,
+        plan_id=plan.plan_id,
+        editorial_plan=plan.to_dict(),
+        generation_package=generation_package_dict(package),
+        slot_captured_at=captured_at,
+        generation_package_status="accepted",
+        image_qa_status="not_run",
+    )
+    record_release_observability(
+        plan,
+        slot_captured_at=captured_at,
+        generation_package_status="accepted",
+        draft_id=draft_id,
+    )
+    return draft_id, plan
+
+
 async def process_naz_to_void_exchange(bot: Bot) -> None:
     if not CROSSPOST_EXCHANGE_ENABLED:
         return
     ensure_exchange_dirs()
     for path in sorted(exchange_dir("naz_to_void", "inbox").glob("*.json"))[:CROSSPOST_EXCHANGE_MAX_PER_RUN]:
+        delivery_plan_id = ""
+        delivery_claimed = False
+        draft_id: int | None = None
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             if payload.get("source") == "void_entity":
@@ -2562,27 +3181,64 @@ async def process_naz_to_void_exchange(bot: Bot) -> None:
             if len(source_text) < 40:
                 raise ValueError("empty or too short Naz payload")
 
-            adapted = await asyncio.to_thread(build_crosspost_from_naz_sync, source_text, payload)
-            draft_id = save_draft(
-                adapted["mode"],
-                adapted["title"],
-                adapted["post"],
-                "Naz AI Bot",
-                f"exchange://naz/{payload.get('id', path.stem)}",
-                "crosspost",
-                publish_score=8,
+            auto_publish = (
+                payload.get("publish_mode", "auto") == "auto"
+                and CROSSPOST_EXCHANGE_AUTO_PUBLISH
             )
-            if payload.get("publish_mode", "auto") == "auto" and CROSSPOST_EXCHANGE_AUTO_PUBLISH:
+            if auto_publish:
+                delivery_plan_id = naz_crosspost_plan_id(payload, path.stem)
+                delivery_status = claim_editorial_delivery(delivery_plan_id, "telegram")
+                if delivery_status != "claimed":
+                    print(
+                        f"exchange duplicate naz_to_void: plan_id={delivery_plan_id} "
+                        f"delivery={delivery_status}",
+                        flush=True,
+                    )
+                    move_exchange_file(
+                        path,
+                        "naz_to_void",
+                        "failed" if delivery_status == "failed" else "processed",
+                    )
+                    continue
+                delivery_claimed = True
+
+            draft_id, plan = await create_planned_naz_crosspost_draft(
+                payload,
+                source_text,
+                fallback_id=path.stem,
+            )
+            if delivery_claimed:
+                if plan.plan_id != delivery_plan_id:
+                    raise RuntimeError("crosspost delivery plan_id mismatch")
+                attach_editorial_delivery_draft(plan.plan_id, "telegram", draft_id)
+            if auto_publish:
                 result = await publish_draft(bot, draft_id)
                 if result.startswith("Опубликовано:"):
+                    finish_editorial_delivery(
+                        plan.plan_id, "telegram", "committed", draft_id=draft_id
+                    )
                     mark_crosspost("naz_to_void")
                     print(f"exchange published naz_to_void: {result}", flush=True)
                 else:
                     raise ValueError(result)
             else:
-                print(f"exchange draft naz_to_void: #{draft_id}", flush=True)
+                print(
+                    f"exchange draft naz_to_void: #{draft_id} plan_id={plan.plan_id}",
+                    flush=True,
+                )
             move_exchange_file(path, "naz_to_void", "processed")
         except Exception as e:
+            if delivery_claimed:
+                try:
+                    finish_editorial_delivery(
+                        delivery_plan_id, "telegram", "failed", draft_id=draft_id
+                    )
+                except Exception as delivery_error:
+                    print(
+                        "exchange delivery finalization failed: "
+                        f"{type(delivery_error).__name__}",
+                        flush=True,
+                    )
             print(f"exchange naz_to_void failed: {path.name}: {type(e).__name__}: {e}", flush=True)
             try:
                 move_exchange_file(path, "naz_to_void", "failed")
@@ -2593,7 +3249,8 @@ async def process_naz_to_void_exchange(bot: Bot) -> None:
 async def exchange_loop(bot: Bot) -> None:
     while True:
         try:
-            await process_naz_to_void_exchange(bot)
+            with scheduled_work_marker("void.crosspost"):
+                await process_naz_to_void_exchange(bot)
         except Exception as e:
             print(f"exchange_loop error: {type(e).__name__}: {e}", flush=True)
         await asyncio.sleep(CROSSPOST_EXCHANGE_INTERVAL_SECONDS)
@@ -3580,7 +4237,7 @@ async def send_telegram_post(bot: Bot, package: TelegramPostPackage) -> Telegram
         return TelegramPublishOutcome(success=False, error=error)
 
     try:
-        await bot.send_message(
+        sent_message = await bot.send_message(
             chat_id=CHANNEL_ID,
             text=package.text,
             reply_markup=catch_keyboard(package.draft_id),
@@ -3591,7 +4248,14 @@ async def send_telegram_post(bot: Bot, package: TelegramPostPackage) -> Telegram
         print(f"telegram publish failed draft #{package.draft_id}: {error}", flush=True)
         return TelegramPublishOutcome(success=False, image_count=image_count, error=error)
 
-    return TelegramPublishOutcome(success=True, image_count=image_count)
+    raw_message_id = getattr(sent_message, "message_id", None)
+    message_id = raw_message_id if isinstance(raw_message_id, int) else None
+    return TelegramPublishOutcome(
+        success=True,
+        image_count=image_count,
+        chat_id=str(CHANNEL_ID),
+        message_id=message_id,
+    )
 
 
 async def publish_draft(
@@ -3623,7 +4287,12 @@ async def publish_draft(
     if not outcome.success:
         return f"Публикация не выполнена: #{draft_id}. {outcome.error}"
 
-    mark_published(draft_id, draft["source_url"] or "")
+    mark_published(
+        draft_id,
+        draft["source_url"] or "",
+        telegram_chat_id=outcome.chat_id,
+        telegram_message_id=outcome.message_id,
+    )
     if apply_planned_character_event:
         await asyncio.to_thread(apply_character_event, character_event_for_mode(str(draft["mode"] or "")))
     if content_plan is not None:
@@ -4103,6 +4772,7 @@ def scheduled_plan(
     source_rows: list[dict[str, Any]],
     character: void_character.CharacterState,
     crosspost_plan_id: str = "",
+    persona_pool_sizes: dict[str, int] | None = None,
 ) -> editorial_orchestrator.EditorialPlan:
     """The sole creative decision entrypoint for scheduled VOID routes."""
     context = void_editorial_catalog.build_context(
@@ -4114,6 +4784,7 @@ def scheduled_plan(
         published_history=get_recent_content_signatures(160),
         character=character,
         crosspost_plan_id=crosspost_plan_id,
+        persona_pool_sizes=persona_pool_sizes,
     )
     return editorial_orchestrator.plan_release(context)
 
@@ -4214,7 +4885,12 @@ async def scheduled_inputs(
     schedule: list[dict[str, Any]],
     *,
     now: datetime,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, dict[str, Any]]]:
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, int],
+]:
     eligible = [dict(item) for item in eligible_schedule_slots(schedule, now)]
     rubric_rows: list[dict[str, Any]] = []
     source_rows: list[dict[str, Any]] = []
@@ -4258,7 +4934,11 @@ async def scheduled_inputs(
     rubric_rows = [row for row in rubric_rows if str(row["key"]) in usable_keys]
     if not rubric_rows or not source_rows:
         raise RuntimeError("no source-integrity-compatible scheduled inputs")
-    return rubric_rows, source_rows, source_items
+    full_rubric_size = len({str(item.get("name") or "") for item in schedule})
+    return rubric_rows, source_rows, source_items, {
+        "rubric": full_rubric_size,
+        "source_ref": max(full_rubric_size, len(source_rows)),
+    }
 
 
 async def create_planned_scheduled_draft(
@@ -4269,7 +4949,9 @@ async def create_planned_scheduled_draft(
     now: datetime | None = None,
 ) -> tuple[int, editorial_orchestrator.EditorialPlan, str]:
     current = now or datetime.now(MOSCOW_TZ)
-    rubric_rows, source_rows, source_items = await scheduled_inputs(schedule, now=current)
+    rubric_rows, source_rows, source_items, persona_pool_sizes = await scheduled_inputs(
+        schedule, now=current
+    )
     character = void_character.apply_event(load_character_state(), "quiet")
     seed = f"{platform}:{current:%Y-%m-%d}:{slot}"
     plan = scheduled_plan(
@@ -4279,6 +4961,13 @@ async def create_planned_scheduled_draft(
         rubric_rows=rubric_rows,
         source_rows=source_rows,
         character=character,
+        persona_pool_sizes=persona_pool_sizes,
+    )
+    captured_at = current.isoformat(timespec="seconds")
+    record_release_observability(
+        plan,
+        slot_captured_at=captured_at,
+        generation_package_status="not_run",
     )
     source = source_items[plan.source_ref]
     source_material = ""
@@ -4293,7 +4982,23 @@ async def create_planned_scheduled_draft(
         source_name = str(source.get("source_name") or source_name)
         source_url = str(source.get("url") or source_url)
         frequency = str(source.get("frequency") or frequency)
-    package = await generate_scheduled_package(plan, character, source_material=source_material)
+    try:
+        package = await generate_scheduled_package(plan, character, source_material=source_material)
+    except ScheduledTechnicalFailure:
+        record_release_observability(
+            plan, slot_captured_at=captured_at, generation_package_status="invalid"
+        )
+        raise
+    except ScheduledContentReject:
+        record_release_observability(
+            plan, slot_captured_at=captured_at, generation_package_status="rejected"
+        )
+        raise
+    except Exception:
+        record_release_observability(
+            plan, slot_captured_at=captured_at, generation_package_status="unavailable"
+        )
+        raise
     draft_id = await asyncio.to_thread(
         save_draft,
         plan.mode,
@@ -4306,6 +5011,17 @@ async def create_planned_scheduled_draft(
         plan_id=plan.plan_id,
         editorial_plan=plan.to_dict(),
         generation_package=generation_package_dict(package),
+        slot_captured_at=captured_at,
+        generation_package_status="accepted",
+        # No pixel-level validator is present in this release. Record that
+        # truthfully instead of claiming visual acceptance.
+        image_qa_status="not_run",
+    )
+    record_release_observability(
+        plan,
+        slot_captured_at=captured_at,
+        generation_package_status="accepted",
+        draft_id=draft_id,
     )
     return draft_id, plan, plan.topic
 
@@ -4474,10 +5190,11 @@ async def auto_loop(bot: Bot) -> None:
                 slot = current_void_schedule_slot()
                 last_slot = get_setting("telegram_void_last_slot", "")
                 if slot and slot != last_slot:
-                    # Claim first so a slow send or restart cannot duplicate a slot.
-                    set_setting("telegram_void_last_slot", slot)
-                    result = await publish_telegram_void_scheduled_once(bot)
-                    print(result, flush=True)
+                    with scheduled_work_marker("void.telegram"):
+                        # Claim first so a slow send or restart cannot duplicate a slot.
+                        set_setting("telegram_void_last_slot", slot)
+                        result = await publish_telegram_void_scheduled_once(bot)
+                        print(result, flush=True)
         except Exception as e:
             print(f"auto_loop error: {type(e).__name__}: {e}", flush=True)
 
@@ -5722,17 +6439,10 @@ async def generate_dialog_answer(user_id: int, text: str, *, persist: bool = Tru
     return reply
 
 
-def void_v14_allowlisted_user_ids() -> frozenset[int]:
-    values: set[int] = set()
-    for item in os.getenv("VOID_V14_ALLOWLIST", "").split(","):
-        item = item.strip()
-        if item and item.lstrip("-").isdigit():
-            values.add(int(item))
-    return frozenset(values)
-
-
 def build_void_v14_router():
     """Lazy laboratory wiring; stable and scheduled paths never call this."""
+    if not VOID_V14_ENABLED:
+        raise RuntimeError("VOID v14 laboratory is disabled")
     from void_v14.config import VoidV14Config
     from void_v14.engine import VoidV14Engine
     from void_v14.memory import ExperimentalMemory
@@ -5746,7 +6456,6 @@ def build_void_v14_router():
                 "/var/lib/void-entity/v14/experimental.sqlite3",
             )
         ),
-        allowlisted_user_ids=void_v14_allowlisted_user_ids(),
     )
     memory = ExperimentalMemory(
         config.memory_path,
@@ -5778,7 +6487,9 @@ async def void_v14_command(message: Message) -> None:
     if not message.from_user:
         return
     user_id = message.from_user.id
-    if user_id != ADMIN_ID and user_id not in void_v14_allowlisted_user_ids():
+    # The laboratory is never a contact or scheduled route. Both conditions
+    # must be explicit before any v14 import/provider construction can occur.
+    if not VOID_V14_ENABLED or user_id != ADMIN_ID:
         await message.answer("VOID v14 недоступен для этого пользователя.")
         return
     parts = (message.text or "").split(maxsplit=2)

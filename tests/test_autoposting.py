@@ -511,6 +511,7 @@ class AutopostingRubricTests(unittest.TestCase):
             patch("void_vk_producer.main.choose_vk_music_track", return_value=track) as choose,
             patch("void_vk_producer.build_job", return_value={"job_id": "material"}),
             patch("void_vk_producer.enqueue_job", return_value=Path("queued")) as enqueue,
+            patch("void_vk_producer.main.record_vk_enqueue") as record_enqueue,
         ):
             result = void_vk_producer.enqueue_draft(121)
 
@@ -519,6 +520,7 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertEqual(choose.call_args.kwargs["excluded_track_keys"], {f"old {index}" for index in range(8)})
         media = enqueue.call_args.args[2]
         self.assertEqual(tuple(media), ("image-1.png", "image-2.png", "image-3.png", "image-4.png"))
+        record_enqueue.assert_called_once_with(121, "material")
 
     def test_vk_music_selection_blocks_without_fresh_suitable_track(self) -> None:
         tracks = [{"artist": "Artist", "title": "Future", "tags": ["future"]}]

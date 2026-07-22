@@ -29,6 +29,10 @@ def output(agent):
 
 
 class VoidV14HybridTests(unittest.IsolatedAsyncioTestCase):
+    def test_example_environment_keeps_v14_disabled(self):
+        example = Path(".env.example").read_text(encoding="utf-8")
+        self.assertIn("VOID_V14_ENABLED=false", example)
+
     async def test_parallel_users_have_isolated_trace_memory(self):
         with tempfile.TemporaryDirectory() as root:
             memory = ExperimentalMemory(Path(root) / "v14.sqlite3", retention_days=30)
@@ -65,6 +69,7 @@ class VoidV14HybridTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(main, "ADMIN_ID", 7),
+            patch.object(main, "VOID_V14_ENABLED", True),
             patch.object(main, "generate_dialog_answer", new=AsyncMock(return_value="stable final")) as stable,
             patch.object(main, "build_void_v14_router") as build,
         ):
@@ -84,6 +89,7 @@ class VoidV14HybridTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch.object(main, "ADMIN_ID", 7),
+            patch.object(main, "VOID_V14_ENABLED", True),
             patch.object(main, "build_void_v14_router", return_value=router),
             patch.object(main, "generate_dialog_answer", new=AsyncMock(return_value="stable preview")) as stable,
             patch.object(main, "persist_dialog_turn") as persist,
@@ -103,6 +109,35 @@ class VoidV14HybridTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "send failed"):
                 await main.deliver_void_v14_outcome(message, outcome, "hello")
         persist.assert_not_called()
+
+    async def test_default_off_blocks_admin_before_router_construction(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=7),
+            text="/v14 experimental hello",
+            answer=AsyncMock(),
+        )
+        with (
+            patch.object(main, "ADMIN_ID", 7),
+            patch.object(main, "VOID_V14_ENABLED", False),
+            patch.object(main, "build_void_v14_router") as build,
+        ):
+            await main.void_v14_command(message)
+        build.assert_not_called()
+
+    async def test_enabled_flag_does_not_authorize_contact_or_old_allowlist(self):
+        message = SimpleNamespace(
+            from_user=SimpleNamespace(id=99),
+            text="/v14 experimental hello",
+            answer=AsyncMock(),
+        )
+        with (
+            patch.object(main, "ADMIN_ID", 7),
+            patch.object(main, "VOID_V14_ENABLED", True),
+            patch.dict("os.environ", {"VOID_V14_ALLOWLIST": "99"}),
+            patch.object(main, "build_void_v14_router") as build,
+        ):
+            await main.void_v14_command(message)
+        build.assert_not_called()
 
 
 if __name__ == "__main__":
