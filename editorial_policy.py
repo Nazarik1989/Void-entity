@@ -44,8 +44,6 @@ REASON_CODES = frozenset({
     "validator_unavailable", "generation_failed", "regeneration_exhausted", "fallback_forbidden",
     "schema_json_parse_failed", "schema_missing_fields", "schema_invalid_field_types",
     "schema_unknown_reason_code", "schema_conflicting_fields",
-    "near_duplicate_semantics", "repeated_digital_attention_thesis",
-    "brief_thesis_near_duplicate", "brief_novelty_exhausted",
 })
 TEXT_GATE_REASON_CODES = frozenset({
     "accepted", "text_missing_entry_context", "text_unknown_conversation",
@@ -61,8 +59,6 @@ NON_RETRYABLE_GATE_REASON_CODES = frozenset({
     "unknown_visual_code_version", "conflicting_visual_rules", "missing_people_justification",
     "validator_unavailable", "schema_json_parse_failed", "schema_missing_fields",
     "schema_invalid_field_types", "schema_unknown_reason_code", "schema_conflicting_fields",
-    "near_duplicate_semantics", "repeated_digital_attention_thesis",
-    "brief_thesis_near_duplicate", "brief_novelty_exhausted",
 })
 TEXT_GATE_BOOLEAN_FIELDS = (
     "accepted", "entry_context_clear", "self_contained", "invented_current_event",
@@ -124,7 +120,6 @@ class ContentBrief:
     forbidden_elements: tuple[str, ...]
     visual_code_version: str
     music_required: bool
-    exclusion_fingerprints: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         value = asdict(self)
@@ -209,8 +204,7 @@ def build_brief(*, destination: str, scheduled_slot: str, source_type: str,
                 visual_subject: str, visual_relation: str, allowed_rubrics: Iterable[str],
                 people_allowed: bool = False, allowed_people_description: str = "",
                 required_elements: Iterable[str] = (), forbidden_elements: Iterable[str] = (),
-                music_required: bool = False,
-                exclusion_fingerprints: Iterable[str] = ()) -> ContentBrief:
+                music_required: bool = False) -> ContentBrief:
     brief = ContentBrief(
         EDITORIAL_CONTRACT_VERSION, make_post_id(destination, source_reference), "void",
         PERSONA_POLICY_VERSION, destination, scheduled_slot, source_type, source_reference,
@@ -219,7 +213,6 @@ def build_brief(*, destination: str, scheduled_slot: str, source_type: str,
         tuple(str(x).strip() for x in required_elements if str(x).strip()),
         tuple(dict.fromkeys((*DEFAULT_FORBIDDEN, *(str(x).strip() for x in forbidden_elements if str(x).strip())))),
         VISUAL_CODE_VERSION, bool(music_required),
-        tuple(dict.fromkeys(str(x).strip() for x in exclusion_fingerprints if str(x).strip())),
     )
     return validate_brief(brief, allowed_rubrics=allowed_rubrics)
 
@@ -230,7 +223,6 @@ def brief_from_json(raw: str, *, allowed_rubrics: Iterable[str]) -> ContentBrief
         raise BriefValidationError("invalid_brief", "brief must be an object")
     value["required_elements"] = tuple(value.get("required_elements") or ())
     value["forbidden_elements"] = tuple(value.get("forbidden_elements") or ())
-    value["exclusion_fingerprints"] = tuple(value.get("exclusion_fingerprints") or ())
     try:
         brief = ContentBrief(**value)
     except TypeError as exc:

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import html
 import json
 import mimetypes
@@ -908,7 +907,6 @@ def build_character_directive(
     mode: str,
     persist_event: bool = True,
     semantic_theme: str = "",
-    editorial_axes: dict[str, str] | None = None,
 ) -> tuple[void_character.CharacterState, dict[str, str], str]:
     event = character_event_for_mode(mode)
     if persist_event:
@@ -929,9 +927,10 @@ def build_character_directive(
         plan["semantic_theme"] = semantic_theme
         plan["semantic_theme_instruction"] = SEMANTIC_THEMES[semantic_theme]
         plan.update(
-            dict(editorial_axes)
-            if editorial_axes is not None
-            else select_editorial_axes(semantic_theme, recent_signatures)
+            select_editorial_axes(
+                semantic_theme,
+                recent_signatures,
+            )
         )
     return state, plan, void_character.prompt_context(state, plan)
 
@@ -3160,10 +3159,7 @@ async def generate_scheduled_draft(
                 draft["publish_score"],
                 editorial_brief.canonical_json(),
             )
-        if (
-            last_reason in {"near_duplicate_semantics", "repeated_digital_attention_thesis"}
-            or not editorial_policy.is_retryable_gate_reason(last_reason)
-        ):
+        if not editorial_policy.is_retryable_gate_reason(last_reason):
             print(
                 f"EDITORIAL_TEXT_GATE post_id={editorial_brief.post_id} "
                 f"attempts={attempt + 1} accepted=false "
@@ -3947,7 +3943,6 @@ def build_scheduled_content_brief(
     source_reference: str,
     platform: str,
     source_type: str,
-    exclusion_fingerprints: tuple[str, ...] = (),
 ) -> editorial_policy.ContentBrief:
     rubric = str(slot.get("name") or "")
     thesis = str(editorial_plan.get("meaning_thought") or slot.get("brief") or "").strip()
@@ -3976,7 +3971,6 @@ def build_scheduled_content_brief(
         allowed_rubrics=registered_void_rubrics(),
         required_elements=(visual_subject,),
         music_required=platform == "vk",
-        exclusion_fingerprints=exclusion_fingerprints,
     )
     print(
         "EDITORIAL_BRIEF metadata="
@@ -4001,175 +3995,6 @@ def build_scheduled_content_brief(
 
 SCHEDULED_GENERATION_ATTEMPTS = 2
 SEMANTIC_HISTORY_LIMIT = 8
-SCHEDULED_BRIEF_ATTEMPTS = 2
-BRIEF_THESIS_SIMILARITY_THRESHOLD = 0.72
-
-
-@dataclass(frozen=True, slots=True)
-class BriefNoveltyDecision:
-    accepted: bool
-    reason_code: str
-    semantic_theme: str
-    meaning_key: str
-    thesis_fingerprint: str
-    similarity_score: float
-    similarity_threshold: float
-    matched_record_id: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class ScheduledBriefPlan:
-    semantic_theme: str
-    editorial_axes: dict[str, str]
-    attempt: int
-    exclusion_fingerprints: tuple[str, ...]
-    decisions: tuple[BriefNoveltyDecision, ...]
-
-
-class NoNovelScheduledBrief(RuntimeError):
-    def __init__(self, decisions: list[BriefNoveltyDecision]):
-        super().__init__("brief_novelty_exhausted")
-        self.reason_code = "brief_novelty_exhausted"
-        self.decisions = tuple(decisions)
-
-
-def semantic_fingerprint(value: str) -> str:
-    normalized = " ".join(str(value or "").casefold().split())
-    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
-
-
-def thesis_similarity(left: str, right: str) -> float:
-    left_tokens = _semantic_tokens(left)
-    right_tokens = _semantic_tokens(right)
-    if not left_tokens or not right_tokens:
-        return 0.0
-    shared = len(left_tokens & right_tokens)
-    containment = shared / min(len(left_tokens), len(right_tokens))
-    jaccard = shared / len(left_tokens | right_tokens)
-    return round(max(containment, jaccard), 4)
-
-
-def _meaning_card_by_key(key: str) -> dict[str, str] | None:
-    for cards in MEANING_CARDS.values():
-        for card in cards:
-            if str(card.get("key") or "") == key:
-                return {str(name): str(value) for name, value in card.items()}
-    return None
-
-
-def brief_exclusion_fingerprints(
-    recent_signatures: list[dict[str, str]],
-) -> tuple[str, ...]:
-    values: list[str] = []
-    for signature in recent_signatures[-SEMANTIC_HISTORY_LIMIT:]:
-        card = _meaning_card_by_key(str(signature.get("meaning_key") or ""))
-        fingerprint = semantic_fingerprint(card.get("thought", "")) if card else ""
-        if fingerprint and fingerprint not in values:
-            values.append(fingerprint)
-    return tuple(values)
-
-
-def evaluate_scheduled_brief_novelty(
-    *,
-    semantic_theme: str,
-    editorial_axes: dict[str, str],
-    recent_signatures: list[dict[str, str]],
-) -> BriefNoveltyDecision:
-    meaning_key = str(editorial_axes.get("meaning_key") or "")
-    thesis = str(editorial_axes.get("meaning_thought") or "")
-    thesis_fingerprint = semantic_fingerprint(thesis)
-    best_score = 0.0
-    matched_record_id = ""
-    for signature in recent_signatures[-SEMANTIC_HISTORY_LIMIT:]:
-        prior_key = str(signature.get("meaning_key") or "")
-        prior_card = _meaning_card_by_key(prior_key)
-        if not prior_card:
-            continue
-        score = 1.0 if prior_key == meaning_key else thesis_similarity(
-            thesis,
-            prior_card.get("thought", ""),
-        )
-        if score > best_score:
-            best_score = score
-            matched_record_id = "signature:" + semantic_fingerprint(
-                "|".join(
-                    (
-                        str(signature.get("platform") or ""),
-                        str(signature.get("mode") or ""),
-                        prior_key,
-                        str(signature.get("created_at") or ""),
-                    )
-                )
-            )
-    accepted = best_score < BRIEF_THESIS_SIMILARITY_THRESHOLD
-    return BriefNoveltyDecision(
-        accepted,
-        "accepted" if accepted else "brief_thesis_near_duplicate",
-        semantic_theme,
-        meaning_key,
-        thesis_fingerprint,
-        best_score,
-        BRIEF_THESIS_SIMILARITY_THRESHOLD,
-        matched_record_id,
-    )
-
-
-def select_scheduled_brief_plan(
-    *,
-    mode: str,
-    recent_signatures: list[dict[str, str]],
-) -> ScheduledBriefPlan:
-    decisions: list[BriefNoveltyDecision] = []
-    candidates = semantic_theme_candidates(mode, recent_signatures)
-    for attempt, semantic_theme in enumerate(
-        candidates[:SCHEDULED_BRIEF_ATTEMPTS],
-        start=1,
-    ):
-        editorial_axes = select_editorial_axes(semantic_theme, recent_signatures)
-        decision = evaluate_scheduled_brief_novelty(
-            semantic_theme=semantic_theme,
-            editorial_axes=editorial_axes,
-            recent_signatures=recent_signatures,
-        )
-        decisions.append(decision)
-        if decision.accepted:
-            return ScheduledBriefPlan(
-                semantic_theme,
-                dict(editorial_axes),
-                attempt,
-                brief_exclusion_fingerprints(recent_signatures),
-                tuple(decisions),
-            )
-    exclusion_fingerprints = brief_exclusion_fingerprints(recent_signatures)
-    _log_brief_novelty_decisions(decisions, exclusion_fingerprints)
-    print(
-        "EDITORIAL_BRIEF_NOVELTY accepted=false "
-        f"reason_code=brief_novelty_exhausted attempts={len(decisions)}",
-        flush=True,
-    )
-    raise NoNovelScheduledBrief(decisions)
-
-
-def _log_brief_novelty_decisions(
-    decisions: tuple[BriefNoveltyDecision, ...] | list[BriefNoveltyDecision],
-    exclusion_fingerprints: tuple[str, ...],
-) -> None:
-    for attempt, decision in enumerate(decisions, start=1):
-        print(
-            "EDITORIAL_BRIEF_NOVELTY "
-            f"attempt={attempt} accepted={str(decision.accepted).lower()} "
-            f"reason_code={decision.reason_code} semantic_theme={decision.semantic_theme} "
-            f"meaning_key={decision.meaning_key} thesis_fingerprint={decision.thesis_fingerprint} "
-            f"similarity_score={decision.similarity_score:.4f} "
-            f"similarity_threshold={decision.similarity_threshold:.4f} "
-            f"matched_record_id={decision.matched_record_id or 'none'} "
-            f"exclusion_fingerprints={','.join(exclusion_fingerprints) or 'none'}",
-            flush=True,
-        )
-
-
-def log_scheduled_brief_plan(plan: ScheduledBriefPlan) -> None:
-    _log_brief_novelty_decisions(plan.decisions, plan.exclusion_fingerprints)
 
 
 def scheduled_reason_code(reason: str) -> str:
@@ -4498,16 +4323,11 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
     brief = str(slot.get("brief", "Make an original post for the shared public."))
     mode = str(slot.get("mode", "signal"))
     recent_signatures = await asyncio.to_thread(get_recent_content_signatures)
-    brief_plan = None
-    if voice == "news":
-        semantic_theme = ""
-    else:
-        brief_plan = select_scheduled_brief_plan(
-            mode=mode,
-            recent_signatures=recent_signatures,
-        )
-        log_scheduled_brief_plan(brief_plan)
-        semantic_theme = brief_plan.semantic_theme
+    semantic_theme = (
+        ""
+        if voice == "news"
+        else choose_semantic_theme(mode, recent_signatures)
+    )
     _, editorial_plan, character_directive = await asyncio.to_thread(
         build_character_directive,
         brief,
@@ -4515,7 +4335,6 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
         mode,
         False,
         semantic_theme,
-        brief_plan.editorial_axes if brief_plan is not None else None,
     )
 
     content = (
@@ -4576,7 +4395,6 @@ async def save_scheduled_rubric_draft(slot: dict[str, Any]) -> int:
         source_reference=source_reference,
         platform="vk",
         source_type="scheduled_rubric",
-        exclusion_fingerprints=brief_plan.exclusion_fingerprints,
     )
     draft_id = await generate_scheduled_draft(
         mode=mode,
@@ -4605,16 +4423,11 @@ async def save_telegram_void_scheduled_draft(
     brief = str(slot.get("brief", "Make an original Telegram post."))
     mode = str(slot.get("mode", "signal"))
     recent_signatures = await asyncio.to_thread(get_recent_content_signatures)
-    brief_plan = None
-    if voice == "news":
-        semantic_theme = ""
-    else:
-        brief_plan = select_scheduled_brief_plan(
-            mode=mode,
-            recent_signatures=recent_signatures,
-        )
-        log_scheduled_brief_plan(brief_plan)
-        semantic_theme = brief_plan.semantic_theme
+    semantic_theme = (
+        ""
+        if voice == "news"
+        else choose_semantic_theme(mode, recent_signatures)
+    )
     _, editorial_plan, character_directive = await asyncio.to_thread(
         build_character_directive,
         brief,
@@ -4622,7 +4435,6 @@ async def save_telegram_void_scheduled_draft(
         mode,
         False,
         semantic_theme,
-        brief_plan.editorial_axes if brief_plan is not None else None,
     )
 
     if voice == "news":
@@ -4675,7 +4487,6 @@ async def save_telegram_void_scheduled_draft(
         source_reference=source_reference,
         platform="telegram",
         source_type="scheduled_rubric",
-        exclusion_fingerprints=brief_plan.exclusion_fingerprints,
     )
     draft_id = await generate_scheduled_draft(
         mode=mode,
@@ -4694,11 +4505,6 @@ async def publish_telegram_void_scheduled_once(bot: Bot) -> str:
     slot = await asyncio.to_thread(choose_telegram_schedule_slot)
     try:
         draft_id, editorial_plan, content_topic = await save_telegram_void_scheduled_draft(slot)
-    except NoNovelScheduledBrief:
-        return (
-            f"Telegram VOID: слот {slot.get('name')} пропущен — "
-            "все ограниченные варианты смыслового плана повторяют недавние смыслы."
-        )
     except Exception as e:
         return f"Telegram VOID schedule failed: {slot.get('name')}: {type(e).__name__}: {e}"
 

@@ -601,7 +601,7 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
             ),
         }
 
-    async def test_semantic_repetition_stops_without_text_paraphrase(self) -> None:
+    async def test_bounded_retry_stops_after_two_rejected_candidates(self) -> None:
         with (
             patch("main.recent_scheduled_posts", return_value=["old"]),
             patch("main.generate_post_sync", return_value=self._draft("candidate")) as generate,
@@ -620,7 +620,7 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                     semantic_theme="craft",
                     editorial_brief=self.brief,
                 )
-        self.assertEqual(generate.call_count, 1)
+        self.assertEqual(generate.call_count, 2)
         save.assert_not_called()
 
     async def test_void_12_text_gate_contract_error_does_not_consume_retry(self) -> None:
@@ -721,11 +721,11 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                     self._draft("accepted candidate"),
                 ],
             ) as generate,
+            patch("main.quality_check", return_value=(True, "ok")),
             patch(
-                "main.quality_check",
-                side_effect=[(False, "text_quality_rejected"), (True, "ok")],
+                "main.semantic_repetition_reason",
+                side_effect=["near_duplicate_semantics", ""],
             ),
-            patch("main.semantic_repetition_reason", return_value=""),
             patch("main.save_draft", return_value=77) as save,
         ):
             draft_id = await generate_scheduled_draft(
@@ -761,10 +761,9 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                 ],
             ) as generate,
             patch("main.quality_check", return_value=(True, "ok")),
-            patch("main.semantic_repetition_reason", return_value=""),
             patch(
-                "main.editorial_text_gate_decision",
-                side_effect=[(False, "text_topic_drift"), (True, "accepted")],
+                "main.semantic_repetition_reason",
+                side_effect=["near_duplicate_semantics", ""],
             ),
             patch("main.save_draft", return_value=77),
         ):
@@ -780,7 +779,7 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
             )
 
         retry_content = generate.call_args_list[1].args[1]
-        self.assertIn("text_topic_drift", retry_content)
+        self.assertIn("near_duplicate_semantics", retry_content)
         self.assertIn(rejected_summary.central_thesis, retry_content)
         self.assertIn(rejected_summary.conclusion, retry_content)
         self.assertIn(rejected_summary.narrative_shape, retry_content)
@@ -792,106 +791,6 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Do not reuse that narrative shape", retry_content)
         self.assertIn("different concrete scene", retry_content)
         self.assertIn("substantially different conclusion", retry_content)
-
-    async def test_void_12_repeating_first_brief_accepts_second_semantic_axis(self) -> None:
-        decisions = [
-            main.BriefNoveltyDecision(
-                False,
-                "brief_thesis_near_duplicate",
-                "craft",
-                "craft_accumulated_skill",
-                "first-fingerprint",
-                1.0,
-                main.BRIEF_THESIS_SIMILARITY_THRESHOLD,
-                "signature:old",
-            ),
-            main.BriefNoveltyDecision(
-                True,
-                "accepted",
-                "city",
-                "city_shared_route",
-                "second-fingerprint",
-                0.0,
-                main.BRIEF_THESIS_SIMILARITY_THRESHOLD,
-            ),
-        ]
-        with (
-            patch("main.semantic_theme_candidates", return_value=["craft", "city"]),
-            patch("main.evaluate_scheduled_brief_novelty", side_effect=decisions),
-        ):
-            plan = main.select_scheduled_brief_plan(
-                mode="observation",
-                recent_signatures=[],
-            )
-
-        self.assertEqual(plan.attempt, 2)
-        self.assertEqual(plan.semantic_theme, "city")
-        self.assertNotEqual(plan.decisions[0].semantic_theme, plan.semantic_theme)
-        self.assertNotEqual(
-            plan.decisions[0].thesis_fingerprint,
-            plan.decisions[1].thesis_fingerprint,
-        )
-
-    async def test_void_brief_pregate_rejects_simple_thesis_paraphrase(self) -> None:
-        prior_card = {
-            "key": "fixture_prior",
-            "thought": "shared timing creates patient attention between people",
-        }
-        axes = {
-            "meaning_key": "fixture_candidate",
-            "meaning_thought": "between people patient attention creates shared timing",
-        }
-        with patch("main._meaning_card_by_key", return_value=prior_card):
-            decision = main.evaluate_scheduled_brief_novelty(
-                semantic_theme="music",
-                editorial_axes=axes,
-                recent_signatures=[{
-                    "platform": "telegram",
-                    "mode": "observation",
-                    "meaning_key": "fixture_prior",
-                    "created_at": "2026-07-21T12:00:00+03:00",
-                }],
-            )
-
-        self.assertFalse(decision.accepted)
-        self.assertEqual(decision.reason_code, "brief_thesis_near_duplicate")
-        self.assertGreaterEqual(
-            decision.similarity_score,
-            main.BRIEF_THESIS_SIMILARITY_THRESHOLD,
-        )
-
-    async def test_void_accepted_brief_thesis_is_immutable_downstream(self) -> None:
-        with self.assertRaisesRegex(AttributeError, "thesis"):
-            self.brief.thesis = "mutated downstream"
-        self.assertEqual(self.brief.thesis, "A fixed craft thesis")
-
-    async def test_void_all_bounded_briefs_repeat_and_slot_is_skipped(self) -> None:
-        rejected = [
-            main.BriefNoveltyDecision(
-                False,
-                "brief_thesis_near_duplicate",
-                theme,
-                meaning,
-                fingerprint,
-                1.0,
-                main.BRIEF_THESIS_SIMILARITY_THRESHOLD,
-                f"signature:{fingerprint}",
-            )
-            for theme, meaning, fingerprint in (
-                ("craft", "craft_accumulated_skill", "first"),
-                ("city", "city_shared_route", "second"),
-            )
-        ]
-        with (
-            patch("main.semantic_theme_candidates", return_value=["craft", "city"]),
-            patch("main.evaluate_scheduled_brief_novelty", side_effect=rejected),
-        ):
-            with self.assertRaises(main.NoNovelScheduledBrief) as raised:
-                main.select_scheduled_brief_plan(
-                    mode="observation",
-                    recent_signatures=[],
-                )
-        self.assertEqual(len(raised.exception.decisions), 2)
 
     async def test_missing_semantic_summary_stops_without_uninformed_retry(self) -> None:
         candidate = self._draft("candidate")
