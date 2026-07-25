@@ -1,12 +1,31 @@
-# VOID Entity
+<p align="center">
+  <img src="./docs/assets/avatar.webp" width="230" alt="VOID Entity avatar" />
+</p>
 
-VOID is an experimental AI editorial persona for narrative content generation, thematic exploration, and autonomous publishing.
+<h1 align="center">VOID Entity</h1>
+
+<p align="center">
+  <strong>Experimental editorial intelligence for signals, narrative, character state and autonomous publishing.</strong>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python" />
+  <img src="https://img.shields.io/badge/Telegram-Bot-26A5E4?style=flat-square&logo=telegram&logoColor=white" alt="Telegram" />
+  <img src="https://img.shields.io/badge/Editorial-Deterministic_Planning-8A7CFF?style=flat-square" alt="Editorial planning" />
+  <img src="https://img.shields.io/badge/Status-Active_Experiment-D0D0D0?style=flat-square" alt="Status" />
+</p>
+
+VOID is an experimental AI editorial persona for narrative content generation, thematic exploration and autonomous publishing.
 
 It transforms news, signals, and observations through its own perspective on AI, attention, control, culture, human behaviour, and the future:
 
 ```text
 Source collection → signal filtering → draft → editorial rewrite → publishing
 ```
+
+<p align="center">
+  <img src="./docs/assets/architecture.svg" width="100%" alt="VOID Entity architecture" />
+</p>
 
 ## Features
 
