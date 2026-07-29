@@ -26,6 +26,7 @@ MAX_TRACK_QUERY_LENGTH = 300
 MAX_DEDUPE_KEY_LENGTH = 256
 RECENT_TRACK_LIMIT = 8
 TRACK_HISTORY_FILENAME = "recent-tracks.json"
+TRACK_HISTORY_BACKFILL_MARKER = ".track-history-v2-complete"
 PUBLICATION_RECEIPT_SCHEMA = "vk_publication_receipt.v1"
 PUBLICATION_RECEIPTS_DIRNAME = "published"
 PUBLICATION_RECEIPT_BACKFILL_MARKER = ".backfill-v1-complete"
@@ -56,8 +57,16 @@ def normalize_track_query(value: str) -> str:
     return " ".join(re.findall(r"[0-9a-zа-яё]+", str(value).casefold()))
 
 
-def recent_track_keys(queue_root: Path, limit: int = RECENT_TRACK_LIMIT) -> list[str]:
-    if limit <= 0:
+def recent_track_keys(
+    queue_root: Path,
+    limit: int | None = RECENT_TRACK_LIMIT,
+) -> list[str]:
+    """Return published track keys in least-to-most-recent order.
+
+    ``None`` exposes the complete distinct LRU history to catalog-aware
+    producers. The numeric default keeps legacy last-eight readers compatible.
+    """
+    if limit is not None and limit <= 0:
         return []
     path = Path(queue_root) / TRACK_HISTORY_FILENAME
     try:
@@ -66,27 +75,94 @@ def recent_track_keys(queue_root: Path, limit: int = RECENT_TRACK_LIMIT) -> list
         return []
     except (OSError, json.JSONDecodeError) as exc:
         raise QueueValidationError("shared VK track history is unavailable") from exc
-    tracks = payload.get("tracks", []) if isinstance(payload, dict) else []
-    if not isinstance(tracks, list):
-        return []
-    keys = [str(item.get("key") or "") for item in tracks if isinstance(item, dict)]
-    return [key for key in keys if key][-limit:]
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"tracks"}
+        or not isinstance(payload["tracks"], list)
+    ):
+        raise QueueValidationError("shared VK track history is invalid")
+    keys: list[str] = []
+    for item in payload["tracks"]:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"key"}
+            or not isinstance(item["key"], str)
+        ):
+            raise QueueValidationError("shared VK track history is invalid")
+        key = item["key"]
+        if not key or normalize_track_query(key) != key or key in keys:
+            raise QueueValidationError("shared VK track history is invalid")
+        keys.append(key)
+    return keys if limit is None else keys[-limit:]
 
 
 def _record_published_track(queue_root: Path, job: dict[str, Any]) -> None:
     queue_root = Path(queue_root)
     path = queue_root / TRACK_HISTORY_FILENAME
     key = normalize_track_query(job["track_query"])
-    existing = recent_track_keys(queue_root, RECENT_TRACK_LIMIT)
+    existing = recent_track_keys(queue_root, None)
     keys = [item for item in existing if item != key]
     keys.append(key)
-    payload = {
-        "tracks": [{"key": item} for item in keys[-RECENT_TRACK_LIMIT:]]
-    }
+    payload = {"tracks": [{"key": item} for item in keys]}
     temp = queue_root / f".{TRACK_HISTORY_FILENAME}.tmp-{uuid.uuid4().hex}"
     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(temp, 0o644)
     os.replace(temp, path)
+
+
+def _backfill_full_track_history(queue_root: Path, allowed_group_id: str) -> None:
+    """Expand legacy last-eight state from validated publication receipts."""
+    queue_root = Path(queue_root)
+    marker = queue_root / TRACK_HISTORY_BACKFILL_MARKER
+    if marker.is_file() and not marker.is_symlink():
+        return
+    # Corrupt existing state remains fail-closed instead of being overwritten.
+    ordered = recent_track_keys(queue_root, None)
+    receipts = sorted(
+        publication_receipts(queue_root),
+        key=lambda item: item["published_at"],
+    )
+    for receipt in receipts:
+        job_dir = next(
+            (
+                candidate
+                # A receipt is authoritative even if later local bookkeeping
+                # moved the already-published job to ``failed``.
+                for state in ("done", "processing", "failed")
+                if (candidate := queue_root / state / receipt["job_id"]).is_dir()
+                and not candidate.is_symlink()
+            ),
+            None,
+        )
+        if job_dir is None:
+            raise QueueValidationError(
+                "confirmed VK publication job is unavailable for track history"
+            )
+        job = validate_job(job_dir, allowed_group_id)
+        if (
+            job["producer"] != receipt["producer"]
+            or job["source_ref"] != receipt["source_ref"]
+        ):
+            raise QueueValidationError(
+                "confirmed VK publication receipt does not match its job"
+            )
+        key = normalize_track_query(job["track_query"])
+        if key in ordered:
+            ordered.remove(key)
+        ordered.append(key)
+    if ordered:
+        payload = {"tracks": [{"key": item} for item in ordered]}
+        temp = queue_root / f".{TRACK_HISTORY_FILENAME}.backfill-{uuid.uuid4().hex}"
+        temp.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(temp, 0o644)
+        os.replace(temp, queue_root / TRACK_HISTORY_FILENAME)
+    temp_marker = queue_root / f".{TRACK_HISTORY_BACKFILL_MARKER}.tmp-{uuid.uuid4().hex}"
+    temp_marker.write_text(_utc_now() + "\n", encoding="utf-8")
+    os.chmod(temp_marker, 0o640)
+    os.replace(temp_marker, marker)
 
 
 def _publication_receipt_path(queue_root: Path, job_id: str) -> Path:
@@ -386,6 +462,7 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
     for state in STATES:
         (queue_root / state).mkdir(parents=True, exist_ok=True)
     _backfill_publication_receipts(queue_root, allowed_group_id)
+    _backfill_full_track_history(queue_root, allowed_group_id)
     for source in sorted((queue_root / "pending").iterdir()):
         if not source.is_dir() or source.is_symlink() or source.name.startswith("."):
             continue

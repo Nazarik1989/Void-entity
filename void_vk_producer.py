@@ -75,7 +75,7 @@ def enqueue_draft(draft_id: int) -> Path:
     media = {f"image-{index}.png": content for index, content in enumerate(images[:4], start=1)}
     track = main.choose_vk_music_track(
         draft,
-        excluded_track_keys=set(recent_track_keys(QUEUE_DIR)),
+        excluded_track_keys=recent_track_keys(QUEUE_DIR, limit=None),
     )
     if not track:
         raise RuntimeError("No suitable fresh VK music track is available; draft was not queued")

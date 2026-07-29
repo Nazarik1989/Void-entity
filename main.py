@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 from urllib.parse import quote, urlencode, urljoin
 from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -116,6 +116,7 @@ VK_GROUP_ID = os.getenv("VK_GROUP_ID", "")
 VK_API_VERSION = os.getenv("VK_API_VERSION", "5.199")
 VK_DRY_RUN = os.getenv("VK_DRY_RUN", "true").strip().lower() not in {"0", "false", "no", "off"}
 VK_MUSIC_TRACKS_FILE = os.getenv("VK_MUSIC_TRACKS_FILE", "data/vk_music_tracks.json")
+VK_SHARED_TRACK_COLLISION_LIMIT = 8
 VK_PHOTO_ACCESS_TOKEN = os.getenv("VK_PHOTO_ACCESS_TOKEN", "")
 
 DB_PATH = "void.db"
@@ -3893,18 +3894,19 @@ def vk_music_track_key(track: dict[str, Any]) -> str:
     return f"{artist}|{title}"
 
 
-def recent_vk_music_track_keys(limit: int = 8) -> list[str]:
+def recent_vk_music_track_keys(limit: int | None = None) -> list[str]:
     conn = db()
-    rows = conn.execute(
-        """
+    query = """
         SELECT music_track
         FROM vk_posts
         WHERE music_track IS NOT NULL AND music_track NOT IN ('', '{}')
         ORDER BY published_at DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
+    """
+    rows = (
+        conn.execute(query).fetchall()
+        if limit is None
+        else conn.execute(query + " LIMIT ?", (limit,)).fetchall()
+    )
     conn.close()
 
     keys: list[str] = []
@@ -3914,8 +3916,8 @@ def recent_vk_music_track_keys(limit: int = 8) -> list[str]:
         except (TypeError, json.JSONDecodeError):
             continue
         if isinstance(track, dict) and track.get("title"):
-            keys.append(vk_music_track_key(track))
-    return keys
+            keys.append(vk_music_track_query_key(track))
+    return list(reversed(keys))
 
 
 VK_VIBE_KEYWORDS = {
@@ -3939,6 +3941,8 @@ VK_MODE_VIBES = {
     "observation": {"calm", "melancholy", "warm"},
     "material": {"dark", "calm", "melancholy"},
 }
+
+VK_SHARED_TRACK_COLLISION_LIMIT = 8
 
 
 def infer_vk_vibes(text: str) -> set[str]:
@@ -3983,11 +3987,29 @@ def vk_music_track_query_key(track: dict[str, Any]) -> str:
     return " ".join(re.findall(r"[0-9a-zа-яё]+", query.casefold()))
 
 
+def _ordered_track_history(values: Iterable[str]) -> list[str]:
+    ordered: list[str] = []
+    for value in values:
+        key = " ".join(re.findall(r"[0-9a-zа-яё]+", str(value).casefold()))
+        if not key:
+            continue
+        if key in ordered:
+            ordered.remove(key)
+        ordered.append(key)
+    return ordered
+
+
 def choose_vk_music_track(
     draft: dict | sqlite3.Row,
-    excluded_track_keys: set[str] | None = None,
+    excluded_track_keys: Iterable[str] | None = None,
 ) -> dict[str, Any] | None:
-    tracks = load_vk_music_tracks()
+    loaded_tracks = load_vk_music_tracks()
+    tracks_by_key = {
+        vk_music_track_query_key(track): track
+        for track in loaded_tracks
+        if vk_music_track_query_key(track)
+    }
+    tracks = list(tracks_by_key.values())
     if not tracks:
         return None
 
@@ -4013,19 +4035,50 @@ def choose_vk_music_track(
         overlap = post_vibes & track_vibes
         return sum(3 if vibe in {"future", "dark", "energy", "calm"} else 2 for vibe in overlap)
 
-    recent = set(recent_vk_music_track_keys(limit=8))
-    shared_recent = excluded_track_keys or set()
+    shared_history = list(excluded_track_keys or ())
+    if isinstance(excluded_track_keys, set):
+        shared_history = sorted(shared_history)
+    shared_collision_keys = set(
+        _ordered_track_history(shared_history)[-VK_SHARED_TRACK_COLLISION_LIMIT:]
+    )
+    # Queue history is authoritative across Naz and VOID. Local VOID history
+    # is only a fallback for manual/legacy callers without shared state.
+    history = (
+        _ordered_track_history(shared_history)
+        if excluded_track_keys is not None
+        else _ordered_track_history(recent_vk_music_track_keys(limit=None))
+    )
+    used = set(history)
+    eligible_tracks = [track for track in tracks if score(track) > 0]
+    if not eligible_tracks:
+        return None
     candidates = [
         track
-        for track in tracks
-        if vk_music_track_key(track) not in recent
-        and vk_music_track_query_key(track) not in shared_recent
+        for track in eligible_tracks
+        if vk_music_track_query_key(track) not in used
     ]
     if not candidates:
-        return None
+        positions = {key: index for index, key in enumerate(history)}
+        rollover_tracks = [
+            track
+            for track in eligible_tracks
+            if vk_music_track_query_key(track) not in shared_collision_keys
+        ]
+        if not rollover_tracks:
+            # Exhaustion relaxes only the diversity guard. Allowlist and
+            # release compatibility stay mandatory, while the slot still
+            # receives the least-recently-used compatible track.
+            rollover_tracks = eligible_tracks
+        oldest = min(
+            positions.get(vk_music_track_query_key(track), -1)
+            for track in rollover_tracks
+        )
+        candidates = [
+            track
+            for track in rollover_tracks
+            if positions.get(vk_music_track_query_key(track), -1) == oldest
+        ]
     best_score = max(score(track) for track in candidates)
-    if best_score <= 0:
-        return None
     best = [track for track in candidates if score(track) == best_score]
 
     draft_seed = plan_id or str(draft["id"] if "id" in draft.keys() else sorted(post_vibes))

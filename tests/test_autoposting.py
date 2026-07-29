@@ -426,7 +426,7 @@ class AutopostingRubricTests(unittest.TestCase):
 
         with (
             patch("main.load_vk_music_tracks", return_value=tracks),
-            patch("main.recent_vk_music_track_keys", return_value=["a|first", "b|second"]),
+            patch("main.recent_vk_music_track_keys", return_value=["a first", "b second"]),
         ):
             selected = choose_vk_music_track(draft)
 
@@ -470,7 +470,7 @@ class AutopostingRubricTests(unittest.TestCase):
 
         self.assertEqual(selected["title"], "Future 8")
 
-    def test_material_uses_allowlist_and_shared_recent_eight_rotation(self) -> None:
+    def test_material_uses_allowlist_and_full_catalog_rotation(self) -> None:
         tracks = [
             {"artist": f"Artist {index}", "title": f"Dark {index}", "tags": ["dark", "calm"]}
             for index in range(9)
@@ -482,7 +482,7 @@ class AutopostingRubricTests(unittest.TestCase):
             "frequency": "HUMAN",
             "post": "Камень хранит след прикосновения.",
         }
-        shared_recent = {f"artist {index} dark {index}" for index in range(8)}
+        shared_recent = [f"artist {index} dark {index}" for index in range(8)]
 
         with (
             patch("main.load_vk_music_tracks", return_value=tracks),
@@ -493,6 +493,7 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertIs(selected, tracks[8])
         self.assertEqual(MATERIAL_RUBRIC["music_source"], "current allowlist only")
         self.assertEqual(MATERIAL_RUBRIC["shared_recent_track_limit"], 8)
+        self.assertEqual(MATERIAL_RUBRIC["track_rotation"], "full_catalog_lru")
 
     def test_vk_producer_accepts_four_material_frames_and_shared_history(self) -> None:
         draft = {
@@ -516,14 +517,21 @@ class AutopostingRubricTests(unittest.TestCase):
             result = void_vk_producer.enqueue_draft(121)
 
         self.assertEqual(result, Path("queued"))
-        recent.assert_called_once_with(void_vk_producer.QUEUE_DIR)
-        self.assertEqual(choose.call_args.kwargs["excluded_track_keys"], {f"old {index}" for index in range(8)})
+        recent.assert_called_once_with(void_vk_producer.QUEUE_DIR, limit=None)
+        self.assertEqual(choose.call_args.kwargs["excluded_track_keys"], [f"old {index}" for index in range(8)])
         media = enqueue.call_args.args[2]
         self.assertEqual(tuple(media), ("image-1.png", "image-2.png", "image-3.png", "image-4.png"))
         record_enqueue.assert_called_once_with(121, "material")
 
-    def test_vk_music_selection_blocks_without_fresh_suitable_track(self) -> None:
-        tracks = [{"artist": "Artist", "title": "Future", "tags": ["future"]}]
+    def test_vk_music_selection_uses_lru_after_full_catalog_cycle(self) -> None:
+        tracks = [
+            {
+                "artist": f"Artist {index}",
+                "title": f"Future {index}",
+                "tags": ["future"],
+            }
+            for index in range(9)
+        ]
         draft = {
             "id": 100,
             "mode": "future",
@@ -538,10 +546,168 @@ class AutopostingRubricTests(unittest.TestCase):
         ):
             selected = choose_vk_music_track(
                 draft,
-                excluded_track_keys={"artist future"},
+                excluded_track_keys=[
+                    f"artist {index} future {index}" for index in range(9)
+                ],
             )
 
-        self.assertIsNone(selected)
+        self.assertIs(selected, tracks[0])
+
+    def test_vk_music_lru_never_reuses_shared_last_eight(self) -> None:
+        tracks = [
+            {
+                "artist": f"Artist {index}",
+                "title": f"Future {index}",
+                "tags": ["future"],
+            }
+            for index in range(10)
+        ]
+        draft = {
+            "id": 101,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+        shared_history = [
+            f"artist {index} future {index}" for index in range(1, 10)
+        ] + ["artist 0 future 0"]
+
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch("main.recent_vk_music_track_keys", return_value=[]),
+        ):
+            selected = choose_vk_music_track(
+                draft,
+                excluded_track_keys=shared_history,
+            )
+
+        self.assertEqual(main.vk_music_track_query_key(selected), shared_history[0])
+        self.assertNotIn(
+            main.vk_music_track_query_key(selected),
+            shared_history[-main.VK_SHARED_TRACK_COLLISION_LIMIT :],
+        )
+
+    def test_vk_music_full_149_track_catalog_has_no_early_repeat(self) -> None:
+        tracks = [
+            {
+                "artist": f"Artist {index}",
+                "title": f"Future Track {index}",
+                "tags": ["future"],
+            }
+            for index in range(149)
+        ]
+        draft = {
+            "id": 149,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+        history: list[str] = []
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch("main.recent_vk_music_track_keys", return_value=[]),
+        ):
+            for _ in range(len(tracks)):
+                selected = choose_vk_music_track(draft, excluded_track_keys=history)
+                self.assertIsNotNone(selected)
+                key = main.vk_music_track_query_key(selected)
+                self.assertNotIn(key, history)
+                history.append(key)
+            selected_after_cycle = choose_vk_music_track(
+                draft,
+                excluded_track_keys=history,
+            )
+
+        self.assertEqual(
+            main.vk_music_track_query_key(selected_after_cycle),
+            history[0],
+        )
+
+    def test_new_catalog_track_enters_current_cycle_before_reuse(self) -> None:
+        tracks = [
+            {"artist": "A", "title": "Future First", "tags": ["future"]},
+            {"artist": "B", "title": "Future Second", "tags": ["future"]},
+        ]
+        draft = {
+            "id": 150,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+        history = ["a future first", "b future second"]
+        expanded = [
+            *tracks,
+            {"artist": "C", "title": "Future New", "tags": ["future"]},
+        ]
+        with (
+            patch("main.load_vk_music_tracks", return_value=expanded),
+            patch("main.recent_vk_music_track_keys", return_value=[]),
+        ):
+            selected = choose_vk_music_track(draft, excluded_track_keys=history)
+
+        self.assertEqual(main.vk_music_track_query_key(selected), "c future new")
+
+    def test_full_lru_does_not_weaken_track_compatibility(self) -> None:
+        tracks = [
+            *[
+                {
+                    "artist": f"Artist {index}",
+                    "title": f"Future {index}",
+                    "tags": ["future"],
+                }
+                for index in range(9)
+            ],
+            {"artist": "Unused", "title": "Night", "tags": ["night"]},
+        ]
+        draft = {
+            "id": 151,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch("main.recent_vk_music_track_keys", return_value=[]),
+        ):
+            selected = choose_vk_music_track(
+                draft,
+                excluded_track_keys=[
+                    f"artist {index} future {index}" for index in range(9)
+                ],
+            )
+
+        self.assertIs(selected, tracks[0])
+
+    def test_shared_history_is_authoritative_over_void_local_order(self) -> None:
+        tracks = [
+            {"artist": f"Artist {index}", "title": "Future", "tags": ["future"]}
+            for index in range(10)
+        ]
+        shared_history = [f"artist {index} future" for index in range(10)]
+        draft = {
+            "id": 152,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch(
+                "main.recent_vk_music_track_keys",
+                return_value=list(reversed(shared_history)),
+            ),
+        ):
+            selected = choose_vk_music_track(
+                draft,
+                excluded_track_keys=shared_history,
+            )
+
+        self.assertEqual(main.vk_music_track_query_key(selected), shared_history[0])
 
     def test_vk_producer_timer_uses_only_requested_moscow_slots(self) -> None:
         timer = Path("deploy/systemd/void-vk-producer.timer").read_text(

@@ -14,6 +14,8 @@ from vk_publish_queue import (
     DuplicateTrackError,
     QueueValidationError,
     RetryablePublishError,
+    TRACK_HISTORY_BACKFILL_MARKER,
+    _backfill_full_track_history,
     build_job,
     canonical_job_id,
     consume_once,
@@ -57,6 +59,21 @@ class VkPublishQueueTests(unittest.TestCase):
     def enqueue(self, job=None):
         return enqueue_job(self.root, job or self.job(), {"image-1.png": b"png"})
 
+    def write_receipt(self, job, published_at="2026-07-30T12:00:00Z"):
+        receipts = self.root / "published"
+        receipts.mkdir(exist_ok=True)
+        payload = {
+            "schema": "vk_publication_receipt.v1",
+            "job_id": job["job_id"],
+            "producer": job["producer"],
+            "source_ref": job["source_ref"],
+            "published_at": published_at,
+        }
+        (receipts / f"{job['job_id']}.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+
     def test_parse_scheduled_draft_id_regression(self):
         self.assertEqual(parse_scheduled_draft_id("Scheduled VK draft: #296"), 296)
 
@@ -67,7 +84,7 @@ class VkPublishQueueTests(unittest.TestCase):
         with self.assertRaisesRegex(QueueValidationError, "track_query is required"):
             self.job(track_query="")
 
-    def test_shared_recent_eight_tracks_cover_naz_and_void(self):
+    def test_shared_history_keeps_full_lru_with_legacy_last_eight_view(self):
         for index in range(8):
             producer = "naz" if index % 2 == 0 else "void"
             job = self.job(
@@ -97,6 +114,93 @@ class VkPublishQueueTests(unittest.TestCase):
         self.enqueue(ninth)
         self.assertEqual(consume_once(self.root, self.group, Mock()), 0)
         self.assertNotIn("artist track 0", recent_track_keys(self.root))
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            [f"artist track {index}" for index in range(9)],
+        )
+
+    def test_legacy_history_is_backfilled_from_confirmed_done_jobs(self):
+        existing = ["legacy oldest", "legacy newest"]
+        (self.root / "recent-tracks.json").write_text(
+            json.dumps({"tracks": [{"key": key} for key in existing]}),
+            encoding="utf-8",
+        )
+        expected = list(existing)
+        (self.root / "done").mkdir()
+        for index in range(12):
+            job = self.job(
+                producer="naz" if index % 2 == 0 else "void",
+                dedupe_key=f"backfill-{index}",
+                track_query=f"Backfill Track {index}",
+            )
+            directory = self.enqueue(job)
+            os.replace(directory, self.root / "done" / directory.name)
+            expected.append(f"backfill track {index}")
+
+        self.assertEqual(consume_once(self.root, self.group, Mock()), 0)
+        history = recent_track_keys(self.root, limit=None)
+        self.assertEqual(history[: len(existing)], existing)
+        self.assertEqual(set(history), set(expected))
+        self.assertEqual(len(history), len(expected))
+        self.assertEqual(len(publication_receipts(self.root)), 12)
+
+    def test_track_history_backfill_resolves_confirmed_processing_job(self):
+        job = self.job(
+            dedupe_key="processing-receipt",
+            track_query="Processing Track",
+            source_ref="void:draft:processing",
+        )
+        directory = self.enqueue(job)
+        processing = self.root / "processing"
+        processing.mkdir()
+        os.replace(directory, processing / directory.name)
+        self.write_receipt(job)
+
+        _backfill_full_track_history(self.root, self.group)
+
+        self.assertEqual(recent_track_keys(self.root, limit=None), ["processing track"])
+        self.assertTrue((self.root / TRACK_HISTORY_BACKFILL_MARKER).is_file())
+
+    def test_track_history_backfill_resolves_published_failed_job(self):
+        job = self.job(
+            dedupe_key="failed-after-receipt",
+            track_query="Published Failed Track",
+            source_ref="void:draft:failed-after-receipt",
+        )
+        directory = self.enqueue(job)
+        failed = self.root / "failed"
+        failed.mkdir()
+        os.replace(directory, failed / directory.name)
+        self.write_receipt(job)
+
+        _backfill_full_track_history(self.root, self.group)
+
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["published failed track"],
+        )
+        self.assertTrue((self.root / TRACK_HISTORY_BACKFILL_MARKER).is_file())
+
+    def test_unresolved_receipt_does_not_write_track_state_or_marker(self):
+        existing_payload = {"tracks": [{"key": "existing track"}]}
+        history_path = self.root / "recent-tracks.json"
+        history_path.write_text(json.dumps(existing_payload), encoding="utf-8")
+        job = self.job(
+            dedupe_key="missing-receipt-job",
+            track_query="Missing Track",
+            source_ref="void:draft:missing",
+        )
+        self.write_receipt(job)
+        original = history_path.read_bytes()
+
+        with self.assertRaisesRegex(
+            QueueValidationError,
+            "confirmed VK publication job is unavailable",
+        ):
+            _backfill_full_track_history(self.root, self.group)
+
+        self.assertEqual(history_path.read_bytes(), original)
+        self.assertFalse((self.root / TRACK_HISTORY_BACKFILL_MARKER).exists())
 
     def test_missing_vk_track_stays_pending_for_safe_retry(self):
         directory = self.enqueue(
@@ -199,6 +303,28 @@ class VkPublishQueueTests(unittest.TestCase):
 
         with self.assertRaisesRegex(QueueValidationError, "history is unavailable"):
             self.enqueue(self.job(dedupe_key="history-corrupt"))
+
+    def test_wrong_shape_duplicate_and_unnormalized_track_history_fail_closed(self):
+        invalid_payloads = (
+            [],
+            {},
+            {"tracks": {}},
+            {"tracks": [None]},
+            {"tracks": [{}]},
+            {"tracks": [{"key": 1}]},
+            {"tracks": [{"key": ""}]},
+            {"tracks": [{"key": "artist track"}, {"key": "artist track"}]},
+            {"tracks": [{"key": " Artist  Track "}]},
+            {"tracks": [{"key": "artist track", "extra": "field"}]},
+            {"tracks": [], "extra": True},
+        )
+        path = self.root / "recent-tracks.json"
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaisesRegex(QueueValidationError, "history is invalid"):
+                    recent_track_keys(self.root, limit=None)
 
     def test_other_group_blocked(self):
         with self.assertRaises(QueueValidationError):

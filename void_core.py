@@ -134,6 +134,7 @@ MATERIAL_RUBRIC = {
     "marking": "minimal MATERIAL / VOID marking added in post-production",
     "music_source": "current allowlist only",
     "shared_recent_track_limit": 8,
+    "track_rotation": "full_catalog_lru",
     "scheduled": False,
 }
 
