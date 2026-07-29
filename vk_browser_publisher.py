@@ -226,7 +226,7 @@ def build_browser_payload(draft_id: int) -> dict[str, Any]:
 
     track = main.choose_vk_music_track(
         draft,
-        excluded_track_keys=set(recent_track_keys(VK_PUBLISH_QUEUE_DIR)),
+        excluded_track_keys=recent_track_keys(VK_PUBLISH_QUEUE_DIR, limit=None),
     )
     if not track:
         raise RuntimeError("No suitable fresh VK music track is available")
