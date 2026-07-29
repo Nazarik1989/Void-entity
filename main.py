@@ -4049,19 +4049,20 @@ def choose_vk_music_track(
         else _ordered_track_history(recent_vk_music_track_keys(limit=None))
     )
     used = set(history)
-    eligible_tracks = [track for track in tracks if score(track) > 0]
-    if not eligible_tracks:
-        return None
+    # The curated allowlist is the compatibility boundary. Mood/tag overlap is
+    # a soft ranking signal, otherwise small tag subsets (future=3, calm=4,
+    # melancholy=5 in the current catalog) can all fall inside shared last-8
+    # and incorrectly make the entire 149-track catalog look unavailable.
     candidates = [
         track
-        for track in eligible_tracks
+        for track in tracks
         if vk_music_track_query_key(track) not in used
     ]
     if not candidates:
         positions = {key: index for index, key in enumerate(history)}
         rollover_tracks = [
             track
-            for track in eligible_tracks
+            for track in tracks
             if vk_music_track_query_key(track) not in shared_collision_keys
         ]
         if not rollover_tracks:

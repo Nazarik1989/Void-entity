@@ -650,7 +650,7 @@ class AutopostingRubricTests(unittest.TestCase):
 
         self.assertEqual(main.vk_music_track_query_key(selected), "c future new")
 
-    def test_full_lru_does_not_weaken_track_compatibility(self) -> None:
+    def test_mood_tags_rank_tracks_without_blocking_full_allowlist_cycle(self) -> None:
         tracks = [
             *[
                 {
@@ -680,7 +680,27 @@ class AutopostingRubricTests(unittest.TestCase):
                 ],
             )
 
-        self.assertIs(selected, tracks[0])
+        self.assertIs(selected, tracks[-1])
+
+    def test_mood_match_wins_while_multiple_fresh_tracks_exist(self) -> None:
+        tracks = [
+            {"artist": "A", "title": "Night", "tags": ["night"]},
+            {"artist": "B", "title": "Future", "tags": ["future"]},
+        ]
+        draft = {
+            "id": 153,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch("main.recent_vk_music_track_keys", return_value=[]),
+        ):
+            selected = choose_vk_music_track(draft, excluded_track_keys=[])
+
+        self.assertIs(selected, tracks[1])
 
     def test_shared_history_is_authoritative_over_void_local_order(self) -> None:
         tracks = [
