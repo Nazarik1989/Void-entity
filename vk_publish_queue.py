@@ -27,6 +27,7 @@ MAX_DEDUPE_KEY_LENGTH = 256
 RECENT_TRACK_LIMIT = 8
 TRACK_HISTORY_FILENAME = "recent-tracks.json"
 TRACK_HISTORY_BACKFILL_MARKER = ".track-history-v2-complete"
+LEGACY_RECEIPT_HISTORY_SCHEMA = "vk_publish_job.v2"
 PUBLICATION_RECEIPT_SCHEMA = "vk_publication_receipt.v1"
 PUBLICATION_RECEIPTS_DIRNAME = "published"
 PUBLICATION_RECEIPT_BACKFILL_MARKER = ".backfill-v1-complete"
@@ -110,6 +111,44 @@ def _record_published_track(queue_root: Path, job: dict[str, Any]) -> None:
     os.replace(temp, path)
 
 
+def _validated_receipt_history_job(
+    job_dir: Path,
+    allowed_group_id: str,
+) -> dict[str, Any]:
+    """Validate a receipt-backed job, including one known legacy shape.
+
+    The legacy ``metadata`` field was written by an older producer and is not
+    part of the current runtime contract. It is ignored only while rebuilding
+    history from an authoritative publication receipt; enqueue and publish
+    validation remain strict.
+    """
+    try:
+        return validate_job(job_dir, allowed_group_id)
+    except QueueValidationError as current_error:
+        job_file = Path(job_dir) / "job.json"
+        if job_dir.is_symlink() or job_file.is_symlink() or not job_file.is_file():
+            raise current_error
+        try:
+            payload = json.loads(job_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raise current_error
+        if (
+            not isinstance(payload, dict)
+            or set(payload) != REQUIRED_FIELDS | {"metadata"}
+            or payload.get("schema") != LEGACY_RECEIPT_HISTORY_SCHEMA
+        ):
+            raise current_error
+        try:
+            projected = {key: payload[key] for key in REQUIRED_FIELDS}
+            projected["schema"] = SCHEMA
+            job = _validate_shape(projected, allowed_group_id)
+        except QueueValidationError:
+            raise current_error
+        if job["job_id"] != Path(job_dir).name:
+            raise current_error
+        return job
+
+
 def _backfill_full_track_history(queue_root: Path, allowed_group_id: str) -> None:
     """Expand legacy last-eight state from validated publication receipts."""
     queue_root = Path(queue_root)
@@ -138,7 +177,7 @@ def _backfill_full_track_history(queue_root: Path, allowed_group_id: str) -> Non
             raise QueueValidationError(
                 "confirmed VK publication job is unavailable for track history"
             )
-        job = validate_job(job_dir, allowed_group_id)
+        job = _validated_receipt_history_job(job_dir, allowed_group_id)
         if (
             job["producer"] != receipt["producer"]
             or job["source_ref"] != receipt["source_ref"]
