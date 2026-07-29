@@ -21,7 +21,7 @@ from void_core import (
 POLICY_VERSIONS = {
     "content": "void-content-v1-orchestrated",
     "visual": "void-darkness-light-material-v1",
-    "music": "void-vk-allowlist-full-catalog-lru-v2",
+    "music": "void-vk-allowlist-full-catalog-lru-v3",
 }
 
 
