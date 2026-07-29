@@ -181,6 +181,33 @@ class VkPublishQueueTests(unittest.TestCase):
         )
         self.assertTrue((self.root / TRACK_HISTORY_BACKFILL_MARKER).is_file())
 
+    def test_track_history_backfill_accepts_receipted_legacy_metadata_job(self):
+        job = self.job(
+            dedupe_key="legacy-metadata-receipt",
+            track_query="Legacy Metadata Track",
+            source_ref="void:draft:legacy-metadata",
+        )
+        directory = self.enqueue(job)
+        job_path = directory / "job.json"
+        legacy = json.loads(job_path.read_text(encoding="utf-8"))
+        legacy["schema"] = "vk_publish_job.v2"
+        legacy["metadata"] = {"legacy": True}
+        job_path.write_text(json.dumps(legacy), encoding="utf-8")
+        with self.assertRaises(QueueValidationError):
+            validate_job(directory, self.group)
+        done = self.root / "done"
+        done.mkdir()
+        os.replace(directory, done / directory.name)
+        self.write_receipt(job)
+
+        _backfill_full_track_history(self.root, self.group)
+
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["legacy metadata track"],
+        )
+        self.assertTrue((self.root / TRACK_HISTORY_BACKFILL_MARKER).is_file())
+
     def test_unresolved_receipt_does_not_write_track_state_or_marker(self):
         existing_payload = {"tracks": [{"key": "existing track"}]}
         history_path = self.root / "recent-tracks.json"
