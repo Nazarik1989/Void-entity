@@ -650,7 +650,7 @@ class AutopostingRubricTests(unittest.TestCase):
 
         self.assertEqual(main.vk_music_track_query_key(selected), "c future new")
 
-    def test_full_lru_does_not_weaken_track_compatibility(self) -> None:
+    def test_full_lru_uses_unseen_allowlisted_track_before_semantic_reuse(self) -> None:
         tracks = [
             *[
                 {
@@ -680,7 +680,36 @@ class AutopostingRubricTests(unittest.TestCase):
                 ],
             )
 
-        self.assertIs(selected, tracks[0])
+        self.assertIs(selected, tracks[-1])
+
+    def test_zero_semantic_overlap_does_not_block_catalog_rotation(self) -> None:
+        tracks = [
+            {
+                "artist": f"Artist {index}",
+                "title": f"Catalog Track {index}",
+                "tags": ["culture", "electronic", "music", "night"],
+            }
+            for index in range(9)
+        ]
+        draft = {
+            "id": 153,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+        history = [f"artist {index} catalog track {index}" for index in range(8)]
+
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch("main.recent_vk_music_track_keys", return_value=[]),
+        ):
+            selected = choose_vk_music_track(
+                draft,
+                excluded_track_keys=history,
+            )
+
+        self.assertIs(selected, tracks[8])
 
     def test_shared_history_is_authoritative_over_void_local_order(self) -> None:
         tracks = [

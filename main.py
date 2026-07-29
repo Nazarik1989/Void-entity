@@ -3942,9 +3942,6 @@ VK_MODE_VIBES = {
     "material": {"dark", "calm", "melancholy"},
 }
 
-VK_SHARED_TRACK_COLLISION_LIMIT = 8
-
-
 def infer_vk_vibes(text: str) -> set[str]:
     normalized = (text or "").casefold()
     return {
@@ -4049,26 +4046,20 @@ def choose_vk_music_track(
         else _ordered_track_history(recent_vk_music_track_keys(limit=None))
     )
     used = set(history)
-    eligible_tracks = [track for track in tracks if score(track) > 0]
-    if not eligible_tracks:
-        return None
     candidates = [
         track
-        for track in eligible_tracks
+        for track in tracks
         if vk_music_track_query_key(track) not in used
     ]
     if not candidates:
         positions = {key: index for index, key in enumerate(history)}
         rollover_tracks = [
             track
-            for track in eligible_tracks
+            for track in tracks
             if vk_music_track_query_key(track) not in shared_collision_keys
         ]
         if not rollover_tracks:
-            # Exhaustion relaxes only the diversity guard. Allowlist and
-            # release compatibility stay mandatory, while the slot still
-            # receives the least-recently-used compatible track.
-            rollover_tracks = eligible_tracks
+            return None
         oldest = min(
             positions.get(vk_music_track_query_key(track), -1)
             for track in rollover_tracks

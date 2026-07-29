@@ -28,6 +28,8 @@ RECENT_TRACK_LIMIT = 8
 TRACK_HISTORY_FILENAME = "recent-tracks.json"
 TRACK_HISTORY_BACKFILL_MARKER = ".track-history-v2-complete"
 LEGACY_RECEIPT_HISTORY_SCHEMA = "vk_publish_job.v2"
+LEGACY_TRACK_HISTORY_CHECKPOINT_SCHEMA = "vk_track_history_checkpoint.v2"
+TRACK_HISTORY_CHECKPOINT_SCHEMA = "vk_track_history_checkpoint.v3"
 PUBLICATION_RECEIPT_SCHEMA = "vk_publication_receipt.v1"
 PUBLICATION_RECEIPTS_DIRNAME = "published"
 PUBLICATION_RECEIPT_BACKFILL_MARKER = ".backfill-v1-complete"
@@ -150,23 +152,110 @@ def _validated_receipt_history_job(
 
 
 def _backfill_full_track_history(queue_root: Path, allowed_group_id: str) -> None:
-    """Expand legacy last-eight state from validated publication receipts."""
+    """Reconcile the published-track LRU from durable receipt evidence."""
     queue_root = Path(queue_root)
     marker = queue_root / TRACK_HISTORY_BACKFILL_MARKER
-    if marker.is_file() and not marker.is_symlink():
-        return
-    # Corrupt existing state remains fail-closed instead of being overwritten.
-    ordered = recent_track_keys(queue_root, None)
+    marker_exists = marker.exists() or marker.is_symlink()
+    if marker_exists and (marker.is_symlink() or not marker.is_file()):
+        raise QueueValidationError("shared VK track history marker is invalid")
+
     receipts = sorted(
         publication_receipts(queue_root),
-        key=lambda item: item["published_at"],
+        key=lambda item: (item["published_at"], item["job_id"]),
     )
-    for receipt in receipts:
+    processed: set[str] = set()
+    checkpoint_tracks: list[str] | None = None
+    if marker_exists:
+        try:
+            marker_text = marker.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise QueueValidationError(
+                "shared VK track history marker is invalid"
+            ) from exc
+        try:
+            checkpoint = json.loads(marker_text)
+        except json.JSONDecodeError:
+            checkpoint = None
+        if checkpoint is not None:
+            if not isinstance(checkpoint, dict):
+                raise QueueValidationError("shared VK track history marker is invalid")
+            schema = checkpoint.get("schema")
+            expected_fields = {"schema", "receipt_job_ids", "updated_at"}
+            if schema == TRACK_HISTORY_CHECKPOINT_SCHEMA:
+                expected_fields.add("track_keys")
+            elif schema != LEGACY_TRACK_HISTORY_CHECKPOINT_SCHEMA:
+                raise QueueValidationError("shared VK track history marker is invalid")
+            if (
+                set(checkpoint) != expected_fields
+                or not isinstance(checkpoint.get("receipt_job_ids"), list)
+                or len(checkpoint["receipt_job_ids"]) > 100_000
+                or not all(
+                    isinstance(job_id, str) and JOB_ID_RE.fullmatch(job_id)
+                    for job_id in checkpoint["receipt_job_ids"]
+                )
+                or len(set(checkpoint["receipt_job_ids"]))
+                != len(checkpoint["receipt_job_ids"])
+                or not isinstance(checkpoint.get("updated_at"), str)
+            ):
+                raise QueueValidationError("shared VK track history marker is invalid")
+            try:
+                updated_at = datetime.fromisoformat(
+                    checkpoint["updated_at"].replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise QueueValidationError(
+                    "shared VK track history marker is invalid"
+                ) from exc
+            if updated_at.tzinfo is None:
+                raise QueueValidationError("shared VK track history marker is invalid")
+            processed = set(checkpoint["receipt_job_ids"])
+            if schema == TRACK_HISTORY_CHECKPOINT_SCHEMA:
+                raw_tracks = checkpoint.get("track_keys")
+                if (
+                    not isinstance(raw_tracks, list)
+                    or len(raw_tracks) > 100_000
+                    or not all(
+                        isinstance(key, str)
+                        and key
+                        and normalize_track_query(key) == key
+                        for key in raw_tracks
+                    )
+                    or len(set(raw_tracks)) != len(raw_tracks)
+                ):
+                    raise QueueValidationError(
+                        "shared VK track history marker is invalid"
+                    )
+                checkpoint_tracks = list(raw_tracks)
+        else:
+            # PR #31 used a timestamp-only marker. Its existing history remains
+            # the newest authoritative suffix while receipts recover membership.
+            try:
+                legacy_cutoff = datetime.fromisoformat(
+                    marker_text.strip().replace("Z", "+00:00")
+                )
+            except ValueError as exc:
+                raise QueueValidationError(
+                    "shared VK track history marker is invalid"
+                ) from exc
+            if legacy_cutoff.tzinfo is None:
+                raise QueueValidationError("shared VK track history marker is invalid")
+            processed = {
+                receipt["job_id"]
+                for receipt in receipts
+                if datetime.fromisoformat(
+                    receipt["published_at"].replace("Z", "+00:00")
+                )
+                <= legacy_cutoff
+            }
+
+    # Invalid JSON/history still fails closed; an absent or rollback-truncated
+    # file can be restored from the v3 checkpoint and publication receipts.
+    current_recent = recent_track_keys(queue_root, None)
+
+    def receipt_track_key(receipt: dict[str, str]) -> str:
         job_dir = next(
             (
                 candidate
-                # A receipt is authoritative even if later local bookkeeping
-                # moved the already-published job to ``failed``.
                 for state in ("done", "processing", "failed")
                 if (candidate := queue_root / state / receipt["job_id"]).is_dir()
                 and not candidate.is_symlink()
@@ -185,11 +274,40 @@ def _backfill_full_track_history(queue_root: Path, allowed_group_id: str) -> Non
             raise QueueValidationError(
                 "confirmed VK publication receipt does not match its job"
             )
-        key = normalize_track_query(job["track_query"])
-        if key in ordered:
-            ordered.remove(key)
-        ordered.append(key)
-    if ordered:
+        return normalize_track_query(job["track_query"])
+
+    if checkpoint_tracks is not None:
+        ordered = list(checkpoint_tracks)
+        pending_receipts = [
+            receipt for receipt in receipts if receipt["job_id"] not in processed
+        ]
+        for receipt in pending_receipts:
+            key = receipt_track_key(receipt)
+            if key in ordered:
+                ordered.remove(key)
+            ordered.append(key)
+            processed.add(receipt["job_id"])
+        if not set(current_recent).issubset(ordered):
+            raise QueueValidationError(
+                "shared VK track history diverges from publication receipts"
+            )
+        if ordered == current_recent and not pending_receipts:
+            return
+    else:
+        # First migration and v2/timestamp checkpoint upgrades recover every
+        # receipt-backed member, then preserve the existing history as newest.
+        receipt_order: list[str] = []
+        for receipt in receipts:
+            key = receipt_track_key(receipt)
+            if key in receipt_order:
+                receipt_order.remove(key)
+            receipt_order.append(key)
+            processed.add(receipt["job_id"])
+        current_keys = set(current_recent)
+        ordered = [key for key in receipt_order if key not in current_keys]
+        ordered.extend(current_recent)
+
+    if ordered != current_recent:
         payload = {"tracks": [{"key": item} for item in ordered]}
         temp = queue_root / f".{TRACK_HISTORY_FILENAME}.backfill-{uuid.uuid4().hex}"
         temp.write_text(
@@ -198,8 +316,17 @@ def _backfill_full_track_history(queue_root: Path, allowed_group_id: str) -> Non
         )
         os.chmod(temp, 0o644)
         os.replace(temp, queue_root / TRACK_HISTORY_FILENAME)
+    checkpoint_payload = {
+        "schema": TRACK_HISTORY_CHECKPOINT_SCHEMA,
+        "receipt_job_ids": sorted(processed),
+        "track_keys": ordered,
+        "updated_at": _utc_now(),
+    }
     temp_marker = queue_root / f".{TRACK_HISTORY_BACKFILL_MARKER}.tmp-{uuid.uuid4().hex}"
-    temp_marker.write_text(_utc_now() + "\n", encoding="utf-8")
+    temp_marker.write_text(
+        json.dumps(checkpoint_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     os.chmod(temp_marker, 0o640)
     os.replace(temp_marker, marker)
 
@@ -529,6 +656,7 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
             publish(job, [processing / name for name in job["media"]])
             _record_publication_receipt(queue_root, job)
             _record_published_track(queue_root, job)
+            _backfill_full_track_history(queue_root, allowed_group_id)
             if retry_file.exists() and not retry_file.is_symlink():
                 retry_file.unlink()
             os.replace(processing, queue_root / "done" / source.name)

@@ -15,6 +15,7 @@ from vk_publish_queue import (
     QueueValidationError,
     RetryablePublishError,
     TRACK_HISTORY_BACKFILL_MARKER,
+    TRACK_HISTORY_CHECKPOINT_SCHEMA,
     _backfill_full_track_history,
     build_job,
     canonical_job_id,
@@ -139,7 +140,7 @@ class VkPublishQueueTests(unittest.TestCase):
 
         self.assertEqual(consume_once(self.root, self.group, Mock()), 0)
         history = recent_track_keys(self.root, limit=None)
-        self.assertEqual(history[: len(existing)], existing)
+        self.assertEqual(history[-len(existing) :], existing)
         self.assertEqual(set(history), set(expected))
         self.assertEqual(len(history), len(expected))
         self.assertEqual(len(publication_receipts(self.root)), 12)
@@ -208,6 +209,30 @@ class VkPublishQueueTests(unittest.TestCase):
         )
         self.assertTrue((self.root / TRACK_HISTORY_BACKFILL_MARKER).is_file())
 
+    def test_backfill_never_reorders_authoritative_legacy_recent_suffix(self):
+        recent = [f"recent track {index}" for index in range(8)]
+        (self.root / "done").mkdir()
+        for position, index in enumerate(reversed(range(8))):
+            job = self.job(
+                dedupe_key=f"recent-suffix-{index}",
+                track_query=f"Recent Track {index}",
+                source_ref=f"void:draft:recent-{index}",
+            )
+            directory = self.enqueue(job)
+            os.replace(directory, self.root / "done" / directory.name)
+            self.write_receipt(
+                job,
+                published_at=f"2026-07-30T12:{position:02d}:00Z",
+            )
+        (self.root / "recent-tracks.json").write_text(
+            json.dumps({"tracks": [{"key": key} for key in recent]}),
+            encoding="utf-8",
+        )
+
+        _backfill_full_track_history(self.root, self.group)
+
+        self.assertEqual(recent_track_keys(self.root, limit=None), recent)
+
     def test_unresolved_receipt_does_not_write_track_state_or_marker(self):
         existing_payload = {"tracks": [{"key": "existing track"}]}
         history_path = self.root / "recent-tracks.json"
@@ -228,6 +253,107 @@ class VkPublishQueueTests(unittest.TestCase):
 
         self.assertEqual(history_path.read_bytes(), original)
         self.assertFalse((self.root / TRACK_HISTORY_BACKFILL_MARKER).exists())
+
+    def test_invalid_track_history_marker_fails_before_state_write(self):
+        history_path = self.root / "recent-tracks.json"
+        history_path.write_text(
+            json.dumps({"tracks": [{"key": "existing track"}]}),
+            encoding="utf-8",
+        )
+        marker = self.root / TRACK_HISTORY_BACKFILL_MARKER
+        marker.mkdir()
+        original = history_path.read_bytes()
+
+        with self.assertRaisesRegex(QueueValidationError, "marker is invalid"):
+            _backfill_full_track_history(self.root, self.group)
+
+        self.assertEqual(history_path.read_bytes(), original)
+
+    def test_checkpoint_repairs_receipt_written_before_history_crash(self):
+        _backfill_full_track_history(self.root, self.group)
+        job = self.job(
+            dedupe_key="receipt-before-history-crash",
+            track_query="Recovered Published Track",
+            source_ref="void:draft:receipt-before-history-crash",
+        )
+        directory = self.enqueue(job)
+        failed = self.root / "failed"
+        failed.mkdir()
+        os.replace(directory, failed / directory.name)
+        self.write_receipt(job)
+
+        _backfill_full_track_history(self.root, self.group)
+
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["recovered published track"],
+        )
+        checkpoint = json.loads(
+            (self.root / TRACK_HISTORY_BACKFILL_MARKER).read_text(encoding="utf-8")
+        )
+        self.assertEqual(checkpoint["schema"], TRACK_HISTORY_CHECKPOINT_SCHEMA)
+        self.assertIn(job["job_id"], checkpoint["receipt_job_ids"])
+        self.assertEqual(checkpoint["track_keys"], ["recovered published track"])
+
+    def test_checkpoint_restores_full_lru_after_legacy_consumer_truncation(self):
+        done = self.root / "done"
+        done.mkdir()
+        jobs = []
+        for index in range(13):
+            job = self.job(
+                producer="naz" if index % 2 == 0 else "void",
+                dedupe_key=f"rollback-history-{index}",
+                track_query=f"Rollback Track {index}",
+                source_ref=f"void:draft:rollback-{index}",
+            )
+            directory = self.enqueue(job)
+            os.replace(directory, done / directory.name)
+            jobs.append(job)
+
+        for index, job in enumerate(jobs[:12]):
+            self.write_receipt(
+                job,
+                published_at=f"2026-07-30T12:{index:02d}:00Z",
+            )
+        _backfill_full_track_history(self.root, self.group)
+        expected_before = [f"rollback track {index}" for index in range(12)]
+        self.assertEqual(recent_track_keys(self.root, limit=None), expected_before)
+
+        # The pre-full-history consumer retained only its last-eight view.
+        self.write_receipt(jobs[12], published_at="2026-07-30T12:12:00Z")
+        legacy_view = [*expected_before[-7:], "rollback track 12"]
+        (self.root / "recent-tracks.json").write_text(
+            json.dumps({"tracks": [{"key": key} for key in legacy_view]}),
+            encoding="utf-8",
+        )
+
+        _backfill_full_track_history(self.root, self.group)
+
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            [f"rollback track {index}" for index in range(13)],
+        )
+
+    def test_checkpoint_restores_missing_history_without_new_receipts(self):
+        done = self.root / "done"
+        done.mkdir()
+        job = self.job(
+            dedupe_key="missing-history-restore",
+            track_query="Durable History Track",
+            source_ref="void:draft:missing-history-restore",
+        )
+        directory = self.enqueue(job)
+        os.replace(directory, done / directory.name)
+        self.write_receipt(job)
+        _backfill_full_track_history(self.root, self.group)
+        (self.root / "recent-tracks.json").unlink()
+
+        _backfill_full_track_history(self.root, self.group)
+
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["durable history track"],
+        )
 
     def test_missing_vk_track_stays_pending_for_safe_retry(self):
         directory = self.enqueue(
