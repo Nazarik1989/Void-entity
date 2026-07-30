@@ -14,7 +14,7 @@ from typing import Any
 from dotenv import load_dotenv
 
 import main
-from vk_publish_queue import RetryablePublishError, build_job, consume_once, enqueue_job, recent_track_keys
+from vk_publish_queue import RetryablePublishError, build_job, enqueue_job, recent_track_keys
 
 
 load_dotenv()
@@ -45,13 +45,16 @@ def _track_score(row_text: str, payload: dict[str, Any]) -> int:
     artist = str(track.get("artist") or "").strip().lower()
     title = str(track.get("title") or "").strip()
     row = row_text.lower()
+    row_tokens = _tokens(row_text)
+    query_tokens = _tokens(str(payload.get("track_query") or ""))
+    if query_tokens and not query_tokens <= row_tokens:
+        return -1
     score = 0
     if artist and artist in row:
         score += 100
     title_tokens = _tokens(title)
     if not title_tokens:
         title_tokens = _tokens(str(payload.get("track_query") or ""))
-    row_tokens = _tokens(row_text)
     score += 10 * len(title_tokens & row_tokens)
     for hint in ("mercury", "beats", "remix", "zavtra"):
         if hint in title.lower() and hint in row:
@@ -336,119 +339,41 @@ def enqueue_draft(draft_id: int, *, producer: str = "void") -> Path:
 
 
 def publish_queue_job(job: dict[str, Any], media: list[Path]) -> None:
-    allowed_url = f"https://vk.com/club{main.VK_GROUP_ID}"
-    if VK_COMMUNITY_URL.rstrip("/") != allowed_url.rstrip("/"):
-        raise RuntimeError("VK_COMMUNITY_URL does not match the allowed community")
-    payload = {"draft_id": job["job_id"], "community_url": allowed_url, "text": job["text"], "image_path": str(media[0]) if media else "", "track": {}, "track_query": job["track_query"]}
-    temp_payload = media[0].parent / ".publisher-payload.json" if media else VK_PUBLISH_QUEUE_DIR / "processing" / job["job_id"] / ".publisher-payload.json"
-    temp_payload.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    open_payload(str(temp_payload), publish=True, mark_draft=False)
+    del job, media
+    raise RuntimeError(
+        "legacy browser queue callback is disabled; use vk_queue_consumer.py"
+    )
 
 
 def consume_queue() -> int:
-    if VK_PUBLISH_KILL_SWITCH.exists():
-        print("VK publisher disabled by kill switch")
-        return 75
-    return consume_once(VK_PUBLISH_QUEUE_DIR, str(main.VK_GROUP_ID), publish_queue_job)
+    raise RuntimeError(
+        "legacy browser consumer is disabled; use vk_queue_consumer.py consume-queue"
+    )
 
 
 def open_payload(payload_path: str, *, publish: bool = False, mark_draft: bool = True) -> None:
-    sync_playwright = ensure_playwright()
-    payload = json.loads(Path(payload_path).read_text(encoding="utf-8"))
-
-    with sync_playwright() as playwright:
-        browser, context = launch_publish_context(playwright)
-        page = context.new_page()
-        page.goto(payload.get("community_url") or VK_COMMUNITY_URL, wait_until="domcontentloaded")
-        page.wait_for_timeout(2500)
-
-        try:
-            open_create_menu(page)
-            click_first_text(page, POST_TEXTS)
-            page.wait_for_timeout(1200)
-
-            image_path = payload.get("image_path")
-            if image_path:
-                page.locator("input[type=file]").last.set_input_files(image_path)
-                page.wait_for_timeout(4000)
-
-            find_post_input(page).fill(payload["text"])
-            page.wait_for_timeout(700)
-            click_first_text(page, (NEXT_TEXT,))
-            page.wait_for_timeout(2500)
-        except Exception as exc:
-            screenshot = save_debug_screenshot(page, payload["draft_id"])
-            raise RuntimeError(f"VK composer setup failed; screenshot: {screenshot}") from exc
-
-        selected_track = ""
-        track_query = str(payload.get("track_query") or "").strip()
-        if not track_query:
-            raise RetryablePublishError("VK track query is missing")
-        page.mouse.click(525, 536)
-        page.wait_for_timeout(1500)
-        page.locator('[data-testid="posting_audio_search_audio_input"]').fill(track_query)
-        page.wait_for_timeout(5000)
-        rows = page.locator('[data-testid="posting_audio_audio_track_row"]')
-        row_texts = [rows.nth(i).inner_text(timeout=2000) for i in range(min(rows.count(), 30))]
-        best_index = -1
-        best_score = 0
-        for index, row_text in enumerate(row_texts):
-            score = _track_score(row_text, payload)
-            if score > best_score:
-                best_score = score
-                best_index = index
-        if best_index < 0 or best_score <= 0:
-            raise RetryablePublishError("no matching VK audio result; retry later")
-        selected_track = row_texts[best_index].replace("\n", " - ")
-        rows.nth(best_index).click(timeout=10000)
-        page.wait_for_timeout(800)
-        page.get_by_text(DONE_TEXT, exact=True).last.click(timeout=10000)
-        page.wait_for_timeout(1500)
-
-        print("Prepared VK post in the browser.")
-        print(f"Draft: #{payload['draft_id']}")
-        print(f"Image: {payload.get('image_path') or 'none'}")
-        print(f"Track query: {payload.get('track_query') or 'none'}")
-        print(f"Selected track: {selected_track or 'none'}")
-        if publish:
-            page.get_by_text(PUBLISH_TEXT, exact=True).last.click(timeout=15000)
-            page.wait_for_timeout(6000)
-            if mark_draft:
-                main.mark_vk_published(
-                    int(payload["draft_id"]),
-                    0,
-                    main.vk_owner_id_from_group_id(main.VK_GROUP_ID),
-                    attachments=["browser"],
-                    music_track=payload.get("track") or {},
-                )
-                try:
-                    mark_vps_browser_published(int(payload["draft_id"]), payload.get("track") or {})
-                except Exception as exc:
-                    print(f"Remote VK duplicate marker failed: {type(exc).__name__}: {exc}")
-            print("Published VK post from the browser.")
-        else:
-            print(f"Review the visible VK composer and click '{PUBLISH_TEXT}' manually if everything is OK.")
-            print("Press Enter here after you finish or close the composer.")
-            input()
-        save_publish_session(context)
-        context.close()
-        if browser:
-            browser.close()
+    del payload_path, publish, mark_draft
+    raise RuntimeError(
+        "prepared VK composer previews are disabled; use the canonical VK queue consumer"
+    )
 
 
 def publish_draft(draft_id: int, *, sync_db: bool = True) -> None:
+    if VK_VPS_DB_SCP:
+        raise RuntimeError(
+            "direct remote VK publishing is retired; enqueue on the VPS instead"
+        )
     if sync_db:
         sync_db_from_vps()
-    payload = build_browser_payload(draft_id)
-    payload_path = VK_BROWSER_PAYLOAD_DIR / f"draft-{draft_id}.json"
-    open_payload(str(payload_path), publish=True)
+    path = enqueue_draft(draft_id)
+    print(f"Queued VK draft #{draft_id}: {path}")
 
 
 def publish_scheduled() -> None:
     if VK_VPS_DB_SCP:
-        draft_id = make_remote_scheduled_draft()
-        publish_draft(draft_id, sync_db=True)
-        return
+        raise RuntimeError(
+            "legacy remote publish-scheduled is disabled; use the VPS producer timer"
+        )
     draft_id = make_local_scheduled_draft()
     path = enqueue_draft(draft_id)
     print(f"Queued VK draft #{draft_id}: {path}")
@@ -466,15 +391,17 @@ def main_cli() -> None:
     prepare = sub.add_parser("prepare-draft", help="Generate browser-publish payload for a draft")
     prepare.add_argument("draft_id", type=int)
 
-    open_cmd = sub.add_parser("open-payload", help="Open VK community with a prepared payload")
+    open_cmd = sub.add_parser(
+        "open-payload",
+        help="Retired: prepared composer previews are disabled",
+    )
     open_cmd.add_argument("payload_path")
-    open_cmd.add_argument("--publish", action="store_true", help="Click the final VK publish button automatically")
 
-    publish_cmd = sub.add_parser("publish-draft", help="Prepare and publish a draft through the logged-in VK browser")
+    publish_cmd = sub.add_parser("publish-draft", help="Prepare and enqueue a draft for the canonical VK consumer")
     publish_cmd.add_argument("draft_id", type=int)
     publish_cmd.add_argument("--no-sync", action="store_true", help="Do not scp void.db from the VPS before preparing")
 
-    sub.add_parser("publish-scheduled", help="Ask the VPS for the current scheduled rubric draft and publish it to VK")
+    sub.add_parser("publish-scheduled", help="Create and enqueue a local scheduled VK draft")
     sub.add_parser("consume-queue", help="Safely consume one validated VK publish job")
 
     args = parser.parse_args()
@@ -488,7 +415,7 @@ def main_cli() -> None:
         payload = build_browser_payload(args.draft_id)
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     elif args.command == "open-payload":
-        open_payload(args.payload_path, publish=args.publish)
+        open_payload(args.payload_path)
     elif args.command == "publish-draft":
         publish_draft(args.draft_id, sync_db=not args.no_sync)
     elif args.command == "publish-scheduled":

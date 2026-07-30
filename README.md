@@ -146,11 +146,10 @@ The manual browser helper is retained for diagnosis:
 python -m playwright install chromium
 python vk_browser_publisher.py login
 python vk_browser_publisher.py prepare-draft 259
-python vk_browser_publisher.py open-payload data/vk_browser_payloads/draft-259.json
 python vk_browser_publisher.py publish-draft 259
 ```
 
-Manual VK and music commands are documented by `/vk_commands`. Keep dry-run enabled while checking any API-based diagnostic path.
+Manual VK and music commands are documented by `/vk_commands`. `publish-draft` and `/publish_vk --yes` enqueue work for the canonical consumer; prepared-composer previews and direct browser/API publication are disabled so they cannot bypass track history. Keep dry-run enabled while checking any API-based diagnostic path.
 
 ## Isolated VPS VK pipeline
 
@@ -170,10 +169,16 @@ Canonical paths:
 
 ```text
 VK_PUBLISH_QUEUE_DIR=/var/lib/void-vk-publisher/queue
+VK_TRACK_ROTATION_SIZE=149
+VK_MUSIC_TRACKS_FILE=data/vk_music_tracks.json
 VK_BROWSER_PROFILE_DIR=/var/lib/void-vk-publisher/profile
 ```
 
 Each `vk_publish_job.v1` job is an atomically renamed directory. Producers can write only `pending`; only `publisher` can read the browser profile and move jobs through `processing`, `done`, and `failed`. Global deduplication is enforced by the consumer across all states. Failed jobs may be retried only through the administrative `requeue-failed` command.
+
+VK music uses one shared publication history with producer-aware rotation rules. Every VOID job must name a track from the current 149-entry allowlist, and that track cannot return until the other 148 VOID catalog tracks have been published. Naz keeps its independent rotation policy, so its smaller catalog cannot stall the VOID consumer. Editorial vibe scoring only orders tracks that have not played in the current VOID pass; it cannot remove a track from the rotation.
+
+The browser consumer confirms that the requested audio was attached and then requires a newly visible wall post containing both the expected text and that audio before a publication receipt can advance the rotation. It writes an atomic unresolved-attempt marker immediately before clicking Publish. If the browser outcome or the hand-off to the receipt is ambiguous, later consumer runs stop with exit code `75` until an operator reconciles that exact job, preventing a possible post from being followed by an untracked repeat.
 
 `void-vk-producer.timer` generates scheduled VOID content and enqueues it without opening a browser. `void-vk-autopost.timer` runs only `vk_queue_consumer.py`, which does not import `main.py`, Telegram, or LLM code. It opens exactly the configured allowlisted VK community, creates a post, attaches local media, selects the requested track, and exits with a meaningful status.
 

@@ -1739,8 +1739,7 @@ def vk_commands_text() -> str:
         "VK commands\n\n"
         "Publisher:\n"
         "/vk_status - VK env and mode status\n"
-        "/vk_test text - dry-run raw VK text post\n"
-        "/vk_test --yes text - publish raw VK test post\n"
+        "/vk_test text - preview raw VK text locally\n"
         "/publish_vk ID - dry-run draft VK post\n"
         "/publish_vk --yes ID - publish draft to VK\n\n"
         "Rubric schedule:\n"
@@ -4047,9 +4046,7 @@ def choose_vk_music_track(
     )
     used = set(history)
     candidates = [
-        track
-        for track in tracks
-        if vk_music_track_query_key(track) not in used
+        track for track in tracks if vk_music_track_query_key(track) not in used
     ]
     if not candidates:
         positions = {key: index for index, key in enumerate(history)}
@@ -4154,6 +4151,14 @@ def post_to_vk_wall(text: str, *, force: bool = False, attachments: list[str] | 
     if not text.strip():
         raise RuntimeError("VK post text is empty")
 
+    # This helper is retained only for a local, redacted API payload preview.
+    # A real wall.post would bypass the canonical queue, its publication
+    # receipt, and the full-catalog music rotation.
+    if force or not VK_DRY_RUN:
+        raise RuntimeError(
+            "direct VK API publication is disabled; use the canonical VK queue"
+        )
+
     owner_id = vk_owner_id_from_group_id(VK_GROUP_ID)
     params = {
         "owner_id": str(owner_id),
@@ -4165,26 +4170,12 @@ def post_to_vk_wall(text: str, *, force: bool = False, attachments: list[str] | 
     if attachments:
         params["attachments"] = ",".join(attachments)
 
-    if VK_DRY_RUN and not force:
-        safe = {**params, "access_token": "***"}
-        return {"ok": True, "dry_run": True, "post_id": None, "response": {"dry_run": safe}}
-
-    if not VK_USER_ACCESS_TOKEN:
-        raise RuntimeError("VK_USER_ACCESS_TOKEN is empty")
-
-    data = urlencode(params).encode("utf-8")
-    request = Request("https://api.vk.com/method/wall.post", data=data, method="POST")
-    with urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-
-    if "error" in payload:
-        raise RuntimeError(format_vk_error(payload["error"]))
-
+    safe = {**params, "access_token": "***"}
     return {
         "ok": True,
-        "dry_run": False,
-        "post_id": payload.get("response", {}).get("post_id"),
-        "response": payload,
+        "dry_run": True,
+        "post_id": None,
+        "response": {"dry_run": safe},
     }
 
 
@@ -4367,41 +4358,28 @@ async def publish_draft_to_vk(draft_id: int, *, force: bool = False) -> str:
     if not ok:
         return f"VK publish blocked: {reason}. Check /preview {draft_id} first."
 
+    if force:
+        try:
+            # All real VK publications must pass through the canonical queue,
+            # where the shared full-catalog rotation is enforced immediately
+            # before the browser opens the composer.
+            import void_vk_producer
+
+            path = await asyncio.to_thread(void_vk_producer.enqueue_draft, draft_id)
+        except Exception as e:
+            return f"VK queue failed: {type(e).__name__}: {e}"
+        return f"VK queued: draft #{draft_id}. job={path.name}."
+
     track = await asyncio.to_thread(choose_vk_music_track, draft)
     if not track:
         return "VK publish blocked: no suitable fresh music track is available."
-    post_text = f"{draft['post']}{format_vk_music_track(track)}"
-    attachments: list[str] = []
-    image_error = ""
-
-    if force:
-        try:
-            image_attachment = await asyncio.to_thread(build_vk_image_attachment_sync, draft)
-            attachments.append(image_attachment)
-        except Exception as e:
-            image_error = f" image=failed:{type(e).__name__}:{e}"
-
-    try:
-        result = await asyncio.to_thread(post_to_vk_wall, post_text, force=force, attachments=attachments)
-    except Exception as e:
-        return f"VK publish failed: {type(e).__name__}: {e}"
-
-    status = "dry-run" if result.get("dry_run") else "published"
-    post_id = result.get("post_id")
-    if result.get("dry_run"):
-        track_note = " track=yes" if track else " track=none"
-        return f"VK {status}: draft #{draft_id}. post_id={post_id}.{track_note} image=skipped. To publish for real: /publish_vk --yes {draft_id}"
-
-    mark_vk_published(
-        draft_id,
-        int(post_id or 0),
-        vk_owner_id_from_group_id(VK_GROUP_ID),
-        attachments=attachments,
-        music_track=track,
+    artist = str(track.get("artist") or "").strip()
+    title = str(track.get("title") or "").strip()
+    label = f"{artist} - {title}" if artist else title
+    return (
+        f"VK dry-run: draft #{draft_id}. track={label}. "
+        f"To queue for real: /publish_vk --yes {draft_id}"
     )
-    image_note = " image=yes" if attachments else image_error or " image=none"
-    track_note = " track=yes" if track else " track=none"
-    return f"VK {status}: draft #{draft_id}. post_id={post_id}.{image_note}{track_note}"
 
 
 async def make_news_drafts(limit: int = 5) -> tuple[int, int]:
@@ -5972,8 +5950,7 @@ async def vk_status_command(message: Message):
         f"VK_DRY_RUN: {VK_DRY_RUN}\n\n"
         "Проверка: /vk_test текст\n"
         "Тест черновика: /publish_vk ID\n"
-        "Реальная публикация: /publish_vk --yes ID\n"
-        "Реальная тест-публикация: /vk_test --yes текст"
+        "Реальная публикация только через очередь: /publish_vk --yes ID"
     )
 
 
@@ -5985,24 +5962,22 @@ async def vk_test_command(message: Message):
 
     payload = (message.text or "").split(maxsplit=1)
     text = payload[1].strip() if len(payload) > 1 else ""
-    force = False
-    if text.startswith("--yes "):
-        force = True
-        text = text.removeprefix("--yes ").strip()
+    force = text == "--yes" or text.startswith("--yes ")
+    if force:
+        text = text.removeprefix("--yes").strip()
+
+    if force:
+        await message.answer(
+            "Direct /vk_test publishing is disabled. "
+            "Create a draft and use /publish_vk --yes ID so publication goes through the VK queue."
+        )
+        return
 
     if len(text) < 3:
-        await message.answer("Используй: /vk_test текст\nРеально опубликовать: /vk_test --yes текст")
+        await message.answer("Use: /vk_test text")
         return
 
-    try:
-        result = await asyncio.to_thread(post_to_vk_wall, text, force=force)
-    except Exception as e:
-        await message.answer(f"VK publish failed: {type(e).__name__}: {e}")
-        return
-
-    status = "dry-run" if result.get("dry_run") else "published"
-    post_id = result.get("post_id")
-    await message.answer(f"VK {status}. post_id={post_id}")
+    await message.answer(f"VK local preview (not published):\n\n{text}")
 
 
 @router.message(Command("cross_status"))

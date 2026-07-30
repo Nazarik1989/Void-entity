@@ -101,7 +101,7 @@ Voice examples:
 
 > Свет нужен не для того, чтобы показать всё. Иногда достаточно понять, куда смотреть.
 
-Music comes only from the current allowlist. The shared Naz/VOID history keeps a full ordered LRU: every track in the persona's current eligible catalog is used before the least-recently-used track may return. The last eight published tracks are excluded while a compatible alternative exists; on true exhaustion only this diversity guard relaxes and the least-recently-used compatible track is selected, so the slot is not skipped. Catalog additions enter the current cycle automatically. MATERIAL is added to the content canon without changing any existing Telegram or VK schedule.
+Music comes only from the current allowlist. The shared publication history keeps a receipt-backed, producer-aware LRU: all 149 VOID tracks are used before the least-recently-used VOID track may return, while Naz retains its independent smaller-catalog policy. Vibe matching only orders tracks that have not yet played; it never removes them from the VOID cycle. The consumer rejects an early repeat even when parallel producers queued stale choices. Catalog additions enter the current cycle automatically. MATERIAL is added to the content canon without changing any existing Telegram or VK schedule.
 
 ## Duo compositions
 

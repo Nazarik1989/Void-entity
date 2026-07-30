@@ -494,6 +494,7 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertEqual(MATERIAL_RUBRIC["music_source"], "current allowlist only")
         self.assertEqual(MATERIAL_RUBRIC["shared_recent_track_limit"], 8)
         self.assertEqual(MATERIAL_RUBRIC["track_rotation"], "full_catalog_lru")
+        self.assertEqual(MATERIAL_RUBRIC["shared_track_rotation"], "full_catalog_lru")
 
     def test_vk_producer_accepts_four_material_frames_and_shared_history(self) -> None:
         draft = {
@@ -553,7 +554,7 @@ class AutopostingRubricTests(unittest.TestCase):
 
         self.assertIs(selected, tracks[0])
 
-    def test_vk_music_lru_never_reuses_shared_last_eight(self) -> None:
+    def test_vk_music_lru_returns_the_oldest_track_after_a_full_cycle(self) -> None:
         tracks = [
             {
                 "artist": f"Artist {index}",
@@ -588,15 +589,56 @@ class AutopostingRubricTests(unittest.TestCase):
             shared_history[-main.VK_SHARED_TRACK_COLLISION_LIMIT :],
         )
 
-    def test_vk_music_full_149_track_catalog_has_no_early_repeat(self) -> None:
+    def test_shared_receipt_history_overrides_older_local_recency(self) -> None:
         tracks = [
             {
                 "artist": f"Artist {index}",
-                "title": f"Future Track {index}",
+                "title": f"Future {index}",
                 "tags": ["future"],
             }
-            for index in range(149)
+            for index in range(10)
         ]
+        draft = {
+            "id": 102,
+            "mode": "future",
+            "title": "Future signal",
+            "frequency": "AI",
+            "post": "future systems",
+        }
+        shared_history = [
+            "artist 1 future 1",
+            "artist 2 future 2",
+            "artist 3 future 3",
+            "artist 4 future 4",
+            "artist 5 future 5",
+            "artist 6 future 6",
+            "artist 7 future 7",
+            "artist 8 future 8",
+            "artist 9 future 9",
+            "artist 0 future 0",
+        ]
+
+        with (
+            patch("main.load_vk_music_tracks", return_value=tracks),
+            patch(
+                "main.recent_vk_music_track_keys",
+                return_value=["artist 1 future 1"],
+            ),
+        ):
+            selected = choose_vk_music_track(
+                draft,
+                excluded_track_keys=shared_history,
+            )
+
+        self.assertEqual(main.vk_music_track_query_key(selected), shared_history[0])
+
+    def test_vk_music_full_149_track_catalog_has_no_early_repeat(self) -> None:
+        tracks = json.loads(
+            Path("data/vk_music_tracks.json").read_text(encoding="utf-8")
+        )["tracks"]
+        catalog_keys = {main.vk_music_track_query_key(track) for track in tracks}
+        self.assertEqual(len(tracks), 149)
+        self.assertEqual(len(catalog_keys), 149)
         draft = {
             "id": 149,
             "mode": "future",
@@ -624,6 +666,7 @@ class AutopostingRubricTests(unittest.TestCase):
             main.vk_music_track_query_key(selected_after_cycle),
             history[0],
         )
+        self.assertEqual(set(history), catalog_keys)
 
     def test_new_catalog_track_enters_current_cycle_before_reuse(self) -> None:
         tracks = [
@@ -749,6 +792,78 @@ class AutopostingRubricTests(unittest.TestCase):
             "OnCalendar=Fri,Sat *-*-* 23:30:00 Europe/Moscow", timer
         )
         self.assertNotIn("00,03,06,09,12,15,18,21", timer)
+
+
+class VkPublishingRoutingTests(unittest.IsolatedAsyncioTestCase):
+    def test_low_level_vk_api_helper_cannot_publish(self) -> None:
+        with (
+            patch("main.VK_DRY_RUN", False),
+            patch("main.urlopen") as request,
+            self.assertRaisesRegex(RuntimeError, "canonical VK queue"),
+        ):
+            main.post_to_vk_wall("raw post")
+
+        request.assert_not_called()
+
+    async def test_forced_vk_test_is_rejected_without_direct_api_call(self) -> None:
+        message = AsyncMock()
+        message.text = "/vk_test --yes raw test post"
+        with (
+            patch("main.is_admin", return_value=True),
+            patch("main.post_to_vk_wall") as direct_publish,
+        ):
+            await main.vk_test_command(message)
+
+        direct_publish.assert_not_called()
+        response = message.answer.await_args.args[0]
+        self.assertIn("Direct /vk_test publishing is disabled", response)
+        self.assertIn("/publish_vk --yes ID", response)
+
+    async def test_vk_test_preview_never_calls_the_direct_api(self) -> None:
+        message = AsyncMock()
+        message.text = "/vk_test raw test post"
+        with (
+            patch("main.is_admin", return_value=True),
+            patch("main.post_to_vk_wall") as direct_publish,
+        ):
+            await main.vk_test_command(message)
+
+        direct_publish.assert_not_called()
+        message.answer.assert_awaited_once_with(
+            "VK local preview (not published):\n\nraw test post"
+        )
+
+    async def test_forced_vk_publish_uses_the_canonical_queue(self) -> None:
+        draft = {"id": 777, "post": "publishable VK post"}
+        queued = Path("pending") / "void-job"
+        with (
+            patch("main.get_draft", return_value=draft),
+            patch("main.get_vk_post_for_draft", return_value=None),
+            patch("main.quality_check", return_value=(True, "ok")),
+            patch("void_vk_producer.enqueue_draft", return_value=queued) as enqueue,
+            patch("main.post_to_vk_wall") as direct_publish,
+        ):
+            result = await main.publish_draft_to_vk(777, force=True)
+
+        self.assertEqual(result, "VK queued: draft #777. job=void-job.")
+        enqueue.assert_called_once_with(777)
+        direct_publish.assert_not_called()
+
+    async def test_vk_preview_never_calls_the_direct_publish_api(self) -> None:
+        draft = {"id": 778, "post": "publishable VK post"}
+        track = {"artist": "Artist", "title": "Track"}
+        with (
+            patch("main.get_draft", return_value=draft),
+            patch("main.get_vk_post_for_draft", return_value=None),
+            patch("main.quality_check", return_value=(True, "ok")),
+            patch("main.choose_vk_music_track", return_value=track),
+            patch("main.post_to_vk_wall") as direct_publish,
+        ):
+            result = await main.publish_draft_to_vk(778)
+
+        self.assertIn("VK dry-run", result)
+        self.assertIn("Artist - Track", result)
+        direct_publish.assert_not_called()
 
 
 class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):

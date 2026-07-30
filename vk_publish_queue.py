@@ -25,6 +25,12 @@ MAX_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_TRACK_QUERY_LENGTH = 300
 MAX_DEDUPE_KEY_LENGTH = 256
 RECENT_TRACK_LIMIT = 8
+TRACK_ROTATION_SIZE = int(os.getenv("VK_TRACK_ROTATION_SIZE", "149") or "149")
+if TRACK_ROTATION_SIZE <= 0:
+    raise ValueError("VK_TRACK_ROTATION_SIZE must be positive")
+VK_MUSIC_TRACKS_FILE = Path(
+    os.getenv("VK_MUSIC_TRACKS_FILE", "data/vk_music_tracks.json")
+)
 TRACK_HISTORY_FILENAME = "recent-tracks.json"
 TRACK_HISTORY_BACKFILL_MARKER = ".track-history-v2-complete"
 LEGACY_RECEIPT_HISTORY_SCHEMA = "vk_publish_job.v2"
@@ -60,6 +66,29 @@ def normalize_track_query(value: str) -> str:
     return " ".join(re.findall(r"[0-9a-zа-яё]+", str(value).casefold()))
 
 
+def _void_track_catalog_keys() -> frozenset[str]:
+    try:
+        payload = json.loads(VK_MUSIC_TRACKS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QueueValidationError("VOID VK track catalog is unavailable") from exc
+    tracks = payload.get("tracks", payload) if isinstance(payload, dict) else payload
+    if not isinstance(tracks, list):
+        raise QueueValidationError("VOID VK track catalog is invalid")
+    keys = frozenset(
+        key
+        for track in tracks
+        if isinstance(track, dict)
+        if (key := normalize_track_query(
+            f"{track.get('artist', '')} {track.get('title', '')}"
+        ))
+    )
+    if len(keys) != TRACK_ROTATION_SIZE:
+        raise QueueValidationError(
+            "VOID VK track catalog size does not match VK_TRACK_ROTATION_SIZE"
+        )
+    return keys
+
+
 def recent_track_keys(
     queue_root: Path,
     limit: int | None = RECENT_TRACK_LIMIT,
@@ -72,6 +101,8 @@ def recent_track_keys(
     if limit is not None and limit <= 0:
         return []
     path = Path(queue_root) / TRACK_HISTORY_FILENAME
+    if path.is_symlink():
+        raise QueueValidationError("shared VK track history is unavailable")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -111,6 +142,18 @@ def _record_published_track(queue_root: Path, job: dict[str, Any]) -> None:
     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(temp, 0o644)
     os.replace(temp, path)
+
+
+def _sync_directory(path: Path) -> None:
+    """Make a completed atomic rename durable before dependent state advances."""
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validated_receipt_history_job(
@@ -336,7 +379,8 @@ def _publication_receipt_path(queue_root: Path, job_id: str) -> Path:
 
 
 def _record_publication_receipt(queue_root: Path, job: dict[str, Any]) -> None:
-    receipts = Path(queue_root) / PUBLICATION_RECEIPTS_DIRNAME
+    queue_root = Path(queue_root)
+    receipts = queue_root / PUBLICATION_RECEIPTS_DIRNAME
     receipts.mkdir(mode=0o770, parents=True, exist_ok=True)
     receipt = {
         "schema": PUBLICATION_RECEIPT_SCHEMA,
@@ -347,12 +391,21 @@ def _record_publication_receipt(queue_root: Path, job: dict[str, Any]) -> None:
     }
     final = _publication_receipt_path(queue_root, job["job_id"])
     temp = receipts / f".{job['job_id']}.tmp-{uuid.uuid4().hex}"
-    temp.write_text(
-        json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.chmod(temp, 0o640)
-    os.replace(temp, final)
+    try:
+        with temp.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(receipt, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o640)
+        os.replace(temp, final)
+        _sync_directory(receipts)
+        # ``receipts`` may have been created in this call, so persist its
+        # directory entry as well as the receipt entry inside it.
+        _sync_directory(queue_root)
+    finally:
+        if temp.exists() and not temp.is_symlink():
+            temp.unlink()
 
 
 def publication_receipts(
@@ -428,10 +481,31 @@ def _backfill_publication_receipts(
     os.replace(temp, marker)
 
 
-def _ensure_track_is_fresh(queue_root: Path, track_query: str) -> None:
+def _ensure_track_is_fresh(
+    queue_root: Path,
+    track_query: str,
+    producer: str,
+) -> None:
     key = normalize_track_query(track_query)
-    if key in set(recent_track_keys(queue_root, RECENT_TRACK_LIMIT)):
-        raise DuplicateTrackError("track was used in the last 8 published VK posts")
+    history = recent_track_keys(queue_root, limit=None)
+    if producer == "void":
+        catalog_keys = _void_track_catalog_keys()
+        if key not in catalog_keys:
+            raise QueueValidationError(
+                "VOID track_query is not present in the current track catalog"
+            )
+        history = [item for item in history if item in catalog_keys]
+        cooldown_size = min(len(catalog_keys) - 1, len(history))
+        if cooldown_size and key in set(history[-cooldown_size:]):
+            raise DuplicateTrackError(
+                "VOID track cannot repeat until the other "
+                f"{len(catalog_keys) - 1} catalog tracks have been published"
+            )
+        return
+    if key in set(history[-RECENT_TRACK_LIMIT:]):
+        raise DuplicateTrackError(
+            "track was used in the last 8 published VK posts"
+        )
 
 
 def canonical_job_id(producer: str, dedupe_key: str) -> str:
@@ -569,7 +643,7 @@ def enqueue_job(queue_root: Path, job: dict[str, Any], media: dict[str, bytes]) 
     if set(media) != set(job["media"]):
         raise QueueValidationError("media payload does not match job.media")
     queue_root = Path(queue_root)
-    _ensure_track_is_fresh(queue_root, job["track_query"])
+    _ensure_track_is_fresh(queue_root, job["track_query"], job["producer"])
     pending = queue_root / "pending"
     pending.mkdir(parents=True, exist_ok=True)
     final = pending / job["job_id"]
@@ -652,7 +726,11 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
             if job["not_before"] and datetime.fromisoformat(job["not_before"].replace("Z", "+00:00")) > datetime.now(timezone.utc):
                 os.replace(processing, source)
                 continue
-            _ensure_track_is_fresh(queue_root, job["track_query"])
+            _ensure_track_is_fresh(
+                queue_root,
+                job["track_query"],
+                job["producer"],
+            )
             publish(job, [processing / name for name in job["media"]])
             _record_publication_receipt(queue_root, job)
             _record_published_track(queue_root, job)

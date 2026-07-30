@@ -135,6 +135,7 @@ MATERIAL_RUBRIC = {
     "music_source": "current allowlist only",
     "shared_recent_track_limit": 8,
     "track_rotation": "full_catalog_lru",
+    "shared_track_rotation": "full_catalog_lru",
     "scheduled": False,
 }
 
