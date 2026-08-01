@@ -524,7 +524,7 @@ class CommunityBotTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(ValueError, "not allowlisted"):
                 await client.send_wall_comment(-1, 83, 7, "reply", "guid")
 
-    async def test_public_comment_gets_signed_threaded_reply(self) -> None:
+    async def test_public_comment_gets_visible_signed_reply(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             settings = make_settings(root, public_replies_enabled=True)
@@ -548,7 +548,7 @@ class CommunityBotTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(transport.comments[0][:4], (
                 -237593988,
                 83,
-                7,
+                0,
                 "VOID // Я вижу этот вопрос.",
             ))
             self.assertEqual(

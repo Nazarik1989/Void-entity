@@ -931,7 +931,10 @@ class CommunityBot:
                 await self.transport.send_wall_comment(
                     event.owner_id,
                     event.post_id,
-                    event.comment_id,
+                    # VK hides replies addressed through reply_to_comment in a
+                    # collapsed thread. Publish a root-level signed comment so
+                    # the entity is immediately visible below the post.
+                    0,
                     response_text,
                     self.comment_guid(event.event_id),
                 )
