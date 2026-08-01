@@ -170,6 +170,7 @@ Canonical paths:
 ```text
 VK_PUBLISH_QUEUE_DIR=/var/lib/void-vk-publisher/queue
 VK_TRACK_ROTATION_SIZE=149
+VK_PUBLISH_MIN_INTERVAL_SECONDS=3600
 VK_MUSIC_TRACKS_FILE=data/vk_music_tracks.json
 VK_BROWSER_PROFILE_DIR=/var/lib/void-vk-publisher/profile
 ```
@@ -185,6 +186,8 @@ The browser consumer confirms that the requested audio was attached and then req
 The consumer has a kill switch at `/etc/void-vk-publisher.disabled`. Complete user/group permissions, systemd hardening, one-time VPS profile authorization, service installation, and requeue operations are documented in `deploy/VPS_VK_PUBLISHER.md`.
 
 Retryable browser failures now leave a structured `retry.json`, exit with code `75`, and are written to the systemd journal instead of being reported as success. A job is quarantined after `VK_MAX_PUBLISH_RETRIES` attempts (default `12`), so one incompatible track or transient VK layout cannot block every later post forever. Work left in `processing` by a killed consumer is recovered from the durable receipt state on the next locked run.
+
+The consumer timer may run frequently for fast retries, while `VK_PUBLISH_MIN_INTERVAL_SECONDS` applies a separate receipt-backed delay after each confirmed publication. This keeps an outage backlog durable without releasing it as a burst of wall posts when VK recovers.
 
 ## VOID in VK community messages
 

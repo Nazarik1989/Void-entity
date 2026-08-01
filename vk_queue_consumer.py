@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import dataclass
 import json
+import math
 import os
 import re
 import time
@@ -30,6 +31,11 @@ KILL_SWITCH = Path(os.getenv("VK_PUBLISH_KILL_SWITCH", "/etc/void-vk-publisher.d
 GROUP_ID = os.getenv("VK_GROUP_ID", "").strip()
 COMMUNITY_URL = os.getenv("VK_COMMUNITY_URL", "").strip().rstrip("/")
 HEADLESS = os.getenv("VK_BROWSER_HEADLESS", "true").strip().lower() in {"1", "true", "yes", "on"}
+PUBLISH_MIN_INTERVAL_SECONDS = int(
+    os.getenv("VK_PUBLISH_MIN_INTERVAL_SECONDS", "0") or "0"
+)
+if PUBLISH_MIN_INTERVAL_SECONDS < 0:
+    raise ValueError("VK_PUBLISH_MIN_INTERVAL_SECONDS must not be negative")
 ADMIN_NOTICES_DIRNAME = "admin-notices"
 ADMIN_NOTICE_SCHEMA = "vk_admin_notice.v1"
 PUBLICATION_ATTEMPT_FILENAME = ".publication-attempt-unresolved.json"
@@ -1187,6 +1193,30 @@ def publish_job(job: dict[str, Any], media: list[Path]) -> None:
             context.close()
 
 
+def _publication_cooldown_remaining(
+    now: datetime | None = None,
+) -> int:
+    """Return the durable post-success throttle in whole seconds.
+
+    The consumer timer intentionally runs often so browser failures recover
+    promptly. Publication receipts are the authoritative success signal, so a
+    separate receipt-backed throttle prevents an outage backlog from becoming
+    a burst of wall posts when VK recovers.
+    """
+    if PUBLISH_MIN_INTERVAL_SECONDS == 0:
+        return 0
+    receipts = publication_receipts(QUEUE_DIR)
+    if not receipts:
+        return 0
+    latest = max(
+        datetime.fromisoformat(item["published_at"].replace("Z", "+00:00"))
+        for item in receipts
+    )
+    current = now or datetime.now(timezone.utc)
+    remaining = PUBLISH_MIN_INTERVAL_SECONDS - (current - latest).total_seconds()
+    return max(0, math.ceil(remaining))
+
+
 def consume_queue() -> int:
     if KILL_SWITCH.exists():
         print("VK publisher disabled by kill switch")
@@ -1202,6 +1232,18 @@ def consume_queue() -> int:
     except Exception as exc:
         print(f"VK publisher cannot validate publication state: {exc}", flush=True)
         return 75
+    try:
+        cooldown_remaining = _publication_cooldown_remaining()
+    except Exception as exc:
+        print(f"VK publisher cannot validate publication cooldown: {exc}", flush=True)
+        return 75
+    if cooldown_remaining:
+        print(
+            "VK publisher publication cooldown active "
+            f"remaining_seconds={cooldown_remaining}",
+            flush=True,
+        )
+        return 0
     allowed_community_url()
     return consume_once(QUEUE_DIR, GROUP_ID, publish_job)
 

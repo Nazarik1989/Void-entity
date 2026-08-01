@@ -3,6 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 
@@ -58,6 +59,7 @@ from vk_queue_consumer import (
     _open_audio_picker,
     _open_composer,
     _open_composer_once,
+    _publication_cooldown_remaining,
     _publish_and_confirm,
     _published_post_evidence,
     _record_admin_notice,
@@ -1600,6 +1602,40 @@ class VkPublishQueueTests(unittest.TestCase):
 
         first.click.assert_called_once_with(timeout=10_000)
         second.click.assert_not_called()
+
+    def test_publication_cooldown_uses_latest_durable_receipt(self):
+        older = self.job(dedupe_key="cooldown-older", source_ref="void:draft:1")
+        newer = self.job(dedupe_key="cooldown-newer", source_ref="void:draft:2")
+        self.write_receipt(older, "2026-08-01T11:00:00Z")
+        self.write_receipt(newer, "2026-08-01T11:30:00Z")
+
+        with (
+            patch("vk_queue_consumer.QUEUE_DIR", self.root),
+            patch("vk_queue_consumer.PUBLISH_MIN_INTERVAL_SECONDS", 3600),
+        ):
+            self.assertEqual(
+                _publication_cooldown_remaining(
+                    datetime.fromisoformat("2026-08-01T12:00:00+00:00")
+                ),
+                1800,
+            )
+            self.assertEqual(
+                _publication_cooldown_remaining(
+                    datetime.fromisoformat("2026-08-01T12:31:00+00:00")
+                ),
+                0,
+            )
+
+    def test_active_publication_cooldown_does_not_open_consumer(self):
+        with (
+            patch("vk_queue_consumer.KILL_SWITCH", self.root / "disabled"),
+            patch("vk_queue_consumer._unresolved_publication_attempt", return_value=False),
+            patch("vk_queue_consumer._publication_cooldown_remaining", return_value=900),
+            patch("vk_queue_consumer.consume_once") as consume,
+        ):
+            self.assertEqual(consume_queue(), 0)
+
+        consume.assert_not_called()
 
     def test_attach_track_calls_composer_attachment_confirmation(self):
         row = Mock()
