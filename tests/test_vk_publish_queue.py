@@ -43,7 +43,9 @@ from vk_queue_consumer import (
     _audio_identity_matches,
     _audio_dom_diagnostics,
     _audio_row_score,
+    _audio_search_is_file_picker,
     _audio_title_fallback,
+    _audio_trigger_diagnostics,
     _attach_track,
     _authentication_required,
     _click_first_text,
@@ -1411,6 +1413,36 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertIn("AudioCard__root--abc", diagnostic)
         self.assertNotIn("private post text", diagnostic)
         self.assertNotIn("<script>", diagnostic)
+
+    def test_file_picker_search_is_never_accepted_as_audio(self):
+        markers = Mock()
+        markers.count.return_value = 2
+        dialog = Mock()
+        dialog.locator.return_value = markers
+        dialogs = Mock()
+        dialogs.count.return_value = 1
+        dialogs.nth.return_value = dialog
+        search = Mock()
+        search.locator.return_value = dialogs
+
+        self.assertTrue(_audio_search_is_file_picker(search))
+
+        markers.count.return_value = 0
+        self.assertFalse(_audio_search_is_file_picker(search))
+
+    def test_audio_trigger_diagnostics_contains_only_sanitized_testids(self):
+        page = Mock()
+        page.evaluate.return_value = [
+            "posting_attach_audio",
+            "<script>private text</script>",
+            "posting_attach_audio",
+        ]
+
+        diagnostic = _audio_trigger_diagnostics(page)
+
+        self.assertIn("posting_attach_audio", diagnostic)
+        self.assertNotIn("<script>", diagnostic)
+        self.assertEqual(diagnostic.count("posting_attach_audio"), 1)
 
     def test_consumer_prefers_the_closest_exact_audio_row(self):
         first = Mock()

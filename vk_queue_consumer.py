@@ -900,14 +900,57 @@ def _first_visible(page: Any, selectors: tuple[str, ...]) -> Any | None:
     return None
 
 
+def _audio_search_is_file_picker(search: Any) -> bool:
+    try:
+        dialogs = search.locator("xpath=ancestor::*[@role='dialog'][1]")
+        count = min(int(dialogs.count()), 4)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    for index in range(count):
+        dialog = dialogs.nth(index)
+        try:
+            markers = dialog.locator(
+                '[data-testid="posting_file_attach_button"], '
+                '[data-testid="docs_list_placeholder"]'
+            )
+            if int(markers.count()) > 0:
+                return True
+        except (AttributeError, TypeError, ValueError):
+            continue
+    return False
+
+
 def _audio_search_input(page: Any, timeout: int = 10_000) -> Any | None:
     deadline = time.monotonic() + timeout / 1000
     while time.monotonic() < deadline:
         candidate = _first_visible(page, AUDIO_SEARCH_SELECTORS)
-        if candidate is not None:
+        if candidate is not None and not _audio_search_is_file_picker(candidate):
             return candidate
         page.wait_for_timeout(250)
     return None
+
+
+def _audio_trigger_diagnostics(page: Any) -> str:
+    try:
+        values = page.evaluate(
+            """
+            () => Array.from(document.querySelectorAll('[data-testid]'))
+              .filter(element => element.offsetParent !== null)
+              .map(element => String(element.getAttribute('data-testid') || ''))
+              .filter(value => /audio|attach|posting|modal/i.test(value))
+              .slice(0, 100)
+            """
+        )
+    except Exception:
+        return "triggers=unavailable"
+    if not isinstance(values, list):
+        return "triggers=invalid"
+    safe = []
+    for raw in values:
+        value = re.sub(r"[^0-9A-Za-z_:\-]", "", str(raw))[:120]
+        if value and value not in safe:
+            safe.append(value)
+    return "triggers=" + ",".join(safe[:60])
 
 
 def _open_audio_picker(page: Any) -> Any:
@@ -932,6 +975,12 @@ def _open_audio_picker(page: Any) -> Any:
             'button[aria-label*="аудио"]',
             '[role="button"][aria-label*="аудио"]',
             'button[title*="аудио"]',
+            'button[aria-label*="Музык"]',
+            '[role="button"][aria-label*="Музык"]',
+            'button[title*="Музык"]',
+            'button[aria-label*="музык"]',
+            '[role="button"][aria-label*="музык"]',
+            'button[title*="музык"]',
         ),
     )
     if trigger is not None:
@@ -941,13 +990,12 @@ def _open_audio_picker(page: Any) -> Any:
         if search is not None:
             return search
 
-    # Last-resort compatibility with the previous fixed-layout VK composer.
-    page.mouse.click(525, 536)
-    page.wait_for_timeout(1_500)
-    search = _audio_search_input(page, timeout=10_000)
-    if search is None:
-        raise RetryablePublishError("VK audio search input is unavailable; retry later")
-    return search
+    # A coordinate click used to work for VK's fixed layout, but now lands on
+    # the file picker. Never guess an attachment type by screen position.
+    raise RetryablePublishError(
+        "VK audio search input is unavailable; retry later "
+        f"({_audio_trigger_diagnostics(page)})"
+    )
 
 
 def _attach_track(page: Any, query: str) -> None:
