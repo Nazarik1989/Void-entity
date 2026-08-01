@@ -31,6 +31,7 @@ from void_dialog_adapter import DialogSettings, VoidDialogEngine
 
 
 DEFAULT_GROUP_ID = 237593988
+MAX_CACHED_POST_CONTEXTS = 500
 
 
 def _positive_int(name: str, value: str, *, minimum: int = 1) -> int:
@@ -70,6 +71,7 @@ class Settings:
     rate_limit_count: int
     rate_limit_window_seconds: int
     max_text_chars: int
+    max_post_context_chars: int
     max_reply_chars: int
     max_public_reply_chars: int
     max_attempts: int
@@ -166,6 +168,13 @@ class Settings:
                 ),
                 12000,
             ),
+            max_post_context_chars=min(
+                _positive_int(
+                    "VK_COMMUNITY_MAX_POST_CONTEXT_CHARS",
+                    os.getenv("VK_COMMUNITY_MAX_POST_CONTEXT_CHARS", "12000"),
+                ),
+                16000,
+            ),
             max_reply_chars=min(
                 _positive_int(
                     "VK_COMMUNITY_MAX_REPLY_CHARS",
@@ -232,6 +241,13 @@ class QueuedEvent:
     owner_id: int
     post_id: int
     comment_id: int
+
+
+@dataclass(frozen=True, slots=True)
+class WallPostContext:
+    owner_id: int
+    post_id: int
+    text: str
 
 
 def _fallback_event_id(update: Mapping[str, Any]) -> str:
@@ -395,6 +411,41 @@ def normalize_wall_activity(
     )
 
 
+def normalize_wall_post_context(
+    update: Mapping[str, Any], settings: Settings
+) -> WallPostContext | None:
+    """Extract only community-authored text from a post-created event."""
+    if update.get("type") != "wall_post_new":
+        return None
+    try:
+        group_id = int(update.get("group_id"))
+    except (TypeError, ValueError):
+        return None
+    if group_id != settings.group_id or group_id not in settings.allowed_group_ids:
+        return None
+    raw_object = update.get("object")
+    if not isinstance(raw_object, Mapping):
+        return None
+    nested = raw_object.get("post")
+    item = nested if isinstance(nested, Mapping) else raw_object
+    try:
+        owner_id = int(item.get("owner_id", -group_id))
+        post_id = int(item.get("id"))
+        from_id = int(item.get("from_id"))
+    except (TypeError, ValueError):
+        return None
+    if owner_id != -group_id or from_id != -group_id or post_id <= 0:
+        return None
+    text = str(item.get("text") or "").replace("\x00", "").strip()
+    if not text:
+        return None
+    return WallPostContext(
+        owner_id=owner_id,
+        post_id=post_id,
+        text=text[: settings.max_post_context_chars],
+    )
+
+
 class EventStore:
     """Durable inbox, dedupe ledger, retry state and per-user rate windows."""
 
@@ -447,6 +498,17 @@ class EventStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vk_community_post_contexts (
+                    owner_id INTEGER NOT NULL,
+                    post_id INTEGER NOT NULL,
+                    text TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    PRIMARY KEY(owner_id, post_id)
+                )
+                """
+            )
             rate_columns = {
                 str(row[1])
                 for row in connection.execute(
@@ -458,6 +520,56 @@ class EventStore:
                     "ALTER TABLE vk_community_rate_limits "
                     "ADD COLUMN notice_sent INTEGER NOT NULL DEFAULT 0"
                 )
+
+    def remember_post_contexts(
+        self,
+        posts: Sequence[WallPostContext],
+        *,
+        now: float | None = None,
+    ) -> int:
+        timestamp = time.time() if now is None else now
+        stored = 0
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            for post in posts:
+                connection.execute(
+                    """
+                    INSERT INTO vk_community_post_contexts(
+                        owner_id, post_id, text, observed_at
+                    ) VALUES(?, ?, ?, ?)
+                    ON CONFLICT(owner_id, post_id) DO UPDATE SET
+                        text=excluded.text,
+                        observed_at=excluded.observed_at
+                    """,
+                    (post.owner_id, post.post_id, post.text, timestamp),
+                )
+                stored += 1
+            if posts:
+                connection.execute(
+                    """
+                    DELETE FROM vk_community_post_contexts
+                    WHERE (owner_id, post_id) NOT IN (
+                        SELECT owner_id, post_id
+                        FROM vk_community_post_contexts
+                        ORDER BY observed_at DESC, owner_id, post_id
+                        LIMIT ?
+                    )
+                    """,
+                    (MAX_CACHED_POST_CONTEXTS,),
+                )
+        return stored
+
+    def post_context(self, owner_id: int, post_id: int) -> str:
+        with closing(self._connect()) as connection, connection:
+            row = connection.execute(
+                """
+                SELECT text
+                FROM vk_community_post_contexts
+                WHERE owner_id=? AND post_id=?
+                """,
+                (owner_id, post_id),
+            ).fetchone()
+        return str(row["text"]) if row else ""
 
     def ingest(self, messages: Sequence[InboundMessage], *, now: float | None = None) -> int:
         timestamp = time.time() if now is None else now
@@ -832,7 +944,7 @@ class CommunityBot:
         self,
         settings: Settings,
         store: EventStore,
-        generate: Callable[[int, str, str], Awaitable[str]],
+        generate: Callable[[int, str, str, str], Awaitable[str]],
         *,
         transport: VkTransport | None = None,
         notifier: SystemdNotifier | None = None,
@@ -862,12 +974,17 @@ class CommunityBot:
 
     def ingest_updates(self, updates: Sequence[Mapping[str, Any]]) -> int:
         accepted: list[InboundMessage] = []
+        post_contexts: list[WallPostContext] = []
         for update in updates:
+            post_context = normalize_wall_post_context(update, self.settings)
+            if post_context is not None:
+                post_contexts.append(post_context)
             event = normalize_message(update, self.settings)
             if event is None:
                 event = normalize_wall_activity(update, self.settings)
             if event is not None:
                 accepted.append(event)
+        self.store.remember_post_contexts(post_contexts)
         return self.store.ingest(accepted)
 
     async def process_one(self) -> bool:
@@ -885,12 +1002,20 @@ class CommunityBot:
                     window_seconds=self.settings.rate_limit_window_seconds,
                 )
                 if rate_decision == "allow":
+                    post_context = ""
+                    if event.event_kind == "wall_post":
+                        post_context = event.text
+                    elif event.event_kind == "wall_comment":
+                        post_context = self.store.post_context(
+                            event.owner_id, event.post_id
+                        )
                     # VK dialogue history lives in its own database, so the native
                     # VK user id is safe and never overlaps Telegram memory.
                     response_text = await self.generate(
                         event.user_id,
                         event.text,
                         event.event_kind,
+                        post_context,
                     )
                 elif rate_decision == "notify":
                     if event.event_kind != "private_message":
@@ -1057,9 +1182,16 @@ async def run_from_env() -> None:
     dialog = VoidDialogEngine(DialogSettings.from_env())
     store = EventStore(settings.state_db_path)
 
-    async def generate(user_id: int, text: str, event_kind: str) -> str:
+    async def generate(
+        user_id: int, text: str, event_kind: str, post_context: str
+    ) -> str:
         platform = "vk_public" if event_kind != "private_message" else "vk"
-        return await dialog.generate(user_id, text, platform=platform)
+        return await dialog.generate(
+            user_id,
+            text,
+            platform=platform,
+            source_context=post_context,
+        )
 
     await CommunityBot(settings, store, generate).run()
 
