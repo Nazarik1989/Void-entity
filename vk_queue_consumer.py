@@ -649,6 +649,80 @@ def _audio_title_fallback(page: Any, search: Any, query: str) -> tuple[Any | Non
     return None, visible_titles
 
 
+def _audio_dom_diagnostics(search: Any) -> str:
+    """Return structure-only picker metadata for safe production diagnosis.
+
+    No text, values, URLs, ids, aria labels, or post contents are collected.
+    The bounded signature is useful when VK renames result-row hooks again.
+    """
+
+    try:
+        payload = search.evaluate(
+            """
+            element => {
+              const clean = node => ({
+                tag: String(node.tagName || '').toLowerCase(),
+                role: String(node.getAttribute?.('role') || ''),
+                testid: String(node.getAttribute?.('data-testid') || ''),
+                className: typeof node.className === 'string'
+                  ? node.className.slice(0, 160) : '',
+                descendants: Number(node.querySelectorAll?.('*').length || 0),
+              });
+              const ancestors = [];
+              let node = element;
+              let root = null;
+              for (let index = 0; node && index < 9; index += 1) {
+                const item = clean(node);
+                ancestors.push(item);
+                if (!root && item.descendants >= 20) root = node;
+                node = node.parentElement;
+              }
+              root = root || element.parentElement || element;
+              const signatures = [];
+              const seen = new Set();
+              for (const child of Array.from(root.querySelectorAll('*')).slice(0, 400)) {
+                const item = clean(child);
+                if (!item.role && !item.testid && !item.className) continue;
+                const key = JSON.stringify([item.tag, item.role, item.testid, item.className]);
+                if (seen.has(key)) continue;
+                seen.add(key);
+                signatures.push(item);
+                if (signatures.length >= 60) break;
+              }
+              return {ancestors, signatures};
+            }
+            """
+        )
+    except Exception:
+        return "dom=unavailable"
+    if not isinstance(payload, dict):
+        return "dom=invalid"
+
+    def sanitized(items: Any, limit: int) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        if not isinstance(items, list):
+            return result
+        for raw in items[:limit]:
+            if not isinstance(raw, dict):
+                continue
+            item: dict[str, Any] = {}
+            for key in ("tag", "role", "testid", "className"):
+                value = re.sub(r"[^0-9A-Za-z_:\- ]", "", str(raw.get(key) or ""))
+                item[key] = value[:160]
+            try:
+                item["descendants"] = min(max(int(raw.get("descendants", 0)), 0), 9999)
+            except (TypeError, ValueError):
+                item["descendants"] = 0
+            result.append(item)
+        return result
+
+    safe = {
+        "ancestors": sanitized(payload.get("ancestors"), 9),
+        "signatures": sanitized(payload.get("signatures"), 60),
+    }
+    return "dom=" + json.dumps(safe, ensure_ascii=True, separators=(",", ":"))[:6000]
+
+
 def _visible_matching_audio_count(page: Any, query: str) -> int:
     if not _tokens(query):
         return 0
@@ -929,7 +1003,8 @@ def _attach_track(page: Any, query: str) -> None:
             row_count = 0
         raise RetryablePublishError(
             "no matching VK audio result; retry later "
-            f"(rows={row_count}, exact_titles={visible_title_candidates})"
+            f"(rows={row_count}, exact_titles={visible_title_candidates}, "
+            f"{_audio_dom_diagnostics(search)})"
         )
     selected.click(timeout=10_000)
     page.wait_for_timeout(800)

@@ -41,6 +41,7 @@ from vk_queue_consumer import (
     VkPublishConfirmationError,
     _PublicationEvidence,
     _audio_identity_matches,
+    _audio_dom_diagnostics,
     _audio_row_score,
     _audio_title_fallback,
     _attach_track,
@@ -1379,6 +1380,37 @@ class VkPublishQueueTests(unittest.TestCase):
 
         self.assertIsNone(selected)
         self.assertEqual(count, 1)
+
+    def test_audio_dom_diagnostics_keeps_structure_and_strips_content(self):
+        search = Mock()
+        search.evaluate.return_value = {
+            "ancestors": [
+                {
+                    "tag": "DIV<script>",
+                    "role": "dialog",
+                    "testid": "audio-picker",
+                    "className": "AudioRoot user secret@example.com",
+                    "descendants": 42,
+                    "text": "private post text",
+                }
+            ],
+            "signatures": [
+                {
+                    "tag": "button",
+                    "role": "option",
+                    "testid": "audio-row",
+                    "className": "AudioCard__root--abc",
+                    "descendants": 3,
+                }
+            ],
+        }
+
+        diagnostic = _audio_dom_diagnostics(search)
+
+        self.assertIn("audio-picker", diagnostic)
+        self.assertIn("AudioCard__root--abc", diagnostic)
+        self.assertNotIn("private post text", diagnostic)
+        self.assertNotIn("<script>", diagnostic)
 
     def test_consumer_prefers_the_closest_exact_audio_row(self):
         first = Mock()
