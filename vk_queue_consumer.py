@@ -130,6 +130,8 @@ PUBLISHED_POST_SELECTORS = (
     '[id^="post_"]',
 )
 PUBLISHED_AUDIO_SELECTORS = (
+    '[data-testid*="musicattach"]',
+    '[data-testid*="musicoverlaybadge"]',
     '[data-testid*="audio"]',
     '[class*="audio_row"]',
     '[class*="AudioRow"]',

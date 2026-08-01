@@ -38,6 +38,7 @@ from vk_queue_consumer import (
     COMPOSER_INPUT_SELECTORS,
     COMPOSER_TRIGGER_SELECTORS,
     PUBLICATION_ATTEMPT_FILENAME,
+    PUBLISHED_AUDIO_SELECTORS,
     VkAuthenticationRequiredError,
     VkComposerStructureError,
     VkPublishConfirmationError,
@@ -1448,6 +1449,12 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertIn(
             '[data-testid="posting_audio_select_audio_selected_title"]',
             ATTACHED_AUDIO_SELECTORS,
+        )
+
+    def test_current_vk_wall_music_attachment_is_verified(self):
+        self.assertEqual(
+            PUBLISHED_AUDIO_SELECTORS[0],
+            '[data-testid*="musicattach"]',
         )
 
     def test_unresolved_inspection_requires_existing_marker(self):
