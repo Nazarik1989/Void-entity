@@ -184,6 +184,14 @@ The browser consumer confirms that the requested audio was attached and then req
 
 The consumer has a kill switch at `/etc/void-vk-publisher.disabled`. Complete user/group permissions, systemd hardening, one-time VPS profile authorization, service installation, and requeue operations are documented in `deploy/VPS_VK_PUBLISHER.md`.
 
+Retryable browser failures now leave a structured `retry.json`, exit with code `75`, and are written to the systemd journal instead of being reported as success. A job is quarantined after `VK_MAX_PUBLISH_RETRIES` attempts (default `12`), so one incompatible track or transient VK layout cannot block every later post forever. Work left in `processing` by a killed consumer is recovered from the durable receipt state on the next locked run.
+
+## VOID in VK community messages
+
+`vk_community_bot.py` runs VOID as a private-message bot for the same allowlisted VK community through Bots Long Poll. It is isolated from the wall publisher, has no `wall.post` method, uses a dedicated community token, deduplicates inbound events, persists replies before send retries, and stores VK dialogue history in a separate SQLite database.
+
+The service is deliberately disabled by default. Enable community messages and `message_new` Long Poll events in VK, create a messages-only community token, and follow `deploy/VPS_VK_COMMUNITY_BOT.md`. The first rollout should use `VK_COMMUNITY_ALLOWED_USER_IDS` as a closed pilot allowlist; the token must never be committed or pasted into a public log.
+
 The Windows Task Scheduler scripts are retained only for legacy manual diagnostics. They are not a production scheduler.
 
 ## Architecture and storage
@@ -196,6 +204,8 @@ The Windows Task Scheduler scripts are retained only for legacy manual diagnosti
 - `vk_publish_queue.py` — strict filesystem queue contract.
 - `void_vk_producer.py` — VOID queue producer; never opens Chromium.
 - `vk_queue_consumer.py` — standalone allowlisted production consumer.
+- `vk_community_bot.py` — durable VK Bots Long Poll private-message adapter.
+- `void_dialog_adapter.py` — transport-neutral VOID dialogue engine with isolated VK history.
 - `vk_browser_publisher.py` — retained manual browser diagnostics.
 - `deploy/` — VPS documentation and systemd units.
 - `tests/` — unit and compatibility tests.
