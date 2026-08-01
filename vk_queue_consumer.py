@@ -20,6 +20,7 @@ from vk_publish_queue import (
     normalize_track_query,
     publication_receipts,
     requeue_failed,
+    validate_job,
 )
 
 QUEUE_DIR = Path(os.getenv("VK_PUBLISH_QUEUE_DIR", "/var/lib/void-vk-publisher/queue"))
@@ -1178,15 +1179,144 @@ def consume_queue() -> int:
     return consume_once(QUEUE_DIR, GROUP_ID, publish_job)
 
 
+def _inspect_unresolved_publication() -> int:
+    attempt = _load_publication_attempt()
+    if attempt is None:
+        raise RuntimeError("no unresolved VK publication attempt")
+    job_id = attempt["job_id"]
+    job_dir = None
+    state = ""
+    for candidate_state in ("failed", "processing", "pending", "done"):
+        candidate = QUEUE_DIR / candidate_state / job_id
+        if candidate.is_dir() and not candidate.is_symlink():
+            job_dir = candidate
+            state = candidate_state
+            break
+    if job_dir is None:
+        raise RuntimeError("unresolved VK job directory is unavailable")
+    job = validate_job(job_dir, GROUP_ID)
+    if not PROFILE_DIR.is_dir() or PROFILE_DIR.is_symlink():
+        raise RuntimeError("authorized browser profile is unavailable")
+
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as playwright:
+        context = playwright.chromium.launch_persistent_context(
+            user_data_dir=str(PROFILE_DIR),
+            headless=HEADLESS,
+            viewport={"width": 1400, "height": 900},
+        )
+        try:
+            page = context.new_page()
+            page.goto(allowed_community_url(), wait_until="domcontentloaded")
+            page.wait_for_timeout(3_000)
+            if _authentication_required(page):
+                raise VkAuthenticationRequiredError(
+                    "VK browser session authentication is required"
+                )
+            evidence = _published_post_evidence(
+                page,
+                job["text"],
+                job["track_query"],
+            )
+            exact_visible = 0
+            exact_ancestors: list[dict[str, str]] = []
+            candidates = page.get_by_text(job["text"], exact=True)
+            for index in range(min(candidates.count(), 20)):
+                candidate = candidates.nth(index)
+                try:
+                    if not candidate.is_visible():
+                        continue
+                    exact_visible += 1
+                    raw = candidate.evaluate(
+                        """
+                        element => {
+                          const result = [];
+                          let node = element;
+                          for (let index = 0; node && index < 8; index += 1) {
+                            result.push({
+                              tag: String(node.tagName || '').toLowerCase(),
+                              role: String(node.getAttribute?.('role') || ''),
+                              testid: String(node.getAttribute?.('data-testid') || ''),
+                              className: typeof node.className === 'string'
+                                ? node.className.slice(0, 160) : '',
+                            });
+                            node = node.parentElement;
+                          }
+                          return result;
+                        }
+                        """
+                    )
+                    if isinstance(raw, list):
+                        for item in raw[:8]:
+                            if not isinstance(item, dict):
+                                continue
+                            exact_ancestors.append(
+                                {
+                                    key: re.sub(
+                                        r"[^0-9A-Za-z_:\- ]",
+                                        "",
+                                        str(item.get(key) or ""),
+                                    )[:160]
+                                    for key in ("tag", "role", "testid", "className")
+                                }
+                            )
+                    break
+                except Exception:
+                    continue
+            visible_testids = page.evaluate(
+                """
+                () => Array.from(document.querySelectorAll('[data-testid]'))
+                  .filter(element => element.offsetParent !== null)
+                  .map(element => String(element.getAttribute('data-testid') || ''))
+                  .filter(value => /post|feed|wall|audio|music/i.test(value))
+                  .slice(0, 120)
+                """
+            )
+        finally:
+            context.close()
+
+    safe_testids: list[str] = []
+    if isinstance(visible_testids, list):
+        for raw in visible_testids:
+            value = re.sub(r"[^0-9A-Za-z_:\-]", "", str(raw))[:120]
+            if value and value not in safe_testids:
+                safe_testids.append(value)
+    matching_ids = sorted(evidence.identified)
+    confirmed = bool(matching_ids or evidence.anonymous_count)
+    print(
+        json.dumps(
+            {
+                "schema": "vk_unresolved_inspection.v1",
+                "job_id": job_id,
+                "queue_state": state,
+                "confirmed_matching_post": confirmed,
+                "matching_post_ids": matching_ids,
+                "anonymous_matching_posts": evidence.anonymous_count,
+                "exact_text_visible": exact_visible,
+                "exact_text_ancestors": exact_ancestors,
+                "visible_testids": safe_testids,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+    return 0 if confirmed else 75
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Standalone allowlisted VK queue consumer")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("consume-queue")
+    sub.add_parser("inspect-unresolved")
     requeue = sub.add_parser("requeue-failed")
     requeue.add_argument("job_id")
     args = parser.parse_args()
     if args.command == "consume-queue":
         raise SystemExit(consume_queue())
+    if args.command == "inspect-unresolved":
+        raise SystemExit(_inspect_unresolved_publication())
     path = requeue_failed(QUEUE_DIR, args.job_id, GROUP_ID)
     print(f"Requeued: {path}")
 

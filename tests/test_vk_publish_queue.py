@@ -52,6 +52,7 @@ from vk_queue_consumer import (
     _authentication_required,
     _click_first_text,
     _confirm_track_attached,
+    _inspect_unresolved_publication,
     _open_audio_picker,
     _open_composer,
     _open_composer_once,
@@ -1448,6 +1449,13 @@ class VkPublishQueueTests(unittest.TestCase):
             '[data-testid="posting_audio_select_audio_selected_title"]',
             ATTACHED_AUDIO_SELECTORS,
         )
+
+    def test_unresolved_inspection_requires_existing_marker(self):
+        with (
+            patch("vk_queue_consumer._load_publication_attempt", return_value=None),
+            self.assertRaisesRegex(RuntimeError, "no unresolved"),
+        ):
+            _inspect_unresolved_publication()
 
     def test_audio_trigger_diagnostics_contains_only_sanitized_testids(self):
         page = Mock()
