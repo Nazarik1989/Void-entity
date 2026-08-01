@@ -16,6 +16,7 @@ from urllib.parse import parse_qs, urlparse
 from vk_publish_queue import (
     RetryablePublishError,
     VK_MUSIC_TRACKS_FILE,
+    _record_publication_receipt,
     consume_once,
     normalize_track_query,
     publication_receipts,
@@ -1205,7 +1206,17 @@ def consume_queue() -> int:
     return consume_once(QUEUE_DIR, GROUP_ID, publish_job)
 
 
-def _inspect_unresolved_publication() -> int:
+def _reconcile_confirmed_unresolved(job: dict[str, Any]) -> None:
+    confirmed_ids = {
+        receipt["job_id"] for receipt in publication_receipts(QUEUE_DIR)
+    }
+    if job["job_id"] not in confirmed_ids:
+        _record_publication_receipt(QUEUE_DIR, job)
+    if _unresolved_publication_attempt():
+        raise RuntimeError("confirmed VK receipt did not resolve publication marker")
+
+
+def _inspect_unresolved_publication(*, reconcile_confirmed: bool = False) -> int:
     attempt = _load_publication_attempt()
     if attempt is None:
         raise RuntimeError("no unresolved VK publication attempt")
@@ -1310,6 +1321,10 @@ def _inspect_unresolved_publication() -> int:
                 safe_testids.append(value)
     matching_ids = sorted(evidence.identified)
     confirmed = bool(matching_ids or evidence.anonymous_count)
+    reconciled = False
+    if reconcile_confirmed and confirmed:
+        _reconcile_confirmed_unresolved(job)
+        reconciled = True
     print(
         json.dumps(
             {
@@ -1317,6 +1332,7 @@ def _inspect_unresolved_publication() -> int:
                 "job_id": job_id,
                 "queue_state": state,
                 "confirmed_matching_post": confirmed,
+                "reconciled": reconciled,
                 "matching_post_ids": matching_ids,
                 "anonymous_matching_posts": evidence.anonymous_count,
                 "exact_text_visible": exact_visible,
@@ -1335,14 +1351,19 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Standalone allowlisted VK queue consumer")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("consume-queue")
-    sub.add_parser("inspect-unresolved")
+    inspect = sub.add_parser("inspect-unresolved")
+    inspect.add_argument("--reconcile-confirmed", action="store_true")
     requeue = sub.add_parser("requeue-failed")
     requeue.add_argument("job_id")
     args = parser.parse_args()
     if args.command == "consume-queue":
         raise SystemExit(consume_queue())
     if args.command == "inspect-unresolved":
-        raise SystemExit(_inspect_unresolved_publication())
+        raise SystemExit(
+            _inspect_unresolved_publication(
+                reconcile_confirmed=args.reconcile_confirmed,
+            )
+        )
     path = requeue_failed(QUEUE_DIR, args.job_id, GROUP_ID)
     print(f"Requeued: {path}")
 

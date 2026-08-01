@@ -61,6 +61,7 @@ from vk_queue_consumer import (
     _publish_and_confirm,
     _published_post_evidence,
     _record_admin_notice,
+    _reconcile_confirmed_unresolved,
     _unresolved_publication_attempt,
     _wait_for_publication_confirmation,
     consume_queue,
@@ -1490,6 +1491,22 @@ class VkPublishQueueTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "no unresolved"),
         ):
             _inspect_unresolved_publication()
+
+    def test_confirmed_unresolved_reconciliation_records_receipt_first(self):
+        job = self.job(dedupe_key="confirmed-reconciliation")
+        with (
+            patch("vk_queue_consumer.QUEUE_DIR", self.root),
+            patch("vk_queue_consumer.publication_receipts", return_value=[]),
+            patch("vk_queue_consumer._record_publication_receipt") as record,
+            patch(
+                "vk_queue_consumer._unresolved_publication_attempt",
+                return_value=False,
+            ) as resolve,
+        ):
+            _reconcile_confirmed_unresolved(job)
+
+        self.assertEqual(record.call_args, call(self.root, job))
+        resolve.assert_called_once_with()
 
     def test_audio_trigger_diagnostics_contains_only_sanitized_testids(self):
         page = Mock()
