@@ -1442,7 +1442,11 @@ class VkPublishQueueTests(unittest.TestCase):
     def test_current_vk_preview_item_is_checked_for_attached_audio(self):
         self.assertEqual(
             ATTACHED_AUDIO_SELECTORS[0],
-            '[data-testid="posting_preview_attachment_item"]',
+            '[data-testid="posting_audio_select_audio_selected"]',
+        )
+        self.assertIn(
+            '[data-testid="posting_audio_select_audio_selected_title"]',
+            ATTACHED_AUDIO_SELECTORS,
         )
 
     def test_audio_trigger_diagnostics_contains_only_sanitized_testids(self):

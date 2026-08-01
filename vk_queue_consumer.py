@@ -63,6 +63,8 @@ AUDIO_SEARCH_SELECTORS = (
     'input[data-testid*="audio"][data-testid*="search"]',
 )
 ATTACHED_AUDIO_SELECTORS = (
+    '[data-testid="posting_audio_select_audio_selected"]',
+    '[data-testid="posting_audio_select_audio_selected_title"]',
     '[data-testid="posting_preview_attachment_item"]',
     '[data-testid="posting_audio_audio_track_row"]',
     '[data-testid*="audio_track_row"]',
