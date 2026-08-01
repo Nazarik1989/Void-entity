@@ -50,6 +50,7 @@ from vk_queue_consumer import (
     _authentication_required,
     _click_first_text,
     _confirm_track_attached,
+    _open_audio_picker,
     _open_composer,
     _open_composer_once,
     _publish_and_confirm,
@@ -1443,6 +1444,28 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertIn("posting_attach_audio", diagnostic)
         self.assertNotIn("<script>", diagnostic)
         self.assertEqual(diagnostic.count("posting_attach_audio"), 1)
+
+    def test_audio_picker_text_lookup_is_scoped_to_active_composer(self):
+        search = Mock()
+        labels = Mock()
+        labels.count.return_value = 1
+        labels.last = labels
+        labels.is_visible.return_value = True
+        scope = Mock()
+        scope.get_by_text.return_value = labels
+        page = Mock()
+
+        with (
+            patch(
+                "vk_queue_consumer._audio_search_input",
+                side_effect=[None, search],
+            ),
+            patch("vk_queue_consumer._first_visible", return_value=scope),
+        ):
+            self.assertIs(_open_audio_picker(page), search)
+
+        scope.get_by_text.assert_called_once_with("Музыка", exact=True)
+        page.get_by_text.assert_not_called()
 
     def test_consumer_prefers_the_closest_exact_audio_row(self):
         first = Mock()

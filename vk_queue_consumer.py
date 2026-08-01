@@ -958,8 +958,20 @@ def _open_audio_picker(page: Any) -> Any:
     if existing is not None:
         return existing
 
+    composer_scope = _first_visible(
+        page,
+        (
+            '[data-testid="posting_modal_box"]',
+            '[role="dialog"][data-testid*="posting"]',
+        ),
+    )
+    if composer_scope is None:
+        raise RetryablePublishError(
+            "VK audio search input composer scope is unavailable; retry later"
+        )
+
     for label in ("Музыка", "Аудиозапись", "Аудио"):
-        locator = page.get_by_text(label, exact=True)
+        locator = composer_scope.get_by_text(label, exact=True)
         if locator.count() and locator.last.is_visible():
             locator.last.click(timeout=5_000, force=True, no_wait_after=True)
             page.wait_for_timeout(1_000)
@@ -968,10 +980,12 @@ def _open_audio_picker(page: Any) -> Any:
                 return search
 
     trigger = _first_visible(
-        page,
+        composer_scope,
         (
+            '[data-testid="group_tab_audios"]',
             'button[data-testid*="audio"]',
             '[role="button"][data-testid*="audio"]',
+            '[data-testid*="attach"][data-testid*="audio"]',
             'button[aria-label*="аудио"]',
             '[role="button"][aria-label*="аудио"]',
             'button[title*="аудио"]',
