@@ -535,6 +535,10 @@ PLATFORM_CHANNELS = {
         "role": "atmosphere, music, culture, visual mood, cities, community memory",
         "format": "visual-first post, softer rhythm, more cultural context",
     },
+    "vk_public": {
+        "role": "public community conversation, culture, curiosity, and dry observation",
+        "format": "one concise conversational reply without markdown or a generic greeting",
+    },
     "max": {
         "role": "compact signals, announcements, direct interaction",
         "format": "short post, clear point, minimal structure",

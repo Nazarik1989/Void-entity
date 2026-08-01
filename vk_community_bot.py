@@ -1,8 +1,9 @@
-"""Private-message adapter that runs VOID in one allowlisted VK community.
+"""Durable VOID adapter for one allowlisted VK community.
 
 The adapter uses VK Bots Long Poll, so it needs no public inbound HTTP endpoint.
-Its API client exposes only ``groups.getLongPollServer`` and ``messages.send``;
-wall publishing is intentionally impossible from this process.
+Its API client exposes only ``groups.getLongPollServer``, ``messages.send``, and
+``wall.createComment``; wall publication is intentionally impossible from this
+process.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import sqlite3
@@ -58,6 +60,7 @@ class Settings:
     group_id: int
     allowed_group_ids: frozenset[int]
     allowed_user_ids: frozenset[int]
+    public_replies_enabled: bool
     token: str
     api_version: str
     state_db_path: Path
@@ -68,6 +71,7 @@ class Settings:
     rate_limit_window_seconds: int
     max_text_chars: int
     max_reply_chars: int
+    max_public_reply_chars: int
     max_attempts: int
     retry_base_seconds: int
     processing_lease_seconds: int
@@ -109,6 +113,10 @@ class Settings:
                 os.getenv("VK_COMMUNITY_ALLOWED_USER_IDS", ""),
                 allow_empty=True,
             ),
+            public_replies_enabled=os.getenv(
+                "VK_COMMUNITY_PUBLIC_REPLIES_ENABLED", "false"
+            ).strip().lower()
+            in {"1", "true", "yes", "on"},
             token=token,
             api_version=os.getenv("VK_API_VERSION", "5.199").strip() or "5.199",
             state_db_path=Path(
@@ -165,6 +173,13 @@ class Settings:
                 ),
                 4000,
             ),
+            max_public_reply_chars=min(
+                _positive_int(
+                    "VK_COMMUNITY_MAX_PUBLIC_REPLY_CHARS",
+                    os.getenv("VK_COMMUNITY_MAX_PUBLIC_REPLY_CHARS", "900"),
+                ),
+                2000,
+            ),
             max_attempts=min(
                 _positive_int(
                     "VK_COMMUNITY_MAX_ATTEMPTS",
@@ -200,6 +215,10 @@ class InboundMessage:
     peer_id: int
     text: str
     raw: Mapping[str, Any]
+    event_kind: str = "private_message"
+    owner_id: int = 0
+    post_id: int = 0
+    comment_id: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +228,10 @@ class QueuedEvent:
     text: str
     response_text: str
     attempts: int
+    event_kind: str
+    owner_id: int
+    post_id: int
+    comment_id: int
 
 
 def _fallback_event_id(update: Mapping[str, Any]) -> str:
@@ -249,6 +272,80 @@ def normalize_message(
     text = text[: settings.max_text_chars]
     event_id = str(update.get("event_id") or "").strip() or _fallback_event_id(update)
     return InboundMessage(event_id, group_id, user_id, peer_id, text, update)
+
+
+PUBLIC_INVOCATIONS = frozenset(
+    {"void", "войд", "войда", "сущность", "entity"}
+)
+
+
+def _public_reply_requested(text: str) -> bool:
+    tokens = frozenset(re.findall(r"[0-9a-zа-яё]+", text.casefold()))
+    return "?" in text or bool(tokens & PUBLIC_INVOCATIONS)
+
+
+def normalize_wall_activity(
+    update: Mapping[str, Any], settings: Settings
+) -> InboundMessage | None:
+    """Accept only direct public prompts on this community's own wall.
+
+    Community-authored posts and comments have a negative ``from_id`` and are
+    rejected before generation, preventing the bot from consuming its own
+    output. Plain public chatter is ignored unless it contains a question or a
+    direct VOID invocation.
+    """
+    if not settings.public_replies_enabled:
+        return None
+    event_type = str(update.get("type") or "")
+    if event_type not in {"wall_reply_new", "wall_post_new"}:
+        return None
+    try:
+        group_id = int(update.get("group_id"))
+    except (TypeError, ValueError):
+        return None
+    if group_id != settings.group_id or group_id not in settings.allowed_group_ids:
+        return None
+    raw_object = update.get("object")
+    if not isinstance(raw_object, Mapping):
+        return None
+    nested_key = "comment" if event_type == "wall_reply_new" else "post"
+    nested = raw_object.get(nested_key)
+    item = nested if isinstance(nested, Mapping) else raw_object
+    try:
+        user_id = int(item.get("from_id"))
+        owner_id = int(item.get("owner_id", -group_id))
+        post_id = int(
+            item.get("post_id")
+            if event_type == "wall_reply_new"
+            else item.get("id")
+        )
+        comment_id = int(item.get("id", 0)) if event_type == "wall_reply_new" else 0
+    except (TypeError, ValueError):
+        return None
+    if owner_id != -group_id or user_id <= 0 or post_id <= 0:
+        return None
+    if event_type == "wall_reply_new" and comment_id <= 0:
+        return None
+    if settings.allowed_user_ids and user_id not in settings.allowed_user_ids:
+        return None
+    text = str(item.get("text") or "").replace("\x00", "").strip()
+    if not text or not _public_reply_requested(text):
+        return None
+    event_id = str(update.get("event_id") or "").strip() or _fallback_event_id(update)
+    return InboundMessage(
+        event_id=event_id,
+        group_id=group_id,
+        user_id=user_id,
+        peer_id=0,
+        text=text[: settings.max_text_chars],
+        raw=update,
+        event_kind=(
+            "wall_comment" if event_type == "wall_reply_new" else "wall_post"
+        ),
+        owner_id=owner_id,
+        post_id=post_id,
+        comment_id=comment_id,
+    )
 
 
 class EventStore:
@@ -321,6 +418,21 @@ class EventStore:
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             for message in messages:
+                routing = {
+                    "event_id": message.event_id,
+                    "group_id": message.group_id,
+                    "user_id": message.user_id,
+                    "peer_id": message.peer_id,
+                }
+                if message.event_kind != "private_message":
+                    routing.update(
+                        {
+                            "event_kind": message.event_kind,
+                            "owner_id": message.owner_id,
+                            "post_id": message.post_id,
+                            "comment_id": message.comment_id,
+                        }
+                    )
                 cursor = connection.execute(
                     """
                     INSERT OR IGNORE INTO vk_community_events(
@@ -336,16 +448,7 @@ class EventStore:
                         # Keep only the routing evidence required for an audit.
                         # Full Long Poll payloads may contain unrelated profile or
                         # attachment metadata and do not belong in this inbox.
-                        json.dumps(
-                            {
-                                "event_id": message.event_id,
-                                "group_id": message.group_id,
-                                "user_id": message.user_id,
-                                "peer_id": message.peer_id,
-                            },
-                            ensure_ascii=False,
-                            sort_keys=True,
-                        ),
+                        json.dumps(routing, ensure_ascii=False, sort_keys=True),
                         timestamp,
                         timestamp,
                     ),
@@ -370,7 +473,7 @@ class EventStore:
             )
             row = connection.execute(
                 """
-                SELECT event_id, user_id, text, response_text, attempts
+                SELECT event_id, user_id, text, raw_json, response_text, attempts
                 FROM vk_community_events
                 WHERE status IN ('pending', 'ready') AND next_attempt_at <= ?
                 ORDER BY received_at, event_id
@@ -390,12 +493,25 @@ class EventStore:
             )
             if updated.rowcount != 1:
                 return None
+        try:
+            routing = json.loads(str(row["raw_json"]))
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError("stored VK event routing is invalid") from exc
+        if not isinstance(routing, Mapping):
+            raise RuntimeError("stored VK event routing is invalid")
+        event_kind = str(routing.get("event_kind") or "private_message")
+        if event_kind not in {"private_message", "wall_comment", "wall_post"}:
+            raise RuntimeError("stored VK event kind is invalid")
         return QueuedEvent(
             event_id=str(row["event_id"]),
             user_id=int(row["user_id"]),
             text=str(row["text"]),
             response_text=str(row["response_text"] or ""),
             attempts=int(row["attempts"]),
+            event_kind=event_kind,
+            owner_id=int(routing.get("owner_id") or 0),
+            post_id=int(routing.get("post_id") or 0),
+            comment_id=int(routing.get("comment_id") or 0),
         )
 
     def save_response(self, event_id: str, response_text: str) -> None:
@@ -519,9 +635,18 @@ class VkTransport(Protocol):
 
     async def send_message(self, user_id: int, text: str, random_id: int) -> int: ...
 
+    async def send_wall_comment(
+        self,
+        owner_id: int,
+        post_id: int,
+        reply_to_comment: int,
+        text: str,
+        guid: str,
+    ) -> int: ...
+
 
 class VkApiClient:
-    """Narrow VK API client: no generic wall-capable method is exposed."""
+    """Narrow VK API client with no wall publication or deletion methods."""
 
     _API_ROOT = "https://api.vk.com/method"
 
@@ -532,7 +657,11 @@ class VkApiClient:
         self._last_send_at = 0.0
 
     async def _api(self, method: str, params: Mapping[str, Any]) -> Any:
-        if method not in {"groups.getLongPollServer", "messages.send"}:
+        if method not in {
+            "groups.getLongPollServer",
+            "messages.send",
+            "wall.createComment",
+        }:
             raise ValueError("VK API method is not allowlisted")
         payload = dict(params)
         payload.update({"access_token": self.settings.token, "v": self.settings.api_version})
@@ -600,6 +729,38 @@ class VkApiClient:
             raise RuntimeError("VK messages.send returned no message id")
         return response
 
+    async def send_wall_comment(
+        self,
+        owner_id: int,
+        post_id: int,
+        reply_to_comment: int,
+        text: str,
+        guid: str,
+    ) -> int:
+        if owner_id != -self.settings.group_id or post_id <= 0:
+            raise ValueError("VK wall comment target is not allowlisted")
+        params: dict[str, Any] = {
+            "owner_id": owner_id,
+            "post_id": post_id,
+            "from_group": self.settings.group_id,
+            "message": text,
+            "guid": guid,
+        }
+        if reply_to_comment > 0:
+            params["reply_to_comment"] = reply_to_comment
+        async with self._send_lock:
+            delay = 0.36 - (time.monotonic() - self._last_send_at)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            response = await self._api("wall.createComment", params)
+            self._last_send_at = time.monotonic()
+        comment_id = (
+            response.get("comment_id") if isinstance(response, Mapping) else response
+        )
+        if not isinstance(comment_id, int) or comment_id <= 0:
+            raise RuntimeError("VK wall.createComment returned no comment id")
+        return comment_id
+
 
 class SystemdNotifier:
     def __init__(self) -> None:
@@ -624,7 +785,7 @@ class CommunityBot:
         self,
         settings: Settings,
         store: EventStore,
-        generate: Callable[[int, str], Awaitable[str]],
+        generate: Callable[[int, str, str], Awaitable[str]],
         *,
         transport: VkTransport | None = None,
         notifier: SystemdNotifier | None = None,
@@ -646,13 +807,21 @@ class CommunityBot:
         value = int.from_bytes(hashlib.sha256(event_id.encode("utf-8")).digest()[:4], "big")
         return (value & 0x7FFFFFFF) or 1
 
+    @staticmethod
+    def comment_guid(event_id: str) -> str:
+        return hashlib.sha256(
+            ("void-vk-comment:" + event_id).encode("utf-8")
+        ).hexdigest()[:32]
+
     def ingest_updates(self, updates: Sequence[Mapping[str, Any]]) -> int:
-        messages = [
-            message
-            for update in updates
-            if (message := normalize_message(update, self.settings)) is not None
-        ]
-        return self.store.ingest(messages)
+        accepted: list[InboundMessage] = []
+        for update in updates:
+            event = normalize_message(update, self.settings)
+            if event is None:
+                event = normalize_wall_activity(update, self.settings)
+            if event is not None:
+                accepted.append(event)
+        return self.store.ingest(accepted)
 
     async def process_one(self) -> bool:
         event = self.store.claim_next(
@@ -671,8 +840,17 @@ class CommunityBot:
                 if rate_decision == "allow":
                     # VK dialogue history lives in its own database, so the native
                     # VK user id is safe and never overlaps Telegram memory.
-                    response_text = await self.generate(event.user_id, event.text)
+                    response_text = await self.generate(
+                        event.user_id,
+                        event.text,
+                        event.event_kind,
+                    )
                 elif rate_decision == "notify":
+                    if event.event_kind != "private_message":
+                        self.store.complete(event.event_id)
+                        self.last_event_at = time.time()
+                        self.write_health("running")
+                        return True
                     response_text = (
                         "Я рядом, но сообщений слишком много. "
                         "Дай мне минуту и продолжим."
@@ -687,15 +865,29 @@ class CommunityBot:
                 response_text = (response_text or "").replace("\x00", "").strip()
                 if not response_text:
                     response_text = "Не успел сформулировать ответ. Попробуй ещё раз."
-                response_text = response_text[: self.settings.max_reply_chars]
+                if event.event_kind == "private_message":
+                    response_text = response_text[: self.settings.max_reply_chars]
+                else:
+                    response_text = (
+                        "VOID // " + response_text
+                    )[: self.settings.max_public_reply_chars]
                 self.store.save_response(event.event_id, response_text)
             if self.transport is None:  # pragma: no cover - run() always supplies it
                 raise RuntimeError("VK transport is unavailable")
-            await self.transport.send_message(
-                event.user_id,
-                response_text,
-                self.random_id(event.event_id),
-            )
+            if event.event_kind == "private_message":
+                await self.transport.send_message(
+                    event.user_id,
+                    response_text,
+                    self.random_id(event.event_id),
+                )
+            else:
+                await self.transport.send_wall_comment(
+                    event.owner_id,
+                    event.post_id,
+                    event.comment_id,
+                    response_text,
+                    self.comment_guid(event.event_id),
+                )
             self.store.complete(event.event_id)
             self.last_event_at = time.time()
             self.write_health("running")
@@ -815,8 +1007,9 @@ async def run_from_env() -> None:
     dialog = VoidDialogEngine(DialogSettings.from_env())
     store = EventStore(settings.state_db_path)
 
-    async def generate(user_id: int, text: str) -> str:
-        return await dialog.generate(user_id, text, platform="vk")
+    async def generate(user_id: int, text: str, event_kind: str) -> str:
+        platform = "vk_public" if event_kind != "private_message" else "vk"
+        return await dialog.generate(user_id, text, platform=platform)
 
     await CommunityBot(settings, store, generate).run()
 

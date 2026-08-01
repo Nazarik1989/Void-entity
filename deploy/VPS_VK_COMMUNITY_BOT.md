@@ -1,18 +1,23 @@
-# VOID VK community private-message adapter
+# VOID VK community conversation adapter
 
-This service answers private messages sent to `club237593988`. It uses VK Bots
-Long Poll, so there is no public callback endpoint, web server, confirmation
-secret, or inbound firewall rule. It is independent from the browser-based wall
-publisher and its API client has no `wall.post` capability.
+This service answers private messages sent to `club237593988` and can optionally
+reply to direct questions or VOID invocations in new wall comments and
+user-authored wall posts. It uses VK Bots Long Poll, so there is no public
+callback endpoint, web server, confirmation secret, or inbound firewall rule.
+It is independent from the browser-based wall publisher and its API client has
+no `wall.post`, edit, or delete capability.
 
 ## Required VK setup
 
 1. In community management, enable **Messages** for the community.
 2. In **API usage -> Long Poll API**, enable Long Poll and subscribe to
-   `message_new` events.
-3. Create a dedicated **community access token** with only the permission needed
-   to manage community messages. Do not use the personal `VK_USER_ACCESS_TOKEN`
-   used by older publishing tools.
+   `message_new`. For public replies also subscribe to `wall_reply_new` and
+   `wall_post_new`; edit/delete lifecycle events are intentionally non-actionable.
+3. Create a dedicated **community access token** with message access. Add wall
+   access only when public replies are enabled, and community-management access
+   when VK requires it for Long Poll. Do not grant photo, document, story, or
+   market access and do not use the personal `VK_USER_ACCESS_TOKEN` used by older
+   publishing tools.
 4. Put that token in `/etc/void-vk-community.env` as
    `VK_GROUP_ACCESS_TOKEN`. Keep the file `root:void` and mode `0640`.
 5. Keep both `VK_COMMUNITY_BOT_GROUP_ID` and
@@ -20,8 +25,10 @@ publisher and its API client has no `wall.post` capability.
    multi-community allowlist.
 
 For a private pilot, set `VK_COMMUNITY_ALLOWED_USER_IDS` to the comma-separated
-VK IDs of testers. Leave it empty only when replies should be open to everyone
-who privately messages the community.
+VK IDs of testers. Leave it empty only when replies should be open to everyone.
+The allowlist applies to both private messages and public wall activity. Public
+replies additionally require `VK_COMMUNITY_PUBLIC_REPLIES_ENABLED=true`; plain
+comments without a question or direct VOID invocation remain untouched.
 
 ## Safe installation
 

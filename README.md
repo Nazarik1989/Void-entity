@@ -189,11 +189,11 @@ Retryable browser failures now leave a structured `retry.json`, exit with code `
 
 The consumer timer may run frequently for fast retries, while `VK_PUBLISH_MIN_INTERVAL_SECONDS` applies a separate receipt-backed delay after each confirmed publication. This keeps an outage backlog durable without releasing it as a burst of wall posts when VK recovers.
 
-## VOID in VK community messages
+## VOID in VK community conversations
 
-`vk_community_bot.py` runs VOID as a private-message bot for the same allowlisted VK community through Bots Long Poll. It is isolated from the wall publisher, has no `wall.post` method, uses a dedicated community token, deduplicates inbound events, persists replies before send retries, and stores VK dialogue history in a separate SQLite database.
+`vk_community_bot.py` runs VOID in the same allowlisted VK community through Bots Long Poll. It handles private messages and, behind an independent feature gate, direct questions or VOID invocations in new wall comments and user-authored wall posts. It is isolated from the wall publisher, has no `wall.post`, edit, or delete method, uses a dedicated community token, deduplicates inbound events, persists replies before send retries, and stores VK dialogue history in a separate SQLite database. Public replies use only the explicitly allowlisted `wall.createComment` method and a stable VK `guid` so delivery retries cannot duplicate a comment.
 
-The service is deliberately disabled by default. Enable community messages and `message_new` Long Poll events in VK, create a messages-only community token, and follow `deploy/VPS_VK_COMMUNITY_BOT.md`. The first rollout should use `VK_COMMUNITY_ALLOWED_USER_IDS` as a closed pilot allowlist; the token must never be committed or pasted into a public log.
+The service is deliberately disabled by default. Enable community messages and `message_new` Long Poll events in VK, add `wall_reply_new` and `wall_post_new` only when public replies are wanted, create a narrowly scoped community token, and follow `deploy/VPS_VK_COMMUNITY_BOT.md`. The first rollout should use `VK_COMMUNITY_ALLOWED_USER_IDS` as a closed pilot allowlist; the same allowlist gates both private and public events. The token must never be committed or pasted into a public log.
 
 The Windows Task Scheduler scripts are retained only for legacy manual diagnostics. They are not a production scheduler.
 
@@ -207,7 +207,7 @@ The Windows Task Scheduler scripts are retained only for legacy manual diagnosti
 - `vk_publish_queue.py` — strict filesystem queue contract.
 - `void_vk_producer.py` — VOID queue producer; never opens Chromium.
 - `vk_queue_consumer.py` — standalone allowlisted production consumer.
-- `vk_community_bot.py` — durable VK Bots Long Poll private-message adapter.
+- `vk_community_bot.py` — durable VK Bots Long Poll conversation adapter.
 - `void_dialog_adapter.py` — transport-neutral VOID dialogue engine with isolated VK history.
 - `vk_browser_publisher.py` — retained manual browser diagnostics.
 - `deploy/` — VPS documentation and systemd units.

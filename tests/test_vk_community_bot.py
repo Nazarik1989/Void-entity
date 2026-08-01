@@ -17,6 +17,7 @@ from vk_community_bot import (
     Settings,
     VkApiClient,
     normalize_message,
+    normalize_wall_activity,
     status_payload,
 )
 from void_dialog_adapter import DialogSettings, VoidDialogEngine
@@ -28,6 +29,7 @@ def make_settings(root: Path, **overrides: object) -> Settings:
         "group_id": 237593988,
         "allowed_group_ids": frozenset({237593988}),
         "allowed_user_ids": frozenset(),
+        "public_replies_enabled": False,
         "token": "test-group-token",
         "api_version": "5.199",
         "state_db_path": root / "events.sqlite3",
@@ -38,6 +40,7 @@ def make_settings(root: Path, **overrides: object) -> Settings:
         "rate_limit_window_seconds": 60,
         "max_text_chars": 4000,
         "max_reply_chars": 3500,
+        "max_public_reply_chars": 900,
         "max_attempts": 5,
         "retry_base_seconds": 1,
         "processing_lease_seconds": 300,
@@ -66,6 +69,52 @@ def message_update(
                 "out": outgoing,
                 "text": text,
             }
+        },
+    }
+
+
+def wall_comment_update(
+    *,
+    event_id: str = "wall-comment-1",
+    group_id: int = 237593988,
+    user_id: int = 42,
+    owner_id: int = -237593988,
+    post_id: int = 83,
+    comment_id: int = 7,
+    text: str = "VOID, что ты думаешь?",
+) -> dict:
+    return {
+        "type": "wall_reply_new",
+        "event_id": event_id,
+        "group_id": group_id,
+        "object": {
+            "id": comment_id,
+            "from_id": user_id,
+            "owner_id": owner_id,
+            "post_id": post_id,
+            "text": text,
+        },
+    }
+
+
+def wall_post_update(
+    *,
+    event_id: str = "wall-post-1",
+    group_id: int = 237593988,
+    user_id: int = 42,
+    owner_id: int = -237593988,
+    post_id: int = 84,
+    text: str = "Сущность, ты это видишь?",
+) -> dict:
+    return {
+        "type": "wall_post_new",
+        "event_id": event_id,
+        "group_id": group_id,
+        "object": {
+            "id": post_id,
+            "from_id": user_id,
+            "owner_id": owner_id,
+            "text": text,
         },
     }
 
@@ -124,6 +173,59 @@ class NormalizationTests(unittest.TestCase):
             )
             self.assertEqual(accepted.text, "12345")
 
+    def test_public_wall_comment_requires_feature_and_direct_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            disabled = make_settings(Path(folder))
+            self.assertIsNone(
+                normalize_wall_activity(wall_comment_update(), disabled)
+            )
+
+            settings = make_settings(Path(folder), public_replies_enabled=True)
+            accepted = normalize_wall_activity(wall_comment_update(), settings)
+            self.assertIsNotNone(accepted)
+            self.assertEqual(accepted.event_kind, "wall_comment")
+            self.assertEqual(accepted.owner_id, -237593988)
+            self.assertEqual(accepted.post_id, 83)
+            self.assertEqual(accepted.comment_id, 7)
+            self.assertIsNone(
+                normalize_wall_activity(
+                    wall_comment_update(text="просто наблюдение без обращения"),
+                    settings,
+                )
+            )
+            self.assertIsNotNone(
+                normalize_wall_activity(
+                    wall_comment_update(text="а почему так" + "?"),
+                    settings,
+                )
+            )
+
+    def test_public_wall_activity_rejects_self_foreign_and_nonpilot_events(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(
+                Path(folder),
+                public_replies_enabled=True,
+                allowed_user_ids=frozenset({42}),
+            )
+            self.assertIsNone(
+                normalize_wall_activity(
+                    wall_comment_update(user_id=-237593988), settings
+                )
+            )
+            self.assertIsNone(
+                normalize_wall_activity(wall_comment_update(user_id=41), settings)
+            )
+            self.assertIsNone(
+                normalize_wall_activity(wall_comment_update(group_id=1), settings)
+            )
+            self.assertIsNone(
+                normalize_wall_activity(wall_comment_update(owner_id=-1), settings)
+            )
+            accepted = normalize_wall_activity(wall_post_update(), settings)
+            self.assertIsNotNone(accepted)
+            self.assertEqual(accepted.event_kind, "wall_post")
+            self.assertEqual(accepted.comment_id, 0)
+
 
 class EventStoreTests(unittest.TestCase):
     def test_ingress_is_durable_and_event_id_is_deduplicated(self) -> None:
@@ -154,6 +256,29 @@ class EventStoreTests(unittest.TestCase):
             store.complete("same-event", now=101)
             self.assertIsNone(store.claim_next(now=102))
             self.assertEqual(store.counts()["done"], 1)
+
+    def test_public_routing_is_minimal_durable_and_claimable(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = make_settings(root, public_replies_enabled=True)
+            inbound = normalize_wall_activity(wall_comment_update(), settings)
+            self.assertIsNotNone(inbound)
+            store = EventStore(settings.state_db_path)
+            self.assertEqual(store.ingest([inbound], now=100), 1)
+
+            claimed = store.claim_next(now=100)
+            self.assertEqual(claimed.event_kind, "wall_comment")
+            self.assertEqual(claimed.owner_id, -237593988)
+            self.assertEqual(claimed.post_id, 83)
+            self.assertEqual(claimed.comment_id, 7)
+            with closing(sqlite3.connect(store.path)) as connection:
+                routing = json.loads(
+                    connection.execute(
+                        "SELECT raw_json FROM vk_community_events"
+                    ).fetchone()[0]
+                )
+            self.assertNotIn("text", routing)
+            self.assertEqual(routing["event_kind"], "wall_comment")
 
     def test_stale_processing_lease_recovers_generated_response(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -249,6 +374,7 @@ class DialogIsolationTests(unittest.IsolatedAsyncioTestCase):
 class FakeTransport:
     def __init__(self) -> None:
         self.sent: list[tuple[int, str, int]] = []
+        self.comments: list[tuple[int, int, int, str, str]] = []
 
     async def get_long_poll_server(self) -> tuple[str, str, str]:
         return "https://lp.vk.com", "key", "1"
@@ -260,11 +386,41 @@ class FakeTransport:
         self.sent.append((user_id, text, random_id))
         return 1
 
+    async def send_wall_comment(
+        self,
+        owner_id: int,
+        post_id: int,
+        reply_to_comment: int,
+        text: str,
+        guid: str,
+    ) -> int:
+        self.comments.append(
+            (owner_id, post_id, reply_to_comment, text, guid)
+        )
+        return 1
+
 
 class FailOnceTransport(FakeTransport):
     async def send_message(self, user_id: int, text: str, random_id: int) -> int:
         self.sent.append((user_id, text, random_id))
         if len(self.sent) == 1:
+            raise RuntimeError("transient")
+        return 1
+
+
+class FailOnceCommentTransport(FakeTransport):
+    async def send_wall_comment(
+        self,
+        owner_id: int,
+        post_id: int,
+        reply_to_comment: int,
+        text: str,
+        guid: str,
+    ) -> int:
+        self.comments.append(
+            (owner_id, post_id, reply_to_comment, text, guid)
+        )
+        if len(self.comments) == 1:
             raise RuntimeError("transient")
         return 1
 
@@ -278,8 +434,9 @@ class CommunityBotTests(unittest.IsolatedAsyncioTestCase):
             transport = FakeTransport()
             calls: list[tuple[int, str]] = []
 
-            async def generate(user_id: int, text: str) -> str:
+            async def generate(user_id: int, text: str, event_kind: str) -> str:
                 calls.append((user_id, text))
+                self.assertEqual(event_kind, "private_message")
                 return "void reply"
 
             bot = CommunityBot(settings, store, generate, transport=transport)
@@ -311,6 +468,92 @@ class CommunityBotTests(unittest.IsolatedAsyncioTestCase):
                 {"peer_id": 42, "random_id": 99, "message": "reply"},
             )
 
+    async def test_vk_wall_comment_is_narrowly_allowlisted_and_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(Path(folder))
+            client = VkApiClient(settings, object())  # type: ignore[arg-type]
+            client._api = AsyncMock(  # type: ignore[method-assign]
+                return_value={"comment_id": 321}
+            )
+
+            self.assertEqual(
+                await client.send_wall_comment(
+                    -237593988, 83, 7, "VOID // reply", "stable-guid"
+                ),
+                321,
+            )
+            client._api.assert_awaited_once_with(
+                "wall.createComment",
+                {
+                    "owner_id": -237593988,
+                    "post_id": 83,
+                    "from_group": 237593988,
+                    "message": "VOID // reply",
+                    "guid": "stable-guid",
+                    "reply_to_comment": 7,
+                },
+            )
+            with self.assertRaisesRegex(ValueError, "not allowlisted"):
+                await client.send_wall_comment(-1, 83, 7, "reply", "guid")
+
+    async def test_public_comment_gets_signed_threaded_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = make_settings(root, public_replies_enabled=True)
+            store = EventStore(settings.state_db_path)
+            transport = FakeTransport()
+            generated: list[tuple[int, str, str]] = []
+
+            async def generate(user_id: int, text: str, event_kind: str) -> str:
+                generated.append((user_id, text, event_kind))
+                return "Я вижу этот вопрос."
+
+            bot = CommunityBot(settings, store, generate, transport=transport)
+            self.assertEqual(bot.ingest_updates([wall_comment_update()]), 1)
+            self.assertTrue(await bot.process_one())
+
+            self.assertEqual(
+                generated,
+                [(42, "VOID, что ты думаешь?", "wall_comment")],
+            )
+            self.assertEqual(len(transport.sent), 0)
+            self.assertEqual(transport.comments[0][:4], (
+                -237593988,
+                83,
+                7,
+                "VOID // Я вижу этот вопрос.",
+            ))
+            self.assertEqual(
+                transport.comments[0][4],
+                bot.comment_guid("wall-comment-1"),
+            )
+
+    async def test_public_comment_retry_reuses_reply_and_guid(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = make_settings(root, public_replies_enabled=True)
+            store = EventStore(settings.state_db_path)
+            transport = FailOnceCommentTransport()
+            generated: list[str] = []
+
+            async def generate(user_id: int, text: str, event_kind: str) -> str:
+                generated.append(text)
+                return "durable public reply"
+
+            bot = CommunityBot(settings, store, generate, transport=transport)
+            bot.ingest_updates([wall_comment_update(event_id="retry-comment")])
+            self.assertTrue(await bot.process_one())
+            with closing(sqlite3.connect(settings.state_db_path)) as connection, connection:
+                connection.execute(
+                    "UPDATE vk_community_events SET next_attempt_at=0 "
+                    "WHERE event_id='retry-comment'"
+                )
+            self.assertTrue(await bot.process_one())
+            self.assertEqual(generated, ["VOID, что ты думаешь?"])
+            self.assertEqual(len(transport.comments), 2)
+            self.assertEqual(transport.comments[0], transport.comments[1])
+            self.assertEqual(store.counts()["done"], 1)
+
     async def test_send_retry_reuses_durable_reply_and_random_id(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -319,8 +562,9 @@ class CommunityBotTests(unittest.IsolatedAsyncioTestCase):
             transport = FailOnceTransport()
             generated: list[str] = []
 
-            async def generate(user_id: int, text: str) -> str:
+            async def generate(user_id: int, text: str, event_kind: str) -> str:
                 generated.append(text)
+                self.assertEqual(event_kind, "private_message")
                 return "durable reply"
 
             bot = CommunityBot(settings, store, generate, transport=transport)
