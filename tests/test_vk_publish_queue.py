@@ -1230,12 +1230,13 @@ class VkPublishQueueTests(unittest.TestCase):
             )
         )
 
-    def test_audio_identity_requires_artist_evidence_for_structured_vk_rows(self):
+    def test_audio_identity_allows_distinctive_title_only_for_structured_vk_rows(self):
         query = "M83 — Midnight City"
 
-        self.assertFalse(_audio_identity_matches("Midnight City", query))
+        self.assertTrue(_audio_identity_matches("Midnight City", query))
         self.assertTrue(_audio_identity_matches("M83 Midnight City 04:03", query))
         self.assertFalse(_audio_identity_matches("Midnight City Live Remix", query))
+        self.assertFalse(_audio_identity_matches("Heartbeat", "Nefretle — Heartbeat"))
 
         artist = Mock()
         artist.inner_text.return_value = "M83"

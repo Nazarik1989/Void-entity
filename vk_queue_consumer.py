@@ -461,12 +461,19 @@ def _audio_identity_score(value: str, query: str) -> tuple[int, int] | None:
     title_tokens = _tokens(title)
     if not title_tokens or not title_tokens <= value_tokens:
         return None
-    # A flat row must still expose the artist. Title-only evidence is unsafe:
-    # different artists can have the same title. Rows that visually split the
-    # fields are handled by _audio_row_score's nested artist/title locators.
-    if not artist_tokens or not artist_tokens <= value_tokens:
+    # VK's current audio picker can expose only the title in a row's flattened
+    # accessible text even though the artist is rendered separately. Accept
+    # title-only evidence only when the title has at least two distinctive
+    # tokens. A one-word title still requires artist evidence, and the variant
+    # guard above continues to reject an unrequested live/remix/edit.
+    distinctive_title_tokens = {
+        token
+        for token in title_tokens
+        if len(token) >= 2 and token not in AUDIO_VARIANT_TOKENS
+    }
+    if len(distinctive_title_tokens) < 2 and not artist_tokens & value_tokens:
         return None
-    return 1, len(value_tokens - (title_tokens | artist_tokens))
+    return 1, len(value_tokens - title_tokens)
 
 
 def _audio_identity_matches(value: str, query: str) -> bool:
