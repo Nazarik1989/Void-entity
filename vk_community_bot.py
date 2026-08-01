@@ -284,6 +284,37 @@ def _public_reply_requested(text: str) -> bool:
     return "?" in text or bool(tokens & PUBLIC_INVOCATIONS)
 
 
+def _direct_public_invocation(text: str) -> bool:
+    tokens = frozenset(re.findall(r"[0-9a-zа-яё]+", text.casefold()))
+    return bool(tokens & PUBLIC_INVOCATIONS)
+
+
+def _community_comment_actor(
+    item: Mapping[str, Any], settings: Settings
+) -> int | None:
+    """Resolve a human actor for a comment published as the community.
+
+    VK commonly exposes only the community's negative ``from_id`` for these
+    comments. A positive signer is preferred when present. During a one-user
+    pilot, the sole allowlisted user is the only possible administrator actor.
+    Open installations use the positive group id as a separate public-dialog
+    identity rather than mixing the thread with a private user conversation.
+    """
+    try:
+        signer_id = int(item.get("signer_id", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if signer_id > 0:
+        if settings.allowed_user_ids and signer_id not in settings.allowed_user_ids:
+            return None
+        return signer_id
+    if len(settings.allowed_user_ids) == 1:
+        return next(iter(settings.allowed_user_ids))
+    if not settings.allowed_user_ids:
+        return settings.group_id
+    return None
+
+
 def normalize_wall_activity(
     update: Mapping[str, Any], settings: Settings
 ) -> InboundMessage | None:
@@ -322,14 +353,30 @@ def normalize_wall_activity(
         comment_id = int(item.get("id", 0)) if event_type == "wall_reply_new" else 0
     except (TypeError, ValueError):
         return None
-    if owner_id != -group_id or user_id <= 0 or post_id <= 0:
+    if owner_id != -group_id or post_id <= 0:
         return None
     if event_type == "wall_reply_new" and comment_id <= 0:
         return None
-    if settings.allowed_user_ids and user_id not in settings.allowed_user_ids:
-        return None
     text = str(item.get("text") or "").replace("\x00", "").strip()
     if not text or not _public_reply_requested(text):
+        return None
+
+    if user_id <= 0:
+        # A human administrator can publish a wall comment as the community.
+        # Accept only direct invocations, never community-authored posts, and
+        # reject VOID's own prefixed replies so Long Poll cannot create a loop.
+        if (
+            event_type != "wall_reply_new"
+            or user_id != -group_id
+            or not _direct_public_invocation(text)
+            or re.match(r"^\s*void\s*//", text, flags=re.IGNORECASE)
+        ):
+            return None
+        actor_id = _community_comment_actor(item, settings)
+        if actor_id is None:
+            return None
+        user_id = actor_id
+    elif settings.allowed_user_ids and user_id not in settings.allowed_user_ids:
         return None
     event_id = str(update.get("event_id") or "").strip() or _fallback_event_id(update)
     return InboundMessage(

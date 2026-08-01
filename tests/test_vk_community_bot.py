@@ -200,17 +200,45 @@ class NormalizationTests(unittest.TestCase):
                 )
             )
 
-    def test_public_wall_activity_rejects_self_foreign_and_nonpilot_events(self) -> None:
+    def test_public_wall_activity_handles_community_admin_comments_safely(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             settings = make_settings(
                 Path(folder),
                 public_replies_enabled=True,
                 allowed_user_ids=frozenset({42}),
             )
+            accepted = normalize_wall_activity(
+                wall_comment_update(user_id=-237593988), settings
+            )
+            self.assertIsNotNone(accepted)
+            self.assertEqual(accepted.user_id, 42)
             self.assertIsNone(
                 normalize_wall_activity(
-                    wall_comment_update(user_id=-237593988), settings
+                    wall_comment_update(
+                        user_id=-237593988,
+                        text="VOID // собственный ответ",
+                    ),
+                    settings,
                 )
+            )
+            self.assertIsNone(
+                normalize_wall_activity(
+                    wall_comment_update(user_id=-237593988, text="а почему?"),
+                    settings,
+                )
+            )
+            self.assertIsNone(
+                normalize_wall_activity(
+                    wall_post_update(user_id=-237593988), settings
+                )
+            )
+
+    def test_public_wall_activity_rejects_foreign_and_nonpilot_events(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(
+                Path(folder),
+                public_replies_enabled=True,
+                allowed_user_ids=frozenset({42}),
             )
             self.assertIsNone(
                 normalize_wall_activity(wall_comment_update(user_id=41), settings)
