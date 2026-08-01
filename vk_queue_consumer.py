@@ -76,8 +76,15 @@ AUDIO_RESULT_SELECTORS = (
     '[role="dialog"] [data-testid*="audio_row"]',
     '[role="dialog"] [class*="AudioRow"]',
     '[role="dialog"] [class*="audio_row"]',
+    '[role="dialog"] [class*="AudioCard"]',
+    '[role="dialog"] [class*="audioCard"]',
+    '[role="dialog"] [class*="AudioItem"]',
+    '[role="dialog"] [class*="audioItem"]',
+    '[role="dialog"] [role="option"]',
     '[data-testid="posting_audio_audio_track_row"]',
     '[data-testid*="audio_track_row"]',
+    '[class*="AudioCard"]',
+    '[class*="audioCard"]',
 )
 AUDIO_ARTIST_SELECTORS = (
     '[data-testid*="artist"]',
@@ -564,6 +571,84 @@ def _audio_search_queries(query: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
+def _audio_title_fallback(page: Any, search: Any, query: str) -> tuple[Any | None, int]:
+    """Find an exact visible title inside the picker when VK hides row hooks.
+
+    The fallback never searches the whole page. It first proves a common picker
+    scope containing both the already-located search field and the ``Готово``
+    control. This avoids clicking an identically named track in the wall feed.
+    One-word titles still need artist evidence from a clickable ancestor.
+    """
+
+    identity = _structured_track_identity(query)
+    if identity is None:
+        return None, 0
+    _, title = identity
+    scopes: list[Any] = []
+    for selector in (
+        "xpath=ancestor::*[.//*[normalize-space(text())='Готово']][1]",
+        "xpath=ancestor::*[@role='dialog'][1]",
+    ):
+        try:
+            candidates = search.locator(selector)
+            count = min(int(candidates.count()), 4)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        for index in range(count):
+            scope = candidates.nth(index)
+            try:
+                if scope.is_visible():
+                    scopes.append(scope)
+            except Exception:
+                continue
+        if scopes:
+            break
+    if not scopes:
+        return None, 0
+
+    visible_titles = 0
+    for scope in scopes:
+        try:
+            title_candidates = scope.get_by_text(title, exact=True)
+            count = min(int(title_candidates.count()), 30)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        for index in range(count):
+            candidate = title_candidates.nth(index)
+            try:
+                if not candidate.is_visible():
+                    continue
+            except Exception:
+                continue
+            visible_titles += 1
+            try:
+                clickable = candidate.locator(
+                    "xpath=ancestor::*["
+                    "@role='option' or @role='button' or self::button or self::a or "
+                    "contains(translate(@class,'AUDIO','audio'),'audio')"
+                    "][1]"
+                )
+                clickable_count = min(int(clickable.count()), 4)
+            except (AttributeError, TypeError, ValueError):
+                clickable_count = 0
+                clickable = None
+            for clickable_index in range(clickable_count):
+                row = clickable.nth(clickable_index)
+                try:
+                    if not row.is_visible():
+                        continue
+                except Exception:
+                    continue
+                if _audio_row_score(row, query) is not None:
+                    return row, visible_titles
+            # A distinctive multi-token exact title is enough only inside the
+            # proven picker scope. The matcher rejects one-word identities and
+            # unrequested variants here.
+            if _audio_identity_score(title, query) is not None:
+                return candidate, visible_titles
+    return None, visible_titles
+
+
 def _visible_matching_audio_count(page: Any, query: str) -> int:
     if not _tokens(query):
         return 0
@@ -808,6 +893,7 @@ def _attach_track(page: Any, query: str) -> None:
     # query so compatibility mocks and the real DOM observe the same row set.
     rows = page.locator(", ".join(AUDIO_RESULT_SELECTORS))
     selected = None
+    visible_title_candidates = 0
     for search_query in _audio_search_queries(query):
         try:
             search.fill(search_query, timeout=10_000)
@@ -832,8 +918,19 @@ def _attach_track(page: Any, query: str) -> None:
         if scored:
             selected = rows.nth(min(scored)[2])
             break
+        selected, candidate_count = _audio_title_fallback(page, search, query)
+        visible_title_candidates = max(visible_title_candidates, candidate_count)
+        if selected is not None:
+            break
     if selected is None:
-        raise RetryablePublishError("no matching VK audio result; retry later")
+        try:
+            row_count = min(int(rows.count()), 999)
+        except (TypeError, ValueError):
+            row_count = 0
+        raise RetryablePublishError(
+            "no matching VK audio result; retry later "
+            f"(rows={row_count}, exact_titles={visible_title_candidates})"
+        )
     selected.click(timeout=10_000)
     page.wait_for_timeout(800)
     page.get_by_text(DONE_TEXT, exact=True).last.click(timeout=10_000)

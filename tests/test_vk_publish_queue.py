@@ -42,6 +42,7 @@ from vk_queue_consumer import (
     _PublicationEvidence,
     _audio_identity_matches,
     _audio_row_score,
+    _audio_title_fallback,
     _attach_track,
     _authentication_required,
     _click_first_text,
@@ -1181,6 +1182,7 @@ class VkPublishQueueTests(unittest.TestCase):
 
         with (
             patch("vk_queue_consumer._visible_matching_audio_count", return_value=0),
+            patch("vk_queue_consumer._audio_title_fallback", return_value=(None, 0)),
             self.assertRaisesRegex(RetryablePublishError, "retry later"),
         ):
             _attach_track(page, "Requested Artist Requested Track")
@@ -1202,6 +1204,7 @@ class VkPublishQueueTests(unittest.TestCase):
 
         with (
             patch("vk_queue_consumer._visible_matching_audio_count", return_value=0),
+            patch("vk_queue_consumer._audio_title_fallback", return_value=(None, 0)),
             self.assertRaisesRegex(RetryablePublishError, "retry later"),
         ):
             _attach_track(page, "Requested Artist Requested Track")
@@ -1306,6 +1309,76 @@ class VkPublishQueueTests(unittest.TestCase):
             _attach_track(page, "M83 — Midnight City")
 
         row.click.assert_called_once_with(timeout=10_000)
+
+    def test_audio_title_fallback_is_scoped_to_picker_and_exact_title(self):
+        row = Mock()
+        row.inner_text.return_value = "M83 Midnight City"
+        row.text_content.return_value = "M83 Midnight City"
+        row.get_attribute.return_value = None
+        row.is_visible.return_value = True
+        row_group = Mock()
+        row_group.count.return_value = 1
+        row_group.nth.return_value = row
+
+        title = Mock()
+        title.is_visible.return_value = True
+        title.locator.return_value = row_group
+        titles = Mock()
+        titles.count.return_value = 1
+        titles.nth.return_value = title
+        scope = Mock()
+        scope.is_visible.return_value = True
+        scope.get_by_text.return_value = titles
+        scopes = Mock()
+        scopes.count.return_value = 1
+        scopes.nth.return_value = scope
+        search = Mock()
+        search.locator.return_value = scopes
+        page = Mock()
+
+        selected, visible_count = _audio_title_fallback(
+            page, search, "M83 — Midnight City"
+        )
+
+        self.assertIs(selected, row)
+        self.assertEqual(visible_count, 1)
+        scope.get_by_text.assert_called_once_with("Midnight City", exact=True)
+
+    def test_audio_title_fallback_rejects_unscoped_and_one_word_titles(self):
+        no_scopes = Mock()
+        no_scopes.count.return_value = 0
+        search = Mock()
+        search.locator.return_value = no_scopes
+
+        selected, count = _audio_title_fallback(
+            Mock(), search, "M83 — Midnight City"
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(count, 0)
+
+        one_word = Mock()
+        one_word.is_visible.return_value = True
+        no_clickable = Mock()
+        no_clickable.count.return_value = 0
+        one_word.locator.return_value = no_clickable
+        titles = Mock()
+        titles.count.return_value = 1
+        titles.nth.return_value = one_word
+        scope = Mock()
+        scope.is_visible.return_value = True
+        scope.get_by_text.return_value = titles
+        scopes = Mock()
+        scopes.count.return_value = 1
+        scopes.nth.return_value = scope
+        search.locator.return_value = scopes
+
+        selected, count = _audio_title_fallback(
+            Mock(), search, "Nefretle — Heartbeat"
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(count, 1)
 
     def test_consumer_prefers_the_closest_exact_audio_row(self):
         first = Mock()
