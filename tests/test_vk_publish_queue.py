@@ -14,7 +14,10 @@ from vk_browser_publisher import parse_scheduled_draft_id
 from vk_publish_queue import (
     DuplicateJobError,
     DuplicateTrackError,
+    MAX_RETRY_ATTEMPTS,
     QueueValidationError,
+    RETRYABLE_EXIT_CODE,
+    RETRY_STATE_FILENAME,
     RetryablePublishError,
     TRACK_HISTORY_BACKFILL_MARKER,
     TRACK_HISTORY_CHECKPOINT_SCHEMA,
@@ -38,6 +41,7 @@ from vk_queue_consumer import (
     VkPublishConfirmationError,
     _PublicationEvidence,
     _audio_identity_matches,
+    _audio_row_score,
     _attach_track,
     _authentication_required,
     _click_first_text,
@@ -712,18 +716,84 @@ class VkPublishQueueTests(unittest.TestCase):
             side_effect=RetryablePublishError("no matching VK audio result")
         )
 
-        self.assertEqual(consume_once(self.root, self.group, publish), 0)
+        self.assertEqual(
+            consume_once(self.root, self.group, publish),
+            RETRYABLE_EXIT_CODE,
+        )
 
         pending = self.root / "pending" / directory.name
         self.assertTrue(pending.is_dir())
         self.assertTrue((pending / "retry.txt").is_file())
+        retry_state = json.loads(
+            (pending / RETRY_STATE_FILENAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(retry_state["attempts"], 1)
+        self.assertEqual(retry_state["error_code"], "vk_audio_no_match")
         self.assertFalse((self.root / "done" / directory.name).exists())
         self.assertFalse((self.root / "failed" / directory.name).exists())
         self.assertEqual(publication_receipts(self.root), [])
 
         publish.reset_mock()
-        self.assertEqual(consume_once(self.root, self.group, publish), 0)
+        self.assertEqual(
+            consume_once(self.root, self.group, publish),
+            RETRYABLE_EXIT_CODE,
+        )
         publish.assert_not_called()
+
+    def test_retry_counter_does_not_reset_when_failure_class_changes(self):
+        directory = self.enqueue(self.job(dedupe_key="retry-class-change"))
+        first = Mock(
+            side_effect=RetryablePublishError("no matching VK audio result")
+        )
+        self.assertEqual(
+            consume_once(self.root, self.group, first),
+            RETRYABLE_EXIT_CODE,
+        )
+
+        pending = self.root / "pending" / directory.name
+        os.utime(pending / "retry.txt", (0, 0))
+        second = Mock(
+            side_effect=RetryablePublishError("composer temporarily unavailable")
+        )
+        self.assertEqual(
+            consume_once(self.root, self.group, second),
+            RETRYABLE_EXIT_CODE,
+        )
+
+        retry_state = json.loads(
+            (pending / RETRY_STATE_FILENAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(retry_state["attempts"], 2)
+        self.assertEqual(retry_state["error_code"], "vk_composer_unavailable")
+
+    def test_consumer_recovers_interrupted_processing_job_without_receipt(self):
+        job = self.job(dedupe_key="interrupted-before-publish")
+        directory = self.enqueue(job)
+        processing = self.root / "processing"
+        processing.mkdir(exist_ok=True)
+        os.replace(directory, processing / directory.name)
+        publish = Mock()
+
+        self.assertEqual(consume_once(self.root, self.group, publish), 0)
+
+        publish.assert_called_once()
+        self.assertTrue((self.root / "done" / directory.name).is_dir())
+        self.assertFalse((processing / directory.name).exists())
+
+    def test_consumer_reconciles_receipted_processing_job_without_republish(self):
+        job = self.job(dedupe_key="interrupted-after-receipt")
+        directory = self.enqueue(job)
+        processing = self.root / "processing"
+        processing.mkdir(exist_ok=True)
+        os.replace(directory, processing / directory.name)
+        self.write_receipt(job)
+        publish = Mock()
+
+        self.assertEqual(consume_once(self.root, self.group, publish), 0)
+
+        publish.assert_not_called()
+        self.assertTrue((self.root / "done" / directory.name).is_dir())
+        self.assertFalse((processing / directory.name).exists())
 
     def test_retry_keeps_same_job_and_plan_then_writes_one_receipt(self):
         job = self.job(
@@ -732,7 +802,10 @@ class VkPublishQueueTests(unittest.TestCase):
         )
         directory = self.enqueue(job)
         first = Mock(side_effect=RetryablePublishError("composer temporarily unavailable"))
-        self.assertEqual(consume_once(self.root, self.group, first), 0)
+        self.assertEqual(
+            consume_once(self.root, self.group, first),
+            RETRYABLE_EXIT_CODE,
+        )
 
         pending = self.root / "pending" / directory.name
         retry_file = pending / "retry.txt"
@@ -748,6 +821,29 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertEqual(consume_once(self.root, self.group, success), 0)
         success.assert_called_once()
         self.assertEqual(len(publication_receipts(self.root)), 1)
+
+    def test_retry_exhaustion_quarantines_job_and_admin_requeue_resets_state(self):
+        job = self.job(dedupe_key="retry-exhausted")
+        directory = self.enqueue(job)
+        publish = Mock(side_effect=RetryablePublishError("no matching VK audio result"))
+
+        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            expected = 1 if attempt == MAX_RETRY_ATTEMPTS else RETRYABLE_EXIT_CODE
+            self.assertEqual(consume_once(self.root, self.group, publish), expected)
+            if attempt < MAX_RETRY_ATTEMPTS:
+                pending = self.root / "pending" / directory.name
+                os.utime(pending / "retry.txt", (0, 0))
+
+        failed = self.root / "failed" / directory.name
+        retry_state = json.loads(
+            (failed / RETRY_STATE_FILENAME).read_text(encoding="utf-8")
+        )
+        self.assertEqual(retry_state["attempts"], MAX_RETRY_ATTEMPTS)
+        self.assertIn("RetryExhaustedError", (failed / "error.txt").read_text())
+
+        pending = requeue_failed(self.root, job["job_id"], self.group)
+        self.assertFalse((pending / "retry.txt").exists())
+        self.assertFalse((pending / RETRY_STATE_FILENAME).exists())
 
     def test_receipt_is_synced_before_publication_can_advance(self):
         self.enqueue(self.job(dedupe_key="durable-receipt"))
@@ -1081,7 +1177,7 @@ class VkPublishQueueTests(unittest.TestCase):
         search.nth.return_value = search
         search.is_visible.return_value = True
         page = Mock()
-        page.locator.side_effect = [search, rows]
+        page.locator.side_effect = [search, *([rows] * 6)]
 
         with (
             patch("vk_queue_consumer._visible_matching_audio_count", return_value=0),
@@ -1102,7 +1198,7 @@ class VkPublishQueueTests(unittest.TestCase):
         search.nth.return_value = search
         search.is_visible.return_value = True
         page = Mock()
-        page.locator.side_effect = [search, rows]
+        page.locator.side_effect = [search, *([rows] * 6)]
 
         with (
             patch("vk_queue_consumer._visible_matching_audio_count", return_value=0),
@@ -1134,6 +1230,82 @@ class VkPublishQueueTests(unittest.TestCase):
             )
         )
 
+    def test_audio_identity_requires_artist_evidence_for_structured_vk_rows(self):
+        query = "M83 — Midnight City"
+
+        self.assertFalse(_audio_identity_matches("Midnight City", query))
+        self.assertTrue(_audio_identity_matches("M83 Midnight City 04:03", query))
+        self.assertFalse(_audio_identity_matches("Midnight City Live Remix", query))
+
+        artist = Mock()
+        artist.inner_text.return_value = "M83"
+        artist.text_content.return_value = "M83"
+        artist.get_attribute.return_value = None
+        artists = Mock()
+        artists.count.return_value = 1
+        artists.nth.return_value = artist
+
+        title = Mock()
+        title.inner_text.return_value = "Midnight City"
+        title.text_content.return_value = "Midnight City"
+        title.get_attribute.return_value = None
+        titles = Mock()
+        titles.count.return_value = 1
+        titles.nth.return_value = title
+
+        row = Mock()
+        row.inner_text.return_value = "Midnight City"
+        row.text_content.return_value = "Midnight City"
+        row.get_attribute.return_value = None
+        row.locator.side_effect = lambda selector: (
+            artists if "artist" in selector.casefold() else titles
+        )
+
+        self.assertIsNotNone(_audio_row_score(row, query))
+
+    def test_attach_track_uses_accessible_text_and_title_only_fallback(self):
+        row = Mock()
+        row.inner_text.return_value = "Midnight City"
+        row.text_content.return_value = "Midnight City"
+        row.get_attribute.return_value = None
+        artist = Mock()
+        artist.inner_text.return_value = "M83"
+        artist.text_content.return_value = "M83"
+        artist.get_attribute.return_value = None
+        artists = Mock()
+        artists.count.return_value = 1
+        artists.nth.return_value = artist
+        title = Mock()
+        title.inner_text.return_value = "Midnight City"
+        title.text_content.return_value = "Midnight City"
+        title.get_attribute.return_value = None
+        titles = Mock()
+        titles.count.return_value = 1
+        titles.nth.return_value = title
+        row.locator.side_effect = lambda selector: (
+            artists if "artist" in selector.casefold() else titles
+        )
+        rows = Mock()
+        rows.count.return_value = 1
+        rows.nth.return_value = row
+        search = Mock()
+        search.count.return_value = 1
+        search.nth.return_value = search
+        search.is_visible.return_value = True
+        done = Mock()
+        done.last = done
+        page = Mock()
+        page.locator.side_effect = [search, *([rows] * 6)]
+        page.get_by_text.return_value = done
+
+        with (
+            patch("vk_queue_consumer._visible_matching_audio_count", return_value=0),
+            patch("vk_queue_consumer._confirm_track_attached"),
+        ):
+            _attach_track(page, "M83 — Midnight City")
+
+        row.click.assert_called_once_with(timeout=10_000)
+
     def test_consumer_prefers_the_closest_exact_audio_row(self):
         first = Mock()
         first.inner_text.return_value = "Requested Artist Requested Track"
@@ -1149,7 +1321,7 @@ class VkPublishQueueTests(unittest.TestCase):
         search.nth.return_value = search
         search.is_visible.return_value = True
         page = Mock()
-        page.locator.side_effect = [search, rows]
+        page.locator.side_effect = [search, *([rows] * 6)]
         done = Mock()
         done.last = done
         page.get_by_text.return_value = done

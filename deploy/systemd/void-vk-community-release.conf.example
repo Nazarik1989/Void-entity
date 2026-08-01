@@ -1,0 +1,8 @@
+[Service]
+WorkingDirectory=@RELEASE_DIR@
+
+ExecStart=
+ExecStart=@RELEASE_DIR@/venv/bin/python @RELEASE_DIR@/vk_community_bot.py run
+
+ReadOnlyPaths=
+ReadOnlyPaths=@CHARACTER_DB@

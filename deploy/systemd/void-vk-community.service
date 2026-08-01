@@ -1,0 +1,39 @@
+[Unit]
+Description=VOID private messages for the allowlisted VK community
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/void-vk-community.enabled
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=void
+Group=void
+WorkingDirectory=/opt/void_entity
+EnvironmentFile=/etc/void-vk-community.env
+Environment=PYTHONUNBUFFERED=1
+UMask=0077
+ExecStart=/opt/void_entity/venv/bin/python /opt/void_entity/vk_community_bot.py run
+Restart=always
+RestartSec=10s
+TimeoutStopSec=2min
+WatchdogSec=90s
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/void_entity/void.db
+ReadWritePaths=/var/lib/void-vk-community
+
+[Install]
+# Intentionally not attached to a target. Enable only after the VK checklist in
+# deploy/VPS_VK_COMMUNITY_BOT.md is complete.

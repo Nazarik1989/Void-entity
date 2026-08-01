@@ -15,7 +15,9 @@ from urllib.parse import parse_qs, urlparse
 
 from vk_publish_queue import (
     RetryablePublishError,
+    VK_MUSIC_TRACKS_FILE,
     consume_once,
+    normalize_track_query,
     publication_receipts,
     requeue_failed,
 )
@@ -67,6 +69,29 @@ ATTACHED_AUDIO_SELECTORS = (
     '[class*="audio_row"]',
     '[class*="AudioRow"]',
     'a[href*="/audio"]',
+)
+AUDIO_RESULT_SELECTORS = (
+    '[role="dialog"] [data-testid="posting_audio_audio_track_row"]',
+    '[role="dialog"] [data-testid*="audio"][data-testid*="track"][data-testid*="row"]',
+    '[role="dialog"] [data-testid*="audio_row"]',
+    '[role="dialog"] [class*="AudioRow"]',
+    '[role="dialog"] [class*="audio_row"]',
+    '[data-testid="posting_audio_audio_track_row"]',
+    '[data-testid*="audio_track_row"]',
+)
+AUDIO_ARTIST_SELECTORS = (
+    '[data-testid*="artist"]',
+    '[data-testid*="performer"]',
+    '[class*="artist"]',
+    '[class*="Artist"]',
+    '[class*="performer"]',
+    '[class*="Performer"]',
+)
+AUDIO_TITLE_SELECTORS = (
+    '[data-testid*="title"]',
+    '[data-testid*="name"]',
+    '[class*="title"]',
+    '[class*="Title"]',
 )
 PUBLISHED_POST_SELECTORS = (
     '[data-post-id]',
@@ -385,22 +410,68 @@ def _post_input(page: Any) -> Any:
 
 
 def _tokens(value: str) -> set[str]:
-    return {
-        part
-        for part in re.split(r"[^0-9A-Za-zА-Яа-яЁё]+", value.casefold())
-        if part
-    }
+    # Unicode-aware: the catalog legitimately contains accented artist names.
+    return set(re.findall(r"[^\W_]+", value.casefold(), flags=re.UNICODE))
+
+
+def _structured_track_identity(query: str) -> tuple[str, str] | None:
+    """Return artist/title when the queue query carries or maps to that identity."""
+    parts = re.split(r"\s+[\N{EM DASH}\N{EN DASH}-]\s+", query.strip(), maxsplit=1)
+    if len(parts) == 2 and all(part.strip() for part in parts):
+        return parts[0].strip(), parts[1].strip()
+
+    query_key = normalize_track_query(query)
+    try:
+        payload = json.loads(VK_MUSIC_TRACKS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    tracks = payload.get("tracks", payload) if isinstance(payload, dict) else payload
+    if not isinstance(tracks, list):
+        return None
+    matches: list[tuple[str, str]] = []
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        artist = str(track.get("artist") or "").strip()
+        title = str(track.get("title") or "").strip()
+        if title and normalize_track_query(f"{artist} {title}") == query_key:
+            matches.append((artist, title))
+    # Ambiguous catalog identities must never be guessed.
+    return matches[0] if len(matches) == 1 else None
+
+
+def _audio_identity_score(value: str, query: str) -> tuple[int, int] | None:
+    """Score a complete identity match without silently changing versions."""
+    query_tokens = _tokens(query)
+    value_tokens = _tokens(value)
+    if not query_tokens or not value_tokens:
+        return None
+    requested_variants = query_tokens & AUDIO_VARIANT_TOKENS
+    displayed_variants = value_tokens & AUDIO_VARIANT_TOKENS
+    if not displayed_variants <= requested_variants:
+        return None
+    if query_tokens <= value_tokens:
+        return 0, len(value_tokens - query_tokens)
+
+    identity = _structured_track_identity(query)
+    if identity is None:
+        return None
+    artist, title = identity
+    artist_tokens = _tokens(artist)
+    title_tokens = _tokens(title)
+    if not title_tokens or not title_tokens <= value_tokens:
+        return None
+    # A flat row must still expose the artist. Title-only evidence is unsafe:
+    # different artists can have the same title. Rows that visually split the
+    # fields are handled by _audio_row_score's nested artist/title locators.
+    if not artist_tokens or not artist_tokens <= value_tokens:
+        return None
+    return 1, len(value_tokens - (title_tokens | artist_tokens))
 
 
 def _audio_identity_matches(value: str, query: str) -> bool:
     """Match the requested catalog identity without silently changing versions."""
-    query_tokens = _tokens(query)
-    value_tokens = _tokens(value)
-    if not query_tokens or not query_tokens <= value_tokens:
-        return False
-    requested_variants = query_tokens & AUDIO_VARIANT_TOKENS
-    displayed_variants = value_tokens & AUDIO_VARIANT_TOKENS
-    return displayed_variants <= requested_variants
+    return _audio_identity_score(value, query) is not None
 
 
 def _normalized_visible_text(value: str) -> str:
@@ -408,7 +479,7 @@ def _normalized_visible_text(value: str) -> str:
     return " ".join(without_zero_width.split()).casefold()
 
 
-def _locator_search_text(locator: Any) -> str:
+def _locator_search_values(locator: Any) -> tuple[str, ...]:
     values: list[str] = []
     for method_name in ("inner_text", "text_content"):
         try:
@@ -424,7 +495,66 @@ def _locator_search_text(locator: Any) -> str:
             continue
         if isinstance(value, str) and value.strip():
             values.append(value)
-    return " ".join(dict.fromkeys(values))
+    return tuple(dict.fromkeys(values))
+
+
+def _locator_search_text(locator: Any) -> str:
+    return " ".join(_locator_search_values(locator))
+
+
+def _nested_search_values(locator: Any, selectors: tuple[str, ...]) -> tuple[str, ...]:
+    values: list[str] = []
+    try:
+        nested = locator.locator(", ".join(selectors))
+        count = min(nested.count(), 20)
+    except Exception:
+        return ()
+    for index in range(count):
+        values.extend(_locator_search_values(nested.nth(index)))
+    return tuple(dict.fromkeys(values))
+
+
+def _audio_row_score(locator: Any, query: str) -> tuple[int, int] | None:
+    """Read both flattened and structured VK rows, retaining strict identity."""
+    query_tokens = _tokens(query)
+    for value in _locator_search_values(locator):
+        score = _audio_identity_score(value, query)
+        if score is not None:
+            return score
+
+    identity = _structured_track_identity(query)
+    if identity is None:
+        return None
+    artist, title = identity
+    artist_tokens = _tokens(artist)
+    title_tokens = _tokens(title)
+    artist_values = _nested_search_values(locator, AUDIO_ARTIST_SELECTORS)
+    title_values = _nested_search_values(locator, AUDIO_TITLE_SELECTORS)
+    if not any(artist_tokens <= _tokens(value) for value in artist_values):
+        return None
+    title_matches = [
+        value for value in title_values if _audio_identity_score(value, title) is not None
+    ]
+    if not title_matches:
+        return None
+    evidence_tokens = _tokens(" ".join((*artist_values, *title_matches)))
+    displayed_variants = evidence_tokens & AUDIO_VARIANT_TOKENS
+    requested_variants = query_tokens & AUDIO_VARIANT_TOKENS
+    if not displayed_variants <= requested_variants:
+        return None
+    return 0, len(evidence_tokens - query_tokens)
+
+
+def _audio_search_queries(query: str) -> tuple[str, ...]:
+    values = [query]
+    identity = _structured_track_identity(query)
+    if identity is not None:
+        artist, title = identity
+        values.extend((f"{artist} - {title}", title))
+    # Never guess a title from an unstructured query. The original flattened
+    # identity remains the only safe search in that case; result selection is
+    # still guarded by the complete-token matcher.
+    return tuple(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
 def _visible_matching_audio_count(page: Any, query: str) -> int:
@@ -439,9 +569,7 @@ def _visible_matching_audio_count(page: Any, query: str) -> int:
             visible = candidate.is_visible()
         except Exception:
             continue
-        if visible and _audio_identity_matches(
-            _locator_search_text(candidate), query
-        ):
+        if visible and _audio_row_score(candidate, query) is not None:
             matches += 1
     return matches
 
@@ -511,9 +639,7 @@ def _post_has_matching_audio(post: Any, query: str) -> bool:
             visible = candidate.is_visible()
         except Exception:
             continue
-        if visible and _audio_identity_matches(
-            _locator_search_text(candidate), query
-        ):
+        if visible and _audio_row_score(candidate, query) is not None:
             return True
     return False
 
@@ -668,27 +794,40 @@ def _attach_track(page: Any, query: str) -> None:
             "VK audio attachment baseline is unavailable; retry later"
         ) from exc
     search = _open_audio_picker(page)
-    try:
-        search.fill(query, timeout=10_000)
-    except Exception as exc:
-        raise RetryablePublishError("VK audio search input is not ready; retry later") from exc
-    page.wait_for_timeout(5_000)
-    rows = page.locator(
-        '[data-testid="posting_audio_audio_track_row"], '
-        '[data-testid*="audio_track_row"]'
-    )
     query_tokens = _tokens(query)
     if not query_tokens:
         raise RetryablePublishError("VK track query has no searchable tokens")
-    scored: list[tuple[int, int]] = []
-    for index in range(min(rows.count(), 30)):
-        row_text = rows.nth(index).inner_text(timeout=2_000)
-        row_tokens = _tokens(row_text)
-        if _audio_identity_matches(row_text, query):
-            scored.append((len(row_tokens - query_tokens), index))
-    if not scored:
+    # Playwright locators are live: keep one locator while changing the search
+    # query so compatibility mocks and the real DOM observe the same row set.
+    rows = page.locator(", ".join(AUDIO_RESULT_SELECTORS))
+    selected = None
+    for search_query in _audio_search_queries(query):
+        try:
+            search.fill(search_query, timeout=10_000)
+        except Exception as exc:
+            raise RetryablePublishError(
+                "VK audio search input is not ready; retry later"
+            ) from exc
+        page.wait_for_timeout(3_000)
+        scored: list[tuple[int, int, int]] = []
+        for index in range(min(rows.count(), 60)):
+            row = rows.nth(index)
+            try:
+                if not row.is_visible():
+                    continue
+            except Exception:
+                # Compatibility with VK's older locator facade. Selection is
+                # still guarded by the complete identity check below.
+                pass
+            score = _audio_row_score(row, query)
+            if score is not None:
+                scored.append((*score, index))
+        if scored:
+            selected = rows.nth(min(scored)[2])
+            break
+    if selected is None:
         raise RetryablePublishError("no matching VK audio result; retry later")
-    rows.nth(min(scored)[1]).click(timeout=10_000)
+    selected.click(timeout=10_000)
     page.wait_for_timeout(800)
     page.get_by_text(DONE_TEXT, exact=True).last.click(timeout=10_000)
     page.wait_for_timeout(1_500)

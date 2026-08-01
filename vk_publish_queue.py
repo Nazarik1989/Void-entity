@@ -43,6 +43,12 @@ PUBLICATION_RECEIPT_FIELDS = frozenset(
     {"schema", "job_id", "producer", "source_ref", "published_at"}
 )
 RETRY_DELAY_SECONDS = 30 * 60
+RETRY_STATE_FILENAME = "retry.json"
+RETRY_STATE_SCHEMA = "vk_publish_retry.v1"
+RETRYABLE_EXIT_CODE = 75
+MAX_RETRY_ATTEMPTS = int(os.getenv("VK_MAX_PUBLISH_RETRIES", "12") or "12")
+if MAX_RETRY_ATTEMPTS <= 0:
+    raise ValueError("VK_MAX_PUBLISH_RETRIES must be positive")
 JOB_ID_RE = re.compile(r"^(naz|void)-[0-9a-f]{24}$")
 
 
@@ -521,6 +527,145 @@ def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _retry_error_code(exc: RetryablePublishError) -> str:
+    message = str(exc).casefold()
+    if "no matching vk audio result" in message:
+        return "vk_audio_no_match"
+    if "audio search input" in message:
+        return "vk_audio_search_unavailable"
+    if "audio attachment" in message or "did not confirm" in message:
+        return "vk_audio_attachment_unconfirmed"
+    if "authentication" in message:
+        return "vk_authentication_required"
+    if "composer" in message:
+        return "vk_composer_unavailable"
+    return "vk_publish_retryable"
+
+
+def _load_retry_state(job_dir: Path) -> dict[str, Any] | None:
+    path = Path(job_dir) / RETRY_STATE_FILENAME
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise QueueValidationError("retry state is unsafe")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QueueValidationError("retry state is invalid") from exc
+    expected = {
+        "schema",
+        "attempts",
+        "error_code",
+        "first_failed_at",
+        "last_failed_at",
+    }
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected
+        or payload.get("schema") != RETRY_STATE_SCHEMA
+        or not isinstance(payload.get("attempts"), int)
+        or payload["attempts"] <= 0
+        or not isinstance(payload.get("error_code"), str)
+        or not payload["error_code"]
+    ):
+        raise QueueValidationError("retry state is invalid")
+    for field in ("first_failed_at", "last_failed_at"):
+        try:
+            parsed = datetime.fromisoformat(str(payload[field]).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise QueueValidationError("retry state timestamp is invalid") from exc
+        if parsed.tzinfo is None:
+            raise QueueValidationError("retry state timestamp must include timezone")
+    return payload
+
+
+def _record_retry_state(job_dir: Path, exc: RetryablePublishError) -> dict[str, Any]:
+    job_dir = Path(job_dir)
+    previous = _load_retry_state(job_dir)
+    now = _utc_now()
+    error_code = _retry_error_code(exc)
+    payload = {
+        "schema": RETRY_STATE_SCHEMA,
+        # Count every retryable failure. Resetting the counter when VK alternates
+        # between two error shapes would let one poisoned job live forever.
+        "attempts": int(previous["attempts"]) + 1 if previous is not None else 1,
+        "error_code": error_code,
+        "first_failed_at": (
+            str(previous["first_failed_at"]) if previous is not None else now
+        ),
+        "last_failed_at": now,
+    }
+    final = job_dir / RETRY_STATE_FILENAME
+    temp = job_dir / f".{RETRY_STATE_FILENAME}.tmp-{uuid.uuid4().hex}"
+    try:
+        with temp.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o640)
+        os.replace(temp, final)
+        _sync_directory(job_dir)
+    finally:
+        if temp.exists() and not temp.is_symlink():
+            temp.unlink()
+    (job_dir / "retry.txt").write_text(
+        f"{type(exc).__name__}: {exc}\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
+def _remove_runtime_markers(job_dir: Path) -> None:
+    for name in ("error.txt", "retry.txt", RETRY_STATE_FILENAME):
+        path = Path(job_dir) / name
+        if path.exists() and not path.is_symlink():
+            path.unlink()
+
+
+def _recover_interrupted_jobs(queue_root: Path, allowed_group_id: str) -> None:
+    """Recover work left between atomic queue-state transitions.
+
+    The consumer is protected by a host-wide flock, so a directory in
+    ``processing`` at startup cannot belong to another live consumer. A durable
+    publication receipt wins and advances the job to ``done``; otherwise the
+    original pending job is restored. Receipt-backed ``failed`` jobs are also
+    reconciled because they represent a post that reached VK before a local
+    bookkeeping write failed.
+    """
+
+    queue_root = Path(queue_root)
+    published_ids = {
+        receipt["job_id"] for receipt in publication_receipts(queue_root)
+    }
+    for state in ("processing", "failed"):
+        source_root = queue_root / state
+        for source in sorted(source_root.iterdir()):
+            if source.is_symlink():
+                raise QueueValidationError(f"unsafe {state} queue entry")
+            if not source.is_dir() or source.name.startswith("."):
+                continue
+            # Historical queues can contain administrative marker directories;
+            # only canonical jobs participate in crash recovery.
+            if not JOB_ID_RE.fullmatch(source.name):
+                continue
+            job = validate_job(source, allowed_group_id)
+            is_published = job["job_id"] in published_ids
+            if state == "failed" and not is_published:
+                continue
+            target_root = queue_root / ("done" if is_published else "pending")
+            target = target_root / source.name
+            if target.exists():
+                raise QueueValidationError(
+                    f"cannot recover {job['job_id']}: target already exists"
+                )
+            if is_published:
+                _remove_runtime_markers(source)
+            os.replace(source, target)
+            _sync_directory(source_root)
+            _sync_directory(target_root)
+
+
 def _safe_media_name(value: Any) -> str:
     if not isinstance(value, str) or not value or "\\" in value or "://" in value:
         raise QueueValidationError("media names must be relative file names")
@@ -690,18 +835,18 @@ def requeue_failed(queue_root: Path, job_id: str, allowed_group_id: str) -> Path
     target = queue_root / "pending" / job_id
     if target.exists():
         raise DuplicateJobError("pending job already exists")
-    error_file = source / "error.txt"
-    if error_file.exists() and not error_file.is_symlink():
-        error_file.unlink()
+    _remove_runtime_markers(source)
     os.replace(source, target)
     return target
 
 
 def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dict[str, Any], list[Path]], None]) -> int:
     queue_root = Path(queue_root)
+    deferred_retry_seen = False
     for state in STATES:
         (queue_root / state).mkdir(parents=True, exist_ok=True)
     _backfill_publication_receipts(queue_root, allowed_group_id)
+    _recover_interrupted_jobs(queue_root, allowed_group_id)
     _backfill_full_track_history(queue_root, allowed_group_id)
     for source in sorted((queue_root / "pending").iterdir()):
         if not source.is_dir() or source.is_symlink() or source.name.startswith("."):
@@ -721,6 +866,7 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
                 and not retry_file.is_symlink()
                 and time.time() - retry_file.stat().st_mtime < RETRY_DELAY_SECONDS
             ):
+                deferred_retry_seen = True
                 os.replace(processing, source)
                 continue
             if job["not_before"] and datetime.fromisoformat(job["not_before"].replace("Z", "+00:00")) > datetime.now(timezone.utc):
@@ -735,16 +881,56 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
             _record_publication_receipt(queue_root, job)
             _record_published_track(queue_root, job)
             _backfill_full_track_history(queue_root, allowed_group_id)
-            if retry_file.exists() and not retry_file.is_symlink():
-                retry_file.unlink()
+            for retry_name in ("retry.txt", RETRY_STATE_FILENAME):
+                completed_retry_file = processing / retry_name
+                if (
+                    completed_retry_file.exists()
+                    and not completed_retry_file.is_symlink()
+                ):
+                    completed_retry_file.unlink()
             os.replace(processing, queue_root / "done" / source.name)
-            return 0
+            return RETRYABLE_EXIT_CODE if deferred_retry_seen else 0
         except RetryablePublishError as exc:
-            (processing / "retry.txt").write_text(
-                f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
-            )
+            try:
+                retry_state = _record_retry_state(processing, exc)
+            except Exception as state_exc:
+                try:
+                    (processing / "error.txt").write_text(
+                        f"RetryStateError: {type(state_exc).__name__}\n",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+                os.replace(processing, queue_root / "failed" / source.name)
+                print(
+                    "VK publisher retry-state failure "
+                    f"job_id={source.name} error={type(state_exc).__name__}",
+                    flush=True,
+                )
+                return 1
+            if int(retry_state["attempts"]) >= MAX_RETRY_ATTEMPTS:
+                (processing / "error.txt").write_text(
+                    "RetryExhaustedError: "
+                    f"{retry_state['error_code']} after "
+                    f"{retry_state['attempts']} attempts\n",
+                    encoding="utf-8",
+                )
+                os.replace(processing, queue_root / "failed" / source.name)
+                print(
+                    "VK publisher retry exhausted "
+                    f"job_id={source.name} error={retry_state['error_code']} "
+                    f"attempts={retry_state['attempts']}",
+                    flush=True,
+                )
+                return 1
             os.replace(processing, source)
-            return 0
+            print(
+                "VK publisher will retry "
+                f"job_id={source.name} error={retry_state['error_code']} "
+                f"attempt={retry_state['attempts']}/{MAX_RETRY_ATTEMPTS}",
+                flush=True,
+            )
+            return RETRYABLE_EXIT_CODE
         except Exception as exc:
             failed_target = queue_root / "failed" / source.name
             if isinstance(exc, DuplicateJobError) and failed_target.is_dir():
@@ -753,4 +939,4 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
             (processing / "error.txt").write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
             os.replace(processing, failed_target)
             return 1
-    return 0
+    return RETRYABLE_EXIT_CODE if deferred_retry_seen else 0
