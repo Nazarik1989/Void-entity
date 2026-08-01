@@ -63,6 +63,7 @@ AUDIO_SEARCH_SELECTORS = (
     'input[data-testid*="audio"][data-testid*="search"]',
 )
 ATTACHED_AUDIO_SELECTORS = (
+    '[data-testid="posting_preview_attachment_item"]',
     '[data-testid="posting_audio_audio_track_row"]',
     '[data-testid*="audio_track_row"]',
     '[data-testid*="audio"][data-testid*="track"]',
@@ -779,7 +780,8 @@ def _confirm_track_attached(
             break
         page.wait_for_timeout(250)
     raise RetryablePublishError(
-        "VK did not confirm the requested audio attachment; retry later"
+        "VK did not confirm the requested audio attachment; retry later "
+        f"({_audio_trigger_diagnostics(page)})"
     )
 
 

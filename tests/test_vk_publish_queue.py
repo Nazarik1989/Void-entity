@@ -34,6 +34,7 @@ from vk_publish_queue import (
 from vk_queue_consumer import (
     AUTH_SELECTORS,
     AUDIO_PICKER_TRIGGER_SELECTORS,
+    ATTACHED_AUDIO_SELECTORS,
     COMPOSER_INPUT_SELECTORS,
     COMPOSER_TRIGGER_SELECTORS,
     PUBLICATION_ATTEMPT_FILENAME,
@@ -1436,6 +1437,12 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertEqual(
             AUDIO_PICKER_TRIGGER_SELECTORS[0],
             '[data-testid="posting_audio_select_audio_cell"]',
+        )
+
+    def test_current_vk_preview_item_is_checked_for_attached_audio(self):
+        self.assertEqual(
+            ATTACHED_AUDIO_SELECTORS[0],
+            '[data-testid="posting_preview_attachment_item"]',
         )
 
     def test_audio_trigger_diagnostics_contains_only_sanitized_testids(self):
