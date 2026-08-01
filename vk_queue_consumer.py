@@ -100,6 +100,22 @@ AUDIO_TITLE_SELECTORS = (
     '[class*="title"]',
     '[class*="Title"]',
 )
+AUDIO_PICKER_TRIGGER_SELECTORS = (
+    '[data-testid="posting_audio_select_audio_cell"]',
+    '[data-testid="group_tab_audios"]',
+    'button[data-testid*="audio"]',
+    '[role="button"][data-testid*="audio"]',
+    '[data-testid*="attach"][data-testid*="audio"]',
+    'button[aria-label*="аудио"]',
+    '[role="button"][aria-label*="аудио"]',
+    'button[title*="аудио"]',
+    'button[aria-label*="Музык"]',
+    '[role="button"][aria-label*="Музык"]',
+    'button[title*="Музык"]',
+    'button[aria-label*="музык"]',
+    '[role="button"][aria-label*="музык"]',
+    'button[title*="музык"]',
+)
 PUBLISHED_POST_SELECTORS = (
     '[data-post-id]',
     '[data-post_id]',
@@ -981,21 +997,7 @@ def _open_audio_picker(page: Any) -> Any:
 
     trigger = _first_visible(
         composer_scope,
-        (
-            '[data-testid="group_tab_audios"]',
-            'button[data-testid*="audio"]',
-            '[role="button"][data-testid*="audio"]',
-            '[data-testid*="attach"][data-testid*="audio"]',
-            'button[aria-label*="аудио"]',
-            '[role="button"][aria-label*="аудио"]',
-            'button[title*="аудио"]',
-            'button[aria-label*="Музык"]',
-            '[role="button"][aria-label*="Музык"]',
-            'button[title*="Музык"]',
-            'button[aria-label*="музык"]',
-            '[role="button"][aria-label*="музык"]',
-            'button[title*="музык"]',
-        ),
+        AUDIO_PICKER_TRIGGER_SELECTORS,
     )
     if trigger is not None:
         trigger.click(timeout=5_000, force=True, no_wait_after=True)

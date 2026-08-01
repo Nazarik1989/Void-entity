@@ -33,6 +33,7 @@ from vk_publish_queue import (
 )
 from vk_queue_consumer import (
     AUTH_SELECTORS,
+    AUDIO_PICKER_TRIGGER_SELECTORS,
     COMPOSER_INPUT_SELECTORS,
     COMPOSER_TRIGGER_SELECTORS,
     PUBLICATION_ATTEMPT_FILENAME,
@@ -1430,6 +1431,12 @@ class VkPublishQueueTests(unittest.TestCase):
 
         markers.count.return_value = 0
         self.assertFalse(_audio_search_is_file_picker(search))
+
+    def test_current_vk_audio_cell_is_an_explicit_picker_trigger(self):
+        self.assertEqual(
+            AUDIO_PICKER_TRIGGER_SELECTORS[0],
+            '[data-testid="posting_audio_select_audio_cell"]',
+        )
 
     def test_audio_trigger_diagnostics_contains_only_sanitized_testids(self):
         page = Mock()
