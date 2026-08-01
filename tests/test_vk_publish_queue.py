@@ -54,6 +54,7 @@ from vk_queue_consumer import (
     _click_first_text,
     _confirm_track_attached,
     _inspect_unresolved_publication,
+    _locator_or_ancestor_audio_matches,
     _open_audio_picker,
     _open_composer,
     _open_composer_once,
@@ -1455,6 +1456,32 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertEqual(
             PUBLISHED_AUDIO_SELECTORS[0],
             '[data-testid*="musicattach"]',
+        )
+
+    def test_wall_music_control_can_match_its_bounded_post_ancestor(self):
+        parent = Mock()
+        parent.inner_text.return_value = "M83 Midnight City"
+        parent.text_content.return_value = "M83 Midnight City"
+        parent.get_attribute.side_effect = lambda name: (
+            "post" if name == "data-testid" else None
+        )
+
+        candidate = Mock()
+        candidate.inner_text.return_value = ""
+        candidate.text_content.return_value = ""
+        candidate.get_attribute.return_value = None
+        parents = Mock()
+        parents.count.return_value = 1
+        parents.inner_text = parent.inner_text
+        parents.text_content = parent.text_content
+        parents.get_attribute = parent.get_attribute
+        candidate.locator.return_value = parents
+
+        self.assertTrue(
+            _locator_or_ancestor_audio_matches(
+                candidate,
+                "M83 — Midnight City",
+            )
         )
 
     def test_unresolved_inspection_requires_existing_marker(self):

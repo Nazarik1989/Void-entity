@@ -828,8 +828,32 @@ def _post_has_matching_audio(post: Any, query: str) -> bool:
             visible = candidate.is_visible()
         except Exception:
             continue
-        if visible and _audio_row_score(candidate, query) is not None:
+        if visible and _locator_or_ancestor_audio_matches(candidate, query):
             return True
+    return False
+
+
+def _locator_or_ancestor_audio_matches(
+    candidate: Any,
+    query: str,
+    *,
+    max_depth: int = 8,
+) -> bool:
+    """Match a music control against its bounded containing post structure."""
+
+    current = candidate
+    for _ in range(max_depth + 1):
+        if _audio_row_score(current, query) is not None:
+            return True
+        try:
+            if current.get_attribute("data-testid") == "post":
+                break
+            parent = current.locator("xpath=..")
+            if int(parent.count()) <= 0:
+                break
+        except (AttributeError, TypeError, ValueError):
+            break
+        current = parent
     return False
 
 
