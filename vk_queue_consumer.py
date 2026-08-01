@@ -986,6 +986,25 @@ def _open_audio_picker(page: Any) -> Any:
             "VK audio search input composer scope is unavailable; retry later"
         )
 
+    trigger = _first_visible(
+        composer_scope,
+        AUDIO_PICKER_TRIGGER_SELECTORS,
+    )
+    if trigger is not None:
+        trigger.click(timeout=5_000, force=True, no_wait_after=True)
+        page.wait_for_timeout(1_000)
+        search = _audio_search_input(page, timeout=8_000)
+        if search is not None:
+            return search
+        try:
+            trigger.evaluate("element => element.click()")
+            page.wait_for_timeout(1_000)
+            search = _audio_search_input(page, timeout=8_000)
+            if search is not None:
+                return search
+        except Exception:
+            pass
+
     for label in ("Музыка", "Аудиозапись", "Аудио"):
         locator = composer_scope.get_by_text(label, exact=True)
         if locator.count() and locator.last.is_visible():
@@ -994,17 +1013,6 @@ def _open_audio_picker(page: Any) -> Any:
             search = _audio_search_input(page, timeout=5_000)
             if search is not None:
                 return search
-
-    trigger = _first_visible(
-        composer_scope,
-        AUDIO_PICKER_TRIGGER_SELECTORS,
-    )
-    if trigger is not None:
-        trigger.click(timeout=5_000, force=True, no_wait_after=True)
-        page.wait_for_timeout(1_000)
-        search = _audio_search_input(page, timeout=5_000)
-        if search is not None:
-            return search
 
     # A coordinate click used to work for VK's fixed layout, but now lands on
     # the file picker. Never guess an attachment type by screen position.

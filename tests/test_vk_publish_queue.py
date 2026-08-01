@@ -1467,12 +1467,40 @@ class VkPublishQueueTests(unittest.TestCase):
                 "vk_queue_consumer._audio_search_input",
                 side_effect=[None, search],
             ),
-            patch("vk_queue_consumer._first_visible", return_value=scope),
+            patch(
+                "vk_queue_consumer._first_visible",
+                side_effect=[scope, None],
+            ),
         ):
             self.assertIs(_open_audio_picker(page), search)
 
         scope.get_by_text.assert_called_once_with("Музыка", exact=True)
         page.get_by_text.assert_not_called()
+
+    def test_audio_picker_prefers_exact_cell_before_text_fallback(self):
+        search = Mock()
+        trigger = Mock()
+        scope = Mock()
+        page = Mock()
+
+        with (
+            patch(
+                "vk_queue_consumer._audio_search_input",
+                side_effect=[None, search],
+            ),
+            patch(
+                "vk_queue_consumer._first_visible",
+                side_effect=[scope, trigger],
+            ),
+        ):
+            self.assertIs(_open_audio_picker(page), search)
+
+        trigger.click.assert_called_once_with(
+            timeout=5_000,
+            force=True,
+            no_wait_after=True,
+        )
+        scope.get_by_text.assert_not_called()
 
     def test_consumer_prefers_the_closest_exact_audio_row(self):
         first = Mock()
