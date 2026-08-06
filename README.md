@@ -213,3 +213,11 @@ Active development. Telegram publishing, draft workflow, signal filtering, chara
 ## Author
 
 Nazar Zykov — AI Agent Developer
+
+---
+
+## Naz AI Lab
+
+This project is part of [Naz AI Lab](https://naz-ai-lab.ru/) — the digital laboratory of [Nazar Zykov](https://naz-ai-lab.ru/creator/).
+
+[Official project page](https://naz-ai-lab.ru/projects/void-entity/) · [All Naz AI Lab projects](https://naz-ai-lab.ru/projects/)
