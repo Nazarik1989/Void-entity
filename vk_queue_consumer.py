@@ -188,6 +188,10 @@ COMPOSER_ATTACHMENT_REMOVE_SELECTOR = (
     '[data-testid^="posting_attachment_"][data-testid$="_remove"]'
 )
 COMPOSER_ATTACHMENT_ITEM_SELECTOR = '[data-testid="posting_attachment_item"]'
+COMPOSER_DEVICE_UPLOAD_SELECTOR = (
+    'input[type="file"]'
+    '[data-testid="posting_base_screen_download_from_device"]'
+)
 
 
 class VkAuthenticationRequiredError(RuntimeError):
@@ -633,6 +637,65 @@ def _wait_for_composer_attachment_count(
         page.wait_for_timeout(250)
     raise RetryablePublishError(
         "VK composer attachment count did not match the queue job; retry later"
+    )
+
+
+def _image_file_input_score(candidate: Any) -> int | None:
+    try:
+        accept = str(candidate.get_attribute("accept") or "").casefold()
+        testid = str(candidate.get_attribute("data-testid") or "")
+    except Exception:
+        return None
+    accepted = tuple(
+        token.strip() for token in accept.split(",") if token.strip()
+    )
+    if not accepted or not any(token.startswith("image/") for token in accepted):
+        return None
+    if any(token.startswith("audio/") for token in accepted):
+        return None
+    image_only = all(token.startswith("image/") for token in accepted)
+    score = 200 if image_only else 100
+    if testid == "posting_base_screen_download_from_device":
+        score += 25
+    return score
+
+
+def _best_image_file_input(root: Any, selector: str) -> Any | None:
+    try:
+        inputs = root.locator(selector)
+        count = min(int(inputs.count()), 20)
+    except Exception as exc:
+        raise RetryablePublishError(
+            "VK composer image upload inputs are unavailable; retry later"
+        ) from exc
+    selected = None
+    selected_score = -1
+    for index in range(count):
+        candidate = inputs.nth(index)
+        score = _image_file_input_score(candidate)
+        if score is not None and score > selected_score:
+            selected = candidate
+            selected_score = score
+    return selected
+
+
+def _composer_image_file_input(page: Any) -> Any:
+    scope = _first_visible(page, COMPOSER_SCOPE_SELECTORS)
+    if scope is None:
+        raise RetryablePublishError(
+            "VK composer image upload scope is unavailable; retry later"
+        )
+    selected = _best_image_file_input(scope, 'input[type="file"]')
+    if selected is not None:
+        return selected
+    # VK currently exposes a mixed video/image input through a React portal.
+    # It is acceptable only with the exact posting-screen test id and an
+    # explicit image MIME type; unrelated empty-accept page inputs stay out.
+    selected = _best_image_file_input(page, COMPOSER_DEVICE_UPLOAD_SELECTOR)
+    if selected is not None:
+        return selected
+    raise RetryablePublishError(
+        "VK composer image upload input is unavailable; retry later"
     )
 
 
@@ -1380,7 +1443,9 @@ def publish_job(job: dict[str, Any], media: list[Path]) -> None:
             )
             _wait_for_composer_attachment_count(page, 0)
             if media:
-                page.locator("input[type=file]").last.set_input_files([str(path) for path in media])
+                _composer_image_file_input(page).set_input_files(
+                    [str(path) for path in media]
+                )
                 page.wait_for_timeout(4_000)
             _wait_for_composer_attachment_count(page, len(media))
             _post_input(page).fill(job["text"])

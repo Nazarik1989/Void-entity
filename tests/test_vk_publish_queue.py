@@ -57,6 +57,7 @@ from vk_queue_consumer import (
     _authentication_required,
     _click_first_text,
     _clear_saved_composer_attachments,
+    _composer_image_file_input,
     _confirm_track_attached,
     _inspect_unresolved_publication,
     _locator_or_ancestor_audio_matches,
@@ -2383,6 +2384,96 @@ class VkPublishQueueTests(unittest.TestCase):
                 managed_texts=frozenset({"post"}),
                 job_id="void-1234567890abcdef12345678",
             )
+
+    def test_image_upload_prefers_scoped_image_only_input_over_later_inputs(self):
+        def file_input(accept, testid=None):
+            candidate = Mock()
+            candidate.get_attribute.side_effect = lambda name: {
+                "accept": accept,
+                "data-testid": testid,
+            }.get(name)
+            return candidate
+
+        image_only = file_input("image/jpeg,image/png,image/gif")
+        mixed_device = file_input(
+            "video/mp4,image/jpeg,image/png",
+            "posting_base_screen_download_from_device",
+        )
+        unrelated_empty = file_input("")
+        inputs = Mock()
+        inputs.count.return_value = 3
+        inputs.nth.side_effect = [image_only, mixed_device, unrelated_empty]
+        scope = Mock()
+        scope.locator.return_value = inputs
+        page = Mock()
+
+        with patch("vk_queue_consumer._first_visible", return_value=scope):
+            selected = _composer_image_file_input(page)
+            selected.set_input_files(["image-1.png"])
+
+        self.assertIs(selected, image_only)
+        image_only.set_input_files.assert_called_once_with(["image-1.png"])
+        mixed_device.set_input_files.assert_not_called()
+        unrelated_empty.set_input_files.assert_not_called()
+        page.locator.assert_not_called()
+
+    def test_image_upload_uses_exact_portal_input_when_scope_has_no_image_input(self):
+        empty = Mock()
+        empty.get_attribute.side_effect = lambda name: "" if name == "accept" else None
+        scoped_inputs = Mock()
+        scoped_inputs.count.return_value = 1
+        scoped_inputs.nth.return_value = empty
+        scope = Mock()
+        scope.locator.return_value = scoped_inputs
+
+        mixed_device = Mock()
+        mixed_device.get_attribute.side_effect = lambda name: {
+            "accept": "video/mp4,image/jpeg,image/png",
+            "data-testid": "posting_base_screen_download_from_device",
+        }.get(name)
+        portal_inputs = Mock()
+        portal_inputs.count.return_value = 1
+        portal_inputs.nth.return_value = mixed_device
+        page = Mock()
+        page.locator.return_value = portal_inputs
+
+        with patch("vk_queue_consumer._first_visible", return_value=scope):
+            selected = _composer_image_file_input(page)
+
+        self.assertIs(selected, mixed_device)
+        page.locator.assert_called_once_with(
+            'input[type="file"]'
+            '[data-testid="posting_base_screen_download_from_device"]'
+        )
+
+    def test_image_upload_rejects_empty_audio_and_non_image_inputs(self):
+        empty = Mock()
+        empty.get_attribute.side_effect = lambda name: "" if name == "accept" else None
+        audio = Mock()
+        audio.get_attribute.side_effect = lambda name: (
+            "audio/mpeg,image/jpeg" if name == "accept" else None
+        )
+        scoped_inputs = Mock()
+        scoped_inputs.count.return_value = 2
+        scoped_inputs.nth.side_effect = [empty, audio]
+        scope = Mock()
+        scope.locator.return_value = scoped_inputs
+
+        video = Mock()
+        video.get_attribute.side_effect = lambda name: (
+            "video/mp4" if name == "accept" else None
+        )
+        portal_inputs = Mock()
+        portal_inputs.count.return_value = 1
+        portal_inputs.nth.return_value = video
+        page = Mock()
+        page.locator.return_value = portal_inputs
+
+        with (
+            patch("vk_queue_consumer._first_visible", return_value=scope),
+            self.assertRaisesRegex(RetryablePublishError, "image upload input"),
+        ):
+            _composer_image_file_input(page)
 
     def test_unmanaged_saved_composer_draft_is_never_overwritten(self):
         editor = Mock()
