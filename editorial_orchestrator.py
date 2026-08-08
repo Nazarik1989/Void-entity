@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Mapping, Sequence
 
 
-ORCHESTRATOR_VERSION = "editorial-orchestrator-v1"
+ORCHESTRATOR_VERSION = "editorial-orchestrator-v2-source-aware-weighted"
 GENERATION_PACKAGE_VERSION = "generation-package-v1"
 PUBLISHED_HISTORY_LIMIT = 160
 _PACKAGE_FIELDS = (
@@ -44,6 +45,8 @@ class EditorialSource:
     real_result: bool = False
     contains_secrets: bool = False
     contains_private_data: bool = False
+    semantic_themes: tuple[str, ...] = ()
+    weight: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +56,7 @@ class EditorialRubric:
     mode: str
     purpose: str
     constraints: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    weight: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +70,7 @@ class EditorialContext:
     pools: Mapping[str, tuple[str, ...]]
     persona_pool_sizes: Mapping[str, int] = field(default_factory=dict)
     semantic_cards: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
+    semantic_card_theses: Mapping[str, str] = field(default_factory=dict)
     published_history: tuple[Mapping[str, Any], ...] = ()
     preferred: Mapping[str, str] = field(default_factory=dict)
     policy_versions: Mapping[str, str] = field(default_factory=dict)
@@ -145,6 +150,13 @@ def _stable_rank(plan_id: str, axis: str, value: str) -> str:
     return hashlib.sha256(f"{plan_id}|{axis}|{value}".encode("utf-8")).hexdigest()
 
 
+def _weighted_rank(plan_id: str, axis: str, value: str, weight: int) -> float:
+    """Deterministic weighted rendezvous score; lower wins."""
+    digest = int(_stable_rank(plan_id, axis, value), 16)
+    unit = (digest + 1) / ((1 << 256) + 1)
+    return -math.log(unit) / max(1, int(weight))
+
+
 def _unique(values: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
@@ -160,6 +172,7 @@ def _choose(
     *, plan_id: str, axis: str, values: Iterable[str],
     history: Sequence[Mapping[str, Any]], preferred: str = "",
     persona_wide_pool_size: int | None = None,
+    weights: Mapping[str, int] | None = None,
 ) -> str:
     candidates = _unique(values)
     if not candidates:
@@ -181,6 +194,18 @@ def _choose(
         ]
     if preferred and preferred in eligible:
         return preferred
+    effective_weights = {
+        value: max(1, int((weights or {}).get(value, 1)))
+        for value in eligible
+    }
+    if len(set(effective_weights.values())) > 1:
+        return min(
+            eligible,
+            key=lambda value: (
+                _weighted_rank(plan_id, axis, value, effective_weights[value]),
+                _stable_rank(plan_id, axis, value),
+            ),
+        )
     return min(eligible, key=lambda value: _stable_rank(plan_id, axis, value))
 
 
@@ -196,6 +221,32 @@ def _plan_id(context: EditorialContext) -> str:
 def _axis_values(context: EditorialContext, rubric: EditorialRubric, axis: str) -> tuple[str, ...]:
     constrained = tuple(rubric.constraints.get(axis, ()))
     return constrained or tuple(context.pools.get(axis, ()))
+
+
+def _source_axis_values(
+    context: EditorialContext,
+    rubric: EditorialRubric,
+    source: EditorialSource,
+    axis: str,
+) -> tuple[str, ...]:
+    values = _axis_values(context, rubric, axis)
+    if axis == "epistemic_state":
+        documented = tuple(
+            value for value in values if value == "documented source signal"
+        )
+        if source.source_type == "documented_source" and source.source_verified:
+            return documented or values
+        return tuple(value for value in values if value != "documented source signal")
+    if axis == "semantic_theme" and source.semantic_themes:
+        compatible = tuple(
+            value for value in values if value in source.semantic_themes
+        )
+        if not compatible:
+            raise EditorialPlanError(
+                "source semantic themes are incompatible with the selected rubric"
+            )
+        return compatible
+    return values
 
 
 def _persona_pool_size(context: EditorialContext, axis: str, candidates: Iterable[str]) -> int:
@@ -233,6 +284,7 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         persona_wide_pool_size=_persona_pool_size(
             context, "rubric", (item.name for item in compatible_rubrics)
         ),
+        weights={item.name: item.weight for item in compatible_rubrics},
     )
     rubric = next(item for item in compatible_rubrics if item.name == rubric_name)
     sources = [
@@ -244,6 +296,7 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         persona_wide_pool_size=_persona_pool_size(
             context, "source_ref", (item.source_ref for item in sources)
         ),
+        weights={item.source_ref: item.weight for item in sources},
     )
     source = next(item for item in sources if item.source_ref == source_ref)
     selected: dict[str, str] = {}
@@ -258,14 +311,26 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         values=("story_first",) if story_first else ("standard",), history=history,
         persona_wide_pool_size=_persona_pool_size(context, "production_mode", ("story_first", "standard")),
     )
+    selected["semantic_theme"] = _choose(
+        plan_id=plan_id,
+        axis="semantic_theme",
+        values=_source_axis_values(context, rubric, source, "semantic_theme"),
+        history=history,
+        preferred=str(context.preferred.get("semantic_theme", "")),
+        persona_wide_pool_size=_persona_pool_size(
+            context,
+            "semantic_theme",
+            _source_axis_values(context, rubric, source, "semantic_theme"),
+        ),
+    )
     for axis in (
-        "thesis_direction", "epistemic_state", "tension", "semantic_theme",
+        "epistemic_state", "tension",
         "facet", "author_role", "emotional_arc", "reader_relation",
         "structure", "hook", "ending", "energy", "seriousness", "tempo", "length",
         "humor", "imagery", "visual_mode", "visual_subject_direction",
         "visual_relation", "track_tags",
     ):
-        candidates = _axis_values(context, rubric, axis)
+        candidates = _source_axis_values(context, rubric, source, axis)
         selected[axis] = _choose(
             plan_id=plan_id, axis=axis, values=candidates,
             history=history, preferred=str(context.preferred.get(axis, "")),
@@ -280,6 +345,25 @@ def plan_release(context: EditorialContext) -> EditorialPlan:
         history=history, preferred=str(context.preferred.get("semantic_card", "")),
         persona_wide_pool_size=_persona_pool_size(context, "semantic_card", semantic_candidates),
     )
+    aligned_thesis = str(
+        context.semantic_card_theses.get(selected["semantic_card"], "")
+    ).strip()
+    if aligned_thesis:
+        selected["thesis_direction"] = aligned_thesis
+    else:
+        thesis_candidates = _source_axis_values(
+            context, rubric, source, "thesis_direction"
+        )
+        selected["thesis_direction"] = _choose(
+            plan_id=plan_id,
+            axis="thesis_direction",
+            values=thesis_candidates,
+            history=history,
+            preferred=str(context.preferred.get("thesis_direction", "")),
+            persona_wide_pool_size=_persona_pool_size(
+                context, "thesis_direction", thesis_candidates
+            ),
+        )
     track_tags = tuple(
         item.strip() for item in selected.pop("track_tags").split(",") if item.strip()
     )
@@ -315,8 +399,8 @@ def generation_prompt(
     retry = ""
     if technical_retry_reason:
         retry = (
-            "\nTECHNICAL RETRY: the previous response was unusable because its JSON/schema "
-            f"was invalid ({technical_retry_reason[:160]}). Execute the exact same plan_id and "
+            "\nBOUNDED RETRY: the previous response failed local validation "
+            f"({technical_retry_reason[:160]}). Execute the exact same plan_id and "
             "all the same axes. Do not redesign the release.\n"
         )
     return (

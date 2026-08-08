@@ -11,6 +11,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import void_vk_producer
 import main
+import character_state
+import editorial_orchestrator
+import void_editorial_catalog
 
 from main import (
     SemanticSummary,
@@ -95,15 +98,15 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertEqual(build_rubric_header("vault", "HUMAN"), "THE VAULT")
         self.assertEqual(build_rubric_header("material", "HUMAN"), "MATERIAL / МАТЕРИЯ")
 
-    def test_material_does_not_change_existing_content_schedules(self) -> None:
+    def test_ai_editorial_schedule_and_unscheduled_material_are_explicit(self) -> None:
         expected_rubrics = [
             ("Midnight", "void", "midnight", "HUMAN", (0, 1, 2), 10),
             ("Frequency", "void", "frequency", "HUMAN", (19, 20, 21, 22), 7),
             ("The Vault", "void", "vault", "HUMAN", (22, 23), 4),
-            ("Future File", "void", "future", "FUTURE", (12, 13, 14, 15, 16, 17, 18), 5),
-            ("Observation", "void", "observation", "ATTENTION", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 6),
-            ("Signal", "void", "signal", "HUMAN", (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 5),
-            ("News Signal", "news", "news", "AI", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19), 4),
+            ("Future File", "void", "future", "FUTURE", (12, 13, 14, 15, 16, 17, 18), 7),
+            ("Observation", "void", "observation", "ATTENTION", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 5),
+            ("Signal", "void", "signal", "AI", (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 6),
+            ("News Signal", "news", "news", "AI", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19), 8),
         ]
         expected_telegram = [
             ("Midnight", "void", "midnight", "HUMAN", (0, 1, 2), 10),
@@ -136,7 +139,7 @@ class AutopostingRubricTests(unittest.TestCase):
         prompt = build_prompt("observation", "ATTENTION", platform="vk")
         self.assertIn("PLATFORM: vk", prompt)
         self.assertIn("VK public page", prompt)
-        self.assertIn("visual-first post", prompt)
+        self.assertIn("one-cover post", prompt)
         self.assertNotIn("editor of the VOID Telegram channel", prompt)
 
     def test_character_core_is_a_lens_not_a_mandatory_thesis(self) -> None:
@@ -144,6 +147,73 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertIn("Do not force every post back to digital noise", VOID_CORE_PROMPT)
         self.assertNotIn("The center is the human inside the digital world", VOID_CORE_PROMPT)
         self.assertIn("one concrete subject", VOID_CORE_PROMPT)
+        self.assertNotIn("main editorial territory", VOID_CORE_PROMPT)
+
+    def test_ai_news_relevance_uses_boundaries_and_broad_segment_names(self) -> None:
+        self.assertFalse(
+            main.is_ai_segment_news_item(
+                "A new business model for travel agents",
+                "No machine intelligence is involved.",
+            )
+        )
+        self.assertFalse(main.is_ai_segment_news_item("Claude Monet retrospective"))
+        self.assertFalse(main.is_ai_segment_news_item("A fashion show on the runway"))
+        for title in (
+            "GPT-5 changes long-context evaluation",
+            "xAI releases Grok update",
+            "Sora and Veo reshape generative video",
+            "DeepSeek and Mistral publish new reasoning systems",
+            "ElevenLabs adds a voice model",
+        ):
+            with self.subTest(title=title):
+                self.assertTrue(main.is_ai_segment_news_item(title))
+
+    def test_ai_news_priority_keeps_adjacent_fallback(self) -> None:
+        items = [
+            {
+                "title": "A city changes its music festival policy",
+                "summary": "culture and people",
+                "url": "https://example.test/adjacent",
+                "score": 9,
+            },
+            {
+                "title": "Runway releases a generative video model",
+                "summary": "new controls for filmmakers",
+                "url": "https://example.test/ai",
+                "score": 2,
+            },
+            {
+                "title": "Artists renegotiate streaming royalties",
+                "summary": "Creators and music labels revise their agreement.",
+                "url": "https://example.test/creators",
+                "score": 8,
+            },
+            {
+                "title": "Factory workers test a new automation tool",
+                "summary": "The workplace trial changes one routine.",
+                "url": "https://example.test/work",
+                "score": 7,
+            },
+            {
+                "title": "A weekend rail trip through the old city",
+                "summary": "Travel notes, cafés and architecture.",
+                "url": "https://example.test/travel",
+                "score": 20,
+            },
+        ]
+        ranked = main.prioritize_ai_news_items(items)
+        self.assertEqual(ranked[0]["url"], "https://example.test/ai")
+        self.assertEqual(len(ranked), 3)
+        self.assertNotIn(
+            "https://example.test/travel",
+            {item["url"] for item in ranked},
+        )
+        self.assertIn(
+            "ai_video",
+            main.ai_semantic_themes_for_news(
+                ranked[0]["title"], ranked[0]["summary"]
+            ),
+        )
 
     def test_semantic_themes_follow_a_full_deterministic_cycle(self) -> None:
         recent: list[dict[str, str]] = []
@@ -192,8 +262,8 @@ class AutopostingRubricTests(unittest.TestCase):
             self.assertEqual(len(cards), 3)
             self.assertTrue(all(card["thought"] and card["moral"] for card in cards))
             all_keys.extend(card["key"] for card in cards)
-        self.assertEqual(len(all_keys), 36)
-        self.assertEqual(len(set(all_keys)), 36)
+        self.assertEqual(len(all_keys), 3 * len(SEMANTIC_THEME_ORDER))
+        self.assertEqual(len(set(all_keys)), len(all_keys))
 
     def test_unpublished_draft_does_not_advance_any_editorial_axis(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -496,7 +566,7 @@ class AutopostingRubricTests(unittest.TestCase):
         self.assertEqual(MATERIAL_RUBRIC["track_rotation"], "full_catalog_lru")
         self.assertEqual(MATERIAL_RUBRIC["shared_track_rotation"], "full_catalog_lru")
 
-    def test_vk_producer_accepts_four_material_frames_and_shared_history(self) -> None:
+    def test_vk_producer_uses_one_cover_and_shared_history(self) -> None:
         draft = {
             "id": 121,
             "mode": "material",
@@ -508,8 +578,9 @@ class AutopostingRubricTests(unittest.TestCase):
         with (
             patch("void_vk_producer.main.get_draft", return_value=draft),
             patch("void_vk_producer.main.quality_check", return_value=(True, "ok")),
-            patch("void_vk_producer.main.generate_post_images_sync", return_value=[b"1", b"2", b"3", b"4"]),
+            patch("void_vk_producer.main.generate_post_images_sync", return_value=[b"1"]) as generate_images,
             patch("void_vk_producer.recent_track_keys", return_value=[f"old {index}" for index in range(8)]) as recent,
+            patch("void_vk_producer.unavailable_track_keys", return_value=["missing track"]) as unavailable,
             patch("void_vk_producer.main.choose_vk_music_track", return_value=track) as choose,
             patch("void_vk_producer.build_job", return_value={"job_id": "material"}),
             patch("void_vk_producer.enqueue_job", return_value=Path("queued")) as enqueue,
@@ -518,10 +589,13 @@ class AutopostingRubricTests(unittest.TestCase):
             result = void_vk_producer.enqueue_draft(121)
 
         self.assertEqual(result, Path("queued"))
+        generate_images.assert_called_once_with(draft, max_images=1)
         recent.assert_called_once_with(void_vk_producer.QUEUE_DIR, limit=None)
+        unavailable.assert_called_once_with(void_vk_producer.QUEUE_DIR)
         self.assertEqual(choose.call_args.kwargs["excluded_track_keys"], [f"old {index}" for index in range(8)])
+        self.assertEqual(choose.call_args.kwargs["unavailable_track_keys"], ["missing track"])
         media = enqueue.call_args.args[2]
-        self.assertEqual(tuple(media), ("image-1.png", "image-2.png", "image-3.png", "image-4.png"))
+        self.assertEqual(tuple(media), ("image-1.png",))
         record_enqueue.assert_called_once_with(121, "material")
 
     def test_vk_music_selection_uses_lru_after_full_catalog_cycle(self) -> None:
@@ -887,6 +961,64 @@ class ScheduledSemanticDiversityTests(unittest.IsolatedAsyncioTestCase):
                 key_meanings=("первый смысл", "второй смысл", "третий смысл"),
             ),
         }
+
+    async def test_news_rubric_keeps_adjacent_source_when_no_ai_item_matches(self) -> None:
+        news_row = dict(
+            next(item for item in RUBRIC_SCHEDULE if item["mode"] == "news")
+        )
+        adjacent = {
+            "title": "A music platform changes creator royalties",
+            "summary": "Artists and listeners react to a new policy.",
+            "url": "https://example.test/creator-policy",
+            "source_name": "Example",
+            "frequency": "HUMAN",
+            "score": 4,
+            "mode": "observation",
+        }
+        with patch("main.fetch_news", return_value=[adjacent]):
+            rubrics, sources, _, _ = await main.scheduled_inputs(
+                [news_row],
+                now=datetime(2026, 8, 8, 12, 0),
+            )
+        self.assertEqual(len(rubrics), 1)
+        self.assertEqual(len(sources), 1)
+        self.assertEqual(sources[0]["source_ref"], adjacent["url"])
+        self.assertEqual(
+            sources[0]["semantic_themes"],
+            ("creators", "music"),
+        )
+        runtime = void_editorial_catalog.build_context(
+            platform="vk",
+            slot="12:00",
+            seed="adjacent-news",
+            rubric_rows=rubrics,
+            source_rows=sources,
+            published_history=(),
+            character=character_state.CharacterState(),
+        )
+        plan = editorial_orchestrator.plan_release(runtime)
+        self.assertIn(plan.semantic_theme, sources[0]["semantic_themes"])
+        self.assertFalse(plan.semantic_theme.startswith("ai_"))
+        self.assertFalse(plan.semantic_card.startswith("ai_"))
+
+    async def test_irrelevant_rss_item_cannot_receive_a_random_ai_card(self) -> None:
+        irrelevant = {
+            "title": "A weekend rail trip through the old city",
+            "summary": "Travel notes, cafés and architecture.",
+            "url": "https://example.test/travel",
+            "source_name": "Example",
+            "frequency": "HUMAN",
+            "score": 1,
+            "mode": "news",
+        }
+        with patch("main.fetch_news", return_value=[irrelevant]):
+            rubrics, sources, _, _ = await main.scheduled_inputs(
+                RUBRIC_SCHEDULE,
+                now=datetime(2026, 8, 8, 12, 0),
+            )
+        self.assertNotIn("news", {row["mode"] for row in rubrics})
+        self.assertNotIn(irrelevant["url"], {row["source_ref"] for row in sources})
+        self.assertTrue(sources)
 
     async def test_bounded_retry_stops_after_two_rejected_candidates(self) -> None:
         with (

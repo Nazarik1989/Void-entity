@@ -146,6 +146,27 @@ class SettingsTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "exactly one"):
                 Settings.from_env()
 
+    def test_welcome_env_requires_copy_and_decodes_literal_newlines(self) -> None:
+        environment = {
+            "VK_COMMUNITY_BOT_ENABLED": "true",
+            "VK_COMMUNITY_BOT_GROUP_ID": "237593988",
+            "VK_COMMUNITY_ALLOWED_GROUP_IDS": "237593988",
+            "VK_GROUP_ACCESS_TOKEN": "secret",
+            "VK_COMMUNITY_WELCOME_ENABLED": "true",
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(ValueError, "WELCOME_TEXT"):
+                Settings.from_env()
+            os.environ["VK_COMMUNITY_WELCOME_TEXT"] = (
+                "VOID // first door\\nhttps://t.me/voidsignv1s"
+            )
+            settings = Settings.from_env()
+        self.assertTrue(settings.welcome_enabled)
+        self.assertEqual(
+            settings.welcome_text,
+            "VOID // first door\nhttps://t.me/voidsignv1s",
+        )
+
 
 class NormalizationTests(unittest.TestCase):
     def test_accepts_only_private_inbound_message_for_allowlisted_group(self) -> None:
@@ -174,6 +195,24 @@ class NormalizationTests(unittest.TestCase):
                 message_update(user_id=7, text="123456789"), settings
             )
             self.assertEqual(accepted.text, "12345")
+
+    def test_welcome_candidate_keeps_dialog_access_separate_from_allowlist(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(
+                Path(folder),
+                allowed_user_ids=frozenset({7}),
+                welcome_enabled=True,
+                welcome_text="VOID // welcome",
+            )
+            accepted = normalize_message(message_update(user_id=8), settings)
+            self.assertIsNotNone(accepted)
+            self.assertEqual(accepted.event_kind, "private_message")
+            self.assertFalse(accepted.dialog_allowed)
+            self.assertTrue(accepted.welcome_eligible)
+            pilot = normalize_message(message_update(user_id=7), settings)
+            self.assertIsNotNone(pilot)
+            self.assertTrue(pilot.dialog_allowed)
+            self.assertTrue(pilot.welcome_eligible)
 
     def test_public_wall_comment_requires_feature_and_direct_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -327,6 +366,140 @@ class EventStoreTests(unittest.TestCase):
             self.assertIsNone(store.claim_next(now=102))
             self.assertEqual(store.counts()["done"], 1)
 
+    def test_welcome_ingress_is_deduplicated_per_user_not_only_event(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = EventStore(Path(folder) / "events.sqlite3")
+            first = InboundMessage(
+                "welcome-1", 237593988, 99, 99, "hello", {},
+                dialog_allowed=False,
+                welcome_eligible=True,
+            )
+            second = InboundMessage(
+                "welcome-2", 237593988, 99, 99, "hello again", {},
+                dialog_allowed=False,
+                welcome_eligible=True,
+            )
+
+            self.assertEqual(store.ingest([first, second], now=100), 1)
+            claimed = store.claim_next(now=100)
+            self.assertEqual(claimed.event_id, "welcome-1")
+            self.assertEqual(claimed.event_kind, "welcome_message")
+            with closing(sqlite3.connect(store.path)) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM vk_community_contacts WHERE user_id=99"
+                    ).fetchone()[0],
+                    "pending",
+                )
+            store.complete_welcome("welcome-1", 99, now=101)
+            self.assertEqual(store.ingest([second], now=102), 0)
+            with closing(sqlite3.connect(store.path)) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM vk_community_contacts WHERE user_id=99"
+                    ).fetchone()[0],
+                    "sent",
+                )
+
+    def test_existing_private_user_is_backfilled_as_sent_on_schema_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "events.sqlite3"
+            with closing(sqlite3.connect(path)) as connection, connection:
+                connection.execute(
+                    """
+                    CREATE TABLE vk_community_events (
+                        event_id TEXT PRIMARY KEY,
+                        group_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL,
+                        text TEXT NOT NULL,
+                        raw_json TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'pending',
+                        response_text TEXT NOT NULL DEFAULT '',
+                        attempts INTEGER NOT NULL DEFAULT 0,
+                        received_at REAL NOT NULL,
+                        claimed_at REAL,
+                        next_attempt_at REAL NOT NULL,
+                        completed_at REAL,
+                        last_error TEXT NOT NULL DEFAULT ''
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    INSERT INTO vk_community_events(
+                        event_id, group_id, user_id, text, raw_json, status,
+                        received_at, next_attempt_at, completed_at
+                    ) VALUES('legacy', 237593988, 77, 'old', ?, 'done', 10, 10, 11)
+                    """,
+                    (
+                        json.dumps(
+                            {
+                                "event_id": "legacy",
+                                "group_id": 237593988,
+                                "peer_id": 77,
+                                "user_id": 77,
+                            }
+                        ),
+                    ),
+                )
+
+            store = EventStore(path)
+            inbound = InboundMessage(
+                "new", 237593988, 77, 77, "still here", {},
+                welcome_eligible=True,
+            )
+            self.assertEqual(store.ingest([inbound], now=20), 1)
+            claimed = store.claim_next(now=20)
+            self.assertEqual(claimed.event_kind, "private_message")
+            with closing(sqlite3.connect(path)) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM vk_community_contacts WHERE user_id=77"
+                    ).fetchone()[0],
+                    "sent",
+                )
+
+    def test_event_id_collision_does_not_create_a_phantom_sent_contact(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = EventStore(Path(folder) / "events.sqlite3")
+            with closing(sqlite3.connect(store.path)) as connection, connection:
+                connection.execute(
+                    """
+                    INSERT INTO vk_community_events(
+                        event_id, group_id, user_id, text, raw_json, status,
+                        received_at, next_attempt_at, completed_at
+                    ) VALUES('collision', 237593988, 1, 'public', ?, 'done', 1, 1, 1)
+                    """,
+                    (
+                        json.dumps(
+                            {
+                                "event_id": "collision",
+                                "event_kind": "wall_comment",
+                                "group_id": 237593988,
+                                "peer_id": 1,
+                                "user_id": 1,
+                            }
+                        ),
+                    ),
+                )
+            collided = InboundMessage(
+                "collision", 237593988, 88, 88, "hello", {},
+                welcome_eligible=True,
+            )
+            retry = InboundMessage(
+                "unique", 237593988, 88, 88, "hello again", {},
+                welcome_eligible=True,
+            )
+            self.assertEqual(store.ingest([collided], now=10), 0)
+            with closing(sqlite3.connect(store.path)) as connection:
+                self.assertIsNone(
+                    connection.execute(
+                        "SELECT status FROM vk_community_contacts WHERE user_id=88"
+                    ).fetchone()
+                )
+            self.assertEqual(store.ingest([retry], now=11), 1)
+            self.assertEqual(store.claim_next(now=11).event_kind, "welcome_message")
+
     def test_public_routing_is_minimal_durable_and_claimable(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
@@ -359,6 +532,26 @@ class EventStoreTests(unittest.TestCase):
             store.save_response("event", "durable reply")
             recovered = store.claim_next(now=400, lease_seconds=300)
             self.assertEqual(recovered.response_text, "durable reply")
+
+    def test_failure_after_completion_cannot_resurrect_a_done_event(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = EventStore(Path(folder) / "events.sqlite3")
+            inbound = InboundMessage("event", 237593988, 42, 42, "hello", {})
+            store.ingest([inbound], now=10)
+            store.claim_next(now=10)
+            store.complete("event", now=11)
+            self.assertEqual(
+                store.fail(
+                    "event",
+                    "HealthWriteError",
+                    max_attempts=1,
+                    retry_base_seconds=1,
+                    now=12,
+                ),
+                "done",
+            )
+            self.assertEqual(store.counts()["done"], 1)
+            self.assertEqual(store.counts()["dead"], 0)
 
     def test_rate_limit_is_persistent_per_user(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
@@ -538,6 +731,138 @@ class FailOnceCommentTransport(FakeTransport):
 
 
 class CommunityBotTests(unittest.IsolatedAsyncioTestCase):
+    async def test_closed_user_gets_one_static_welcome_but_never_ai(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = make_settings(
+                root,
+                allowed_user_ids=frozenset({7}),
+                welcome_enabled=True,
+                welcome_text="VOID // choose a door: https://example.test",
+            )
+            store = EventStore(settings.state_db_path)
+            transport = FakeTransport()
+            generate = AsyncMock(return_value="must not be used")
+            bot = CommunityBot(settings, store, generate, transport=transport)
+
+            first = message_update(event_id="first", user_id=8)
+            second = message_update(event_id="second", user_id=8, text="again")
+            self.assertEqual(bot.ingest_updates([first, second]), 1)
+            self.assertTrue(await bot.process_one())
+            self.assertFalse(await bot.process_one())
+            generate.assert_not_awaited()
+            self.assertEqual(
+                transport.sent[0][:2],
+                (8, "VOID // choose a door: https://example.test"),
+            )
+            self.assertEqual(
+                bot.ingest_updates(
+                    [message_update(event_id="third", user_id=8, text="still there")]
+                ),
+                0,
+            )
+            self.assertFalse(await bot.process_one())
+            generate.assert_not_awaited()
+
+    async def test_open_and_allowlisted_users_get_welcome_then_normal_dialog(self) -> None:
+        cases = (
+            ("open", frozenset(), 42),
+            ("allowlisted", frozenset({7}), 7),
+        )
+        for label, allowed_user_ids, user_id in cases:
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                settings = make_settings(
+                    root,
+                    allowed_user_ids=allowed_user_ids,
+                    welcome_enabled=True,
+                    welcome_text="VOID // welcome",
+                )
+                store = EventStore(settings.state_db_path)
+                transport = FakeTransport()
+                generate = AsyncMock(return_value="ordinary reply")
+                bot = CommunityBot(settings, store, generate, transport=transport)
+
+                self.assertEqual(
+                    bot.ingest_updates(
+                        [message_update(event_id="first", user_id=user_id)]
+                    ),
+                    1,
+                )
+                self.assertTrue(await bot.process_one())
+                generate.assert_not_awaited()
+                self.assertEqual(transport.sent[0][:2], (user_id, "VOID // welcome"))
+
+                self.assertEqual(
+                    bot.ingest_updates(
+                        [
+                            message_update(
+                                event_id="second",
+                                user_id=user_id,
+                                text="let's talk",
+                            )
+                        ]
+                    ),
+                    1,
+                )
+                self.assertTrue(await bot.process_one())
+                generate.assert_awaited_once_with(
+                    user_id,
+                    "let's talk",
+                    "private_message",
+                    "",
+                )
+                self.assertEqual(transport.sent[1][:2], (user_id, "ordinary reply"))
+
+    async def test_dead_welcome_recovers_with_same_vk_random_id(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            settings = make_settings(
+                root,
+                welcome_enabled=True,
+                welcome_text="VOID // durable welcome",
+                max_attempts=1,
+            )
+            store = EventStore(settings.state_db_path)
+            transport = FailOnceTransport()
+            generate = AsyncMock(return_value="must not be used")
+            bot = CommunityBot(settings, store, generate, transport=transport)
+
+            self.assertEqual(
+                bot.ingest_updates([message_update(event_id="welcome-dead")]),
+                1,
+            )
+            self.assertTrue(await bot.process_one())
+            self.assertEqual(store.counts()["dead"], 1)
+            with closing(sqlite3.connect(store.path)) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM vk_community_contacts WHERE user_id=42"
+                    ).fetchone()[0],
+                    "pending",
+                )
+
+            self.assertEqual(
+                bot.ingest_updates(
+                    [message_update(event_id="new-signal", text="try again")]
+                ),
+                1,
+            )
+            self.assertTrue(await bot.process_one())
+            self.assertEqual(transport.sent[0], transport.sent[1])
+            self.assertEqual(
+                transport.sent[1][2],
+                bot.random_id("welcome-dead"),
+            )
+            generate.assert_not_awaited()
+            with closing(sqlite3.connect(store.path)) as connection:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT status FROM vk_community_contacts WHERE user_id=42"
+                    ).fetchone()[0],
+                    "sent",
+                )
+
     async def test_processing_reuses_generator_and_never_exposes_wall_method(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)

@@ -2,10 +2,11 @@ import json
 import os
 import sys
 import tempfile
+import types
 import unittest
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import Mock, call, patch
+from unittest.mock import MagicMock, Mock, call, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
@@ -23,6 +24,7 @@ from vk_publish_queue import (
     TRACK_HISTORY_BACKFILL_MARKER,
     TRACK_HISTORY_CHECKPOINT_SCHEMA,
     _backfill_full_track_history,
+    _replace_job_track_query,
     build_job,
     canonical_job_id,
     consume_once,
@@ -30,6 +32,7 @@ from vk_publish_queue import (
     publication_receipts,
     recent_track_keys,
     requeue_failed,
+    unavailable_track_keys,
     validate_job,
 )
 from vk_queue_consumer import (
@@ -53,9 +56,11 @@ from vk_queue_consumer import (
     _attach_track,
     _authentication_required,
     _click_first_text,
+    _clear_saved_composer_attachments,
     _confirm_track_attached,
     _inspect_unresolved_publication,
     _locator_or_ancestor_audio_matches,
+    _load_publication_attempt,
     _open_audio_picker,
     _open_composer,
     _open_composer_once,
@@ -63,6 +68,7 @@ from vk_queue_consumer import (
     _publish_and_confirm,
     _published_post_evidence,
     _record_admin_notice,
+    _record_publication_attempt,
     _reconcile_confirmed_unresolved,
     _unresolved_publication_attempt,
     _wait_for_publication_confirmation,
@@ -723,40 +729,464 @@ class VkPublishQueueTests(unittest.TestCase):
             ["durable history track"],
         )
 
-    def test_missing_vk_track_stays_pending_for_safe_retry(self):
-        directory = self.enqueue(self.job(dedupe_key="retry-track"))
+    def test_missing_vk_track_is_replaced_for_the_next_safe_timer(self):
+        entries = (
+            ("faithless sobersoul", "Faithless Sobersoul"),
+            ("next artist next track", "Next Artist Next Track"),
+            ("third artist third track", "Third Artist Third Track"),
+        )
+        catalog = frozenset(key for key, _query in entries)
+        with (
+            patch(
+                "vk_publish_queue._void_track_catalog_keys",
+                return_value=catalog,
+            ),
+            patch(
+                "vk_publish_queue._void_track_catalog_entries",
+                return_value=entries,
+            ),
+        ):
+            directory = self.enqueue(self.job(dedupe_key="retry-track"))
+            publish = Mock(
+                side_effect=RetryablePublishError("no matching VK audio result")
+            )
+
+            self.assertEqual(
+                consume_once(self.root, self.group, publish),
+                0,
+            )
+
+            pending = self.root / "pending" / directory.name
+            self.assertTrue(pending.is_dir())
+            self.assertFalse((pending / "retry.txt").exists())
+            self.assertFalse((pending / RETRY_STATE_FILENAME).exists())
+            self.assertEqual(
+                validate_job(pending, self.group)["track_query"],
+                "Next Artist Next Track",
+            )
+            self.assertFalse((self.root / "done" / directory.name).exists())
+            self.assertFalse((self.root / "failed" / directory.name).exists())
+            self.assertEqual(publication_receipts(self.root), [])
+            self.assertEqual(recent_track_keys(self.root, limit=None), [])
+
+            publish.reset_mock()
+            publish.side_effect = None
+            self.assertEqual(
+                consume_once(self.root, self.group, publish),
+                0,
+            )
+        published_job = publish.call_args.args[0]
+        self.assertNotIn("_skip_audio", published_job)
+        self.assertEqual(published_job["track_query"], "Next Artist Next Track")
+        self.assertTrue((self.root / "done" / directory.name).is_dir())
+        self.assertEqual(len(publication_receipts(self.root)), 1)
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["next artist next track"],
+        )
+        self.assertEqual(
+            unavailable_track_keys(self.root),
+            ["faithless sobersoul"],
+        )
+
+    def test_failed_atomic_track_replacement_preserves_original_job(self):
+        directory = self.enqueue(
+            self.job(dedupe_key="atomic-track-replacement")
+        )
+
+        with (
+            patch(
+                "vk_publish_queue.os.replace",
+                side_effect=OSError("simulated atomic rename failure"),
+            ),
+            self.assertRaisesRegex(OSError, "atomic rename failure"),
+        ):
+            _replace_job_track_query(
+                directory,
+                self.group,
+                "Next Artist Next Track",
+            )
+
+        self.assertEqual(
+            validate_job(directory, self.group)["track_query"],
+            "Faithless Sobersoul",
+        )
+        self.assertEqual(
+            list(directory.glob(".job.json.track-*")),
+            [],
+        )
+
+    def test_crash_after_atomic_replacement_discards_stale_audio_backoff(self):
+        entries = (
+            ("faithless sobersoul", "Faithless Sobersoul"),
+            ("next artist next track", "Next Artist Next Track"),
+        )
+        catalog = frozenset(key for key, _query in entries)
+        with patch(
+            "vk_publish_queue._void_track_catalog_keys",
+            return_value=catalog,
+        ):
+            directory = self.enqueue(
+                self.job(dedupe_key="replacement-before-marker-cleanup")
+            )
+        (self.root / "unavailable-tracks.json").write_text(
+            json.dumps({"tracks": [{"key": "faithless sobersoul"}]}),
+            encoding="utf-8",
+        )
+        timestamp = "2026-08-01T12:00:00Z"
+        (directory / RETRY_STATE_FILENAME).write_text(
+            json.dumps(
+                {
+                    "schema": "vk_publish_retry.v2",
+                    "attempts": 1,
+                    "error_code": "vk_audio_no_match",
+                    "unavailable_track_queries": ["faithless sobersoul"],
+                    "first_failed_at": timestamp,
+                    "last_failed_at": timestamp,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (directory / "retry.txt").write_text("stale", encoding="utf-8")
+        _replace_job_track_query(
+            directory,
+            self.group,
+            "Next Artist Next Track",
+        )
+        publish = Mock()
+
+        with (
+            patch(
+                "vk_publish_queue._void_track_catalog_keys",
+                return_value=catalog,
+            ),
+            patch(
+                "vk_publish_queue._void_track_catalog_entries",
+                return_value=entries,
+            ),
+        ):
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
+
+        self.assertEqual(
+            publish.call_args.args[0]["track_query"],
+            "Next Artist Next Track",
+        )
+        done = self.root / "done" / directory.name
+        self.assertFalse((done / RETRY_STATE_FILENAME).exists())
+        self.assertFalse((done / "retry.txt").exists())
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["next artist next track"],
+        )
+
+    def test_replacement_track_survives_a_later_composer_failure(self):
+        entries = (
+            ("faithless sobersoul", "Faithless Sobersoul"),
+            ("next artist next track", "Next Artist Next Track"),
+            ("third artist third track", "Third Artist Third Track"),
+        )
+        catalog = frozenset(key for key, _query in entries)
+        calls = 0
+
+        def publish(job, _media):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RetryablePublishError("no matching VK audio result")
+            self.assertNotIn("_skip_audio", job)
+            self.assertEqual(job["track_query"], "Next Artist Next Track")
+            if calls == 2:
+                raise RetryablePublishError("composer temporarily unavailable")
+
+        with (
+            patch(
+                "vk_publish_queue._void_track_catalog_keys",
+                return_value=catalog,
+            ),
+            patch(
+                "vk_publish_queue._void_track_catalog_entries",
+                return_value=entries,
+            ),
+        ):
+            directory = self.enqueue(
+                self.job(dedupe_key="durable-audio-replacement")
+            )
+            self.assertEqual(
+                consume_once(self.root, self.group, publish), 0
+            )
+            self.assertEqual(
+                consume_once(self.root, self.group, publish), RETRYABLE_EXIT_CODE
+            )
+            pending = self.root / "pending" / directory.name
+            self.assertEqual(
+                validate_job(pending, self.group)["track_query"],
+                "Next Artist Next Track",
+            )
+            retry_state = json.loads(
+                (pending / RETRY_STATE_FILENAME).read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                retry_state["unavailable_track_queries"],
+                [],
+            )
+            self.assertEqual(
+                retry_state["error_code"],
+                "vk_composer_unavailable",
+            )
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
+            self.assertEqual(calls, 2)
+            os.utime(pending / "retry.txt", (0, 0))
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
+
+        state = json.loads(
+            (self.root / "done" / directory.name / "job.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(calls, 3)
+        self.assertEqual(state["track_query"], "Next Artist Next Track")
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["next artist next track"],
+        )
+
+    def test_missing_track_promotion_wins_over_retry_exhaustion(self):
+        entries = (
+            ("faithless sobersoul", "Faithless Sobersoul"),
+            ("next artist next track", "Next Artist Next Track"),
+        )
+        catalog = frozenset(key for key, _query in entries)
+        with patch(
+            "vk_publish_queue._void_track_catalog_keys",
+            return_value=catalog,
+        ):
+            directory = self.enqueue(
+                self.job(dedupe_key="missing-at-retry-limit")
+            )
+        timestamp = "2026-08-01T12:00:00Z"
+        (directory / RETRY_STATE_FILENAME).write_text(
+            json.dumps(
+                {
+                    "schema": "vk_publish_retry.v2",
+                    "attempts": MAX_RETRY_ATTEMPTS - 1,
+                    "error_code": "vk_composer_unavailable",
+                    "unavailable_track_queries": [],
+                    "first_failed_at": timestamp,
+                    "last_failed_at": timestamp,
+                }
+            ),
+            encoding="utf-8",
+        )
+        retry_file = directory / "retry.txt"
+        retry_file.write_text("old retry", encoding="utf-8")
+        os.utime(retry_file, (0, 0))
         publish = Mock(
             side_effect=RetryablePublishError("no matching VK audio result")
         )
 
-        self.assertEqual(
-            consume_once(self.root, self.group, publish),
-            RETRYABLE_EXIT_CODE,
-        )
+        with (
+            patch(
+                "vk_publish_queue._void_track_catalog_keys",
+                return_value=catalog,
+            ),
+            patch(
+                "vk_publish_queue._void_track_catalog_entries",
+                return_value=entries,
+            ),
+        ):
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
 
         pending = self.root / "pending" / directory.name
         self.assertTrue(pending.is_dir())
-        self.assertTrue((pending / "retry.txt").is_file())
-        retry_state = json.loads(
-            (pending / RETRY_STATE_FILENAME).read_text(encoding="utf-8")
-        )
-        self.assertEqual(retry_state["attempts"], 1)
-        self.assertEqual(retry_state["error_code"], "vk_audio_no_match")
-        self.assertFalse((self.root / "done" / directory.name).exists())
         self.assertFalse((self.root / "failed" / directory.name).exists())
-        self.assertEqual(publication_receipts(self.root), [])
-
-        publish.reset_mock()
+        self.assertFalse((pending / RETRY_STATE_FILENAME).exists())
         self.assertEqual(
-            consume_once(self.root, self.group, publish),
-            RETRYABLE_EXIT_CODE,
+            validate_job(pending, self.group)["track_query"],
+            "Next Artist Next Track",
         )
-        publish.assert_not_called()
+
+    def test_legacy_audio_retry_state_migrates_to_durable_replacement(self):
+        entries = (
+            ("faithless sobersoul", "Faithless Sobersoul"),
+            ("next artist next track", "Next Artist Next Track"),
+        )
+        catalog = frozenset(key for key, _query in entries)
+        with patch(
+            "vk_publish_queue._void_track_catalog_keys",
+            return_value=catalog,
+        ):
+            directory = self.enqueue(
+                self.job(dedupe_key="legacy-audio-replacement")
+            )
+        timestamp = "2026-08-01T12:00:00Z"
+        (directory / RETRY_STATE_FILENAME).write_text(
+            json.dumps(
+                {
+                    "schema": "vk_publish_retry.v1",
+                    "attempts": 10,
+                    "error_code": "vk_audio_no_match",
+                    "first_failed_at": timestamp,
+                    "last_failed_at": timestamp,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (directory / "retry.txt").write_text("legacy", encoding="utf-8")
+        publish = Mock()
+
+        with (
+            patch(
+                "vk_publish_queue._void_track_catalog_keys",
+                return_value=catalog,
+            ),
+            patch(
+                "vk_publish_queue._void_track_catalog_entries",
+                return_value=entries,
+            ),
+        ):
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
+            publish.assert_not_called()
+            pending = self.root / "pending" / directory.name
+            self.assertEqual(
+                validate_job(pending, self.group)["track_query"],
+                "Next Artist Next Track",
+            )
+            self.assertFalse((pending / RETRY_STATE_FILENAME).exists())
+            self.assertFalse((pending / "retry.txt").exists())
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
+
+        self.assertEqual(
+            publish.call_args.args[0]["track_query"],
+            "Next Artist Next Track",
+        )
+        self.assertNotIn("_skip_audio", publish.call_args.args[0])
+        self.assertEqual(
+            unavailable_track_keys(self.root),
+            ["faithless sobersoul"],
+        )
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["next artist next track"],
+        )
+
+    def test_durable_track_quarantine_replaces_track_after_retry_reset(self):
+        entries = (
+            ("faithless sobersoul", "Faithless Sobersoul"),
+            ("next artist next track", "Next Artist Next Track"),
+        )
+        catalog = frozenset(key for key, _query in entries)
+        with patch(
+            "vk_publish_queue._void_track_catalog_keys",
+            return_value=catalog,
+        ):
+            directory = self.enqueue(
+                self.job(dedupe_key="quarantine-without-retry-marker")
+            )
+        (self.root / "unavailable-tracks.json").write_text(
+            json.dumps({"tracks": [{"key": "faithless sobersoul"}]}),
+            encoding="utf-8",
+        )
+        publish = Mock()
+
+        with (
+            patch(
+                "vk_publish_queue._void_track_catalog_keys",
+                return_value=catalog,
+            ),
+            patch(
+                "vk_publish_queue._void_track_catalog_entries",
+                return_value=entries,
+            ),
+        ):
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
+            publish.assert_not_called()
+            self.assertEqual(
+                validate_job(
+                    self.root / "pending" / directory.name,
+                    self.group,
+                )["track_query"],
+                "Next Artist Next Track",
+            )
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
+
+        self.assertEqual(
+            publish.call_args.args[0]["track_query"],
+            "Next Artist Next Track",
+        )
+        self.assertTrue((self.root / "done" / directory.name).is_dir())
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["next artist next track"],
+        )
+
+    def test_replaced_job_ignores_stale_missing_track_marker_after_crash(self):
+        entries = (
+            ("faithless sobersoul", "Faithless Sobersoul"),
+            ("next artist next track", "Next Artist Next Track"),
+        )
+        catalog = frozenset(key for key, _query in entries)
+        with patch(
+            "vk_publish_queue._void_track_catalog_keys",
+            return_value=catalog,
+        ):
+            directory = self.enqueue(
+                self.job(dedupe_key="replacement-crash-window")
+            )
+        (self.root / "unavailable-tracks.json").write_text(
+            json.dumps({"tracks": [{"key": "faithless sobersoul"}]}),
+            encoding="utf-8",
+        )
+        _replace_job_track_query(
+            directory,
+            self.group,
+            "Next Artist Next Track",
+        )
+        timestamp = "2026-08-01T12:00:00Z"
+        (directory / RETRY_STATE_FILENAME).write_text(
+            json.dumps(
+                {
+                    "schema": "vk_publish_retry.v2",
+                    "attempts": 1,
+                    "error_code": "vk_audio_no_match",
+                    "unavailable_track_queries": ["faithless sobersoul"],
+                    "first_failed_at": timestamp,
+                    "last_failed_at": timestamp,
+                }
+            ),
+            encoding="utf-8",
+        )
+        (directory / "retry.txt").write_text("fresh retry", encoding="utf-8")
+        publish = Mock()
+
+        with (
+            patch(
+                "vk_publish_queue._void_track_catalog_keys",
+                return_value=catalog,
+            ),
+            patch(
+                "vk_publish_queue._void_track_catalog_entries",
+                return_value=entries,
+            ),
+        ):
+            self.assertEqual(consume_once(self.root, self.group, publish), 0)
+
+        publish.assert_called_once()
+        self.assertEqual(
+            publish.call_args.args[0]["track_query"],
+            "Next Artist Next Track",
+        )
+        done = self.root / "done" / directory.name
+        self.assertTrue(done.is_dir())
+        self.assertFalse((done / RETRY_STATE_FILENAME).exists())
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["next artist next track"],
+        )
 
     def test_retry_counter_does_not_reset_when_failure_class_changes(self):
         directory = self.enqueue(self.job(dedupe_key="retry-class-change"))
         first = Mock(
-            side_effect=RetryablePublishError("no matching VK audio result")
+            side_effect=RetryablePublishError("audio search input is unavailable")
         )
         self.assertEqual(
             consume_once(self.root, self.group, first),
@@ -838,7 +1268,7 @@ class VkPublishQueueTests(unittest.TestCase):
     def test_retry_exhaustion_quarantines_job_and_admin_requeue_resets_state(self):
         job = self.job(dedupe_key="retry-exhausted")
         directory = self.enqueue(job)
-        publish = Mock(side_effect=RetryablePublishError("no matching VK audio result"))
+        publish = Mock(side_effect=RetryablePublishError("composer temporarily unavailable"))
 
         for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
             expected = 1 if attempt == MAX_RETRY_ATTEMPTS else RETRYABLE_EXIT_CODE
@@ -875,6 +1305,52 @@ class VkPublishQueueTests(unittest.TestCase):
                 call(self.root),
             ],
         )
+
+    def test_void_rotation_rolls_over_across_only_available_catalog_tracks(self):
+        catalog = frozenset(
+            {
+                "rotation track a",
+                "rotation track b",
+                "rotation track unavailable",
+            }
+        )
+        (self.root / "recent-tracks.json").write_text(
+            json.dumps(
+                {
+                    "tracks": [
+                        {"key": "rotation track a"},
+                        {"key": "rotation track b"},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.root / "unavailable-tracks.json").write_text(
+            json.dumps(
+                {"tracks": [{"key": "rotation track unavailable"}]}
+            ),
+            encoding="utf-8",
+        )
+
+        with patch(
+            "vk_publish_queue._void_track_catalog_keys",
+            return_value=catalog,
+        ):
+            oldest = self.job(
+                dedupe_key="available-rollover-oldest",
+                track_query="Rotation Track A",
+            )
+            self.enqueue(oldest)
+
+            still_recent = self.job(
+                dedupe_key="available-rollover-recent",
+                track_query="Rotation Track B",
+            )
+            with self.assertRaisesRegex(
+                DuplicateTrackError,
+                "other 1 available",
+            ):
+                self.enqueue(still_recent)
 
     def test_receipt_recovers_track_history_after_post_publish_write_failure(self):
         job = self.job(
@@ -1507,8 +1983,107 @@ class VkPublishQueueTests(unittest.TestCase):
         ):
             _reconcile_confirmed_unresolved(job)
 
-        self.assertEqual(record.call_args, call(self.root, job))
+        self.assertEqual(
+            record.call_args,
+            call(self.root, job),
+        )
         resolve.assert_called_once_with()
+
+    def test_replacement_attempt_is_inspected_and_reconciled_with_audio(self):
+        job = self.job(dedupe_key="replacement-inspect-reconcile")
+        directory = self.enqueue(job)
+        replacement = "NVTION PVNIC Back to Life"
+        replaced_job = _replace_job_track_query(
+            directory,
+            self.group,
+            replacement,
+        )
+        self.assertEqual(replaced_job["track_query"], replacement)
+        (self.root / "unavailable-tracks.json").write_text(
+            json.dumps({"tracks": [{"key": "faithless sobersoul"}]}),
+            encoding="utf-8",
+        )
+        failed = self.root / "failed"
+        failed.mkdir(exist_ok=True)
+        os.replace(directory, failed / directory.name)
+        profile = self.root / "profile"
+        profile.mkdir()
+
+        candidates = Mock()
+        candidates.count.return_value = 0
+        page = Mock()
+        page.get_by_text.return_value = candidates
+        page.evaluate.return_value = []
+        context = Mock()
+        context.new_page.return_value = page
+        browser_api = Mock()
+        browser_api.chromium.launch_persistent_context.return_value = context
+        playwright_manager = MagicMock()
+        playwright_manager.__enter__.return_value = browser_api
+        playwright_manager.__exit__.return_value = False
+        playwright_package = types.ModuleType("playwright")
+        playwright_package.__path__ = []
+        playwright_sync_api = types.ModuleType("playwright.sync_api")
+        playwright_sync_api.sync_playwright = Mock(
+            return_value=playwright_manager
+        )
+        playwright_package.sync_api = playwright_sync_api
+        evidence = _PublicationEvidence(
+            frozenset({"wall:-237593988_991"}),
+            0,
+            frozenset({"wall:-237593988_991"}),
+        )
+
+        with (
+            patch("vk_queue_consumer.QUEUE_DIR", self.root),
+            patch("vk_queue_consumer.PROFILE_DIR", profile),
+            patch("vk_queue_consumer.GROUP_ID", self.group),
+            patch.dict(
+                sys.modules,
+                {
+                    "playwright": playwright_package,
+                    "playwright.sync_api": playwright_sync_api,
+                },
+            ),
+            patch(
+                "vk_queue_consumer.allowed_community_url",
+                return_value="https://vk.com/club237593988",
+            ),
+            patch("vk_queue_consumer._authentication_required", return_value=False),
+            patch(
+                "vk_queue_consumer._published_post_evidence",
+                return_value=evidence,
+            ) as published_evidence,
+        ):
+            _record_publication_attempt(job["job_id"])
+            self.assertEqual(
+                _load_publication_attempt()["schema"],
+                "vk_publication_attempt.v1",
+            )
+            self.assertEqual(
+                _inspect_unresolved_publication(reconcile_confirmed=True),
+                0,
+            )
+
+        self.assertEqual(published_evidence.call_args.args[2], replacement)
+        self.assertNotIn("require_audio", published_evidence.call_args.kwargs)
+        self.assertFalse((self.root / PUBLICATION_ATTEMPT_FILENAME).exists())
+        receipts = publication_receipts(self.root)
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(recent_track_keys(self.root, limit=None), [])
+        self.assertEqual(
+            unavailable_track_keys(self.root),
+            ["faithless sobersoul"],
+        )
+
+        publish = Mock()
+        self.assertEqual(consume_once(self.root, self.group, publish), 0)
+        publish.assert_not_called()
+        self.assertTrue((self.root / "done" / job["job_id"]).is_dir())
+        self.assertEqual(
+            recent_track_keys(self.root, limit=None),
+            ["nvtion pvnic back to life"],
+        )
 
     def test_audio_trigger_diagnostics_contains_only_sanitized_testids(self):
         page = Mock()
@@ -1692,6 +2267,149 @@ class VkPublishQueueTests(unittest.TestCase):
                 previous_match_count=1,
                 timeout=0,
             )
+
+    def test_saved_composer_attachments_are_removed_before_retry_upload(self):
+        editor = Mock()
+        editor.input_value.return_value = "post"
+        remove = Mock()
+        remove.is_visible.return_value = True
+        item = Mock()
+        item.is_visible.return_value = True
+        items = Mock()
+        items.count.side_effect = [1, 0, 0]
+        items.nth.return_value = item
+        controls = Mock()
+        controls.count.return_value = 1
+        controls.nth.return_value = remove
+        scope = Mock()
+        scope.locator.side_effect = lambda selector: (
+            items if selector == '[data-testid="posting_attachment_item"]' else controls
+        )
+        page = Mock()
+
+        with (
+            patch("vk_queue_consumer._first_visible", return_value=scope),
+            patch("vk_queue_consumer._post_input", return_value=editor),
+        ):
+            self.assertEqual(
+                _clear_saved_composer_attachments(
+                    page,
+                    managed_texts=frozenset({"post"}),
+                    job_id="void-1234567890abcdef12345678",
+                ),
+                1,
+            )
+
+        remove.click.assert_called_once_with(
+            timeout=5_000,
+            force=True,
+            no_wait_after=True,
+        )
+
+    def test_hidden_remove_control_is_revealed_by_hover_before_cleanup(self):
+        editor = Mock()
+        editor.input_value.return_value = "post"
+        remove = Mock()
+        remove.is_visible.side_effect = [False, True]
+        item = Mock()
+        item.is_visible.return_value = True
+        items = Mock()
+        items.count.side_effect = [1, 0, 0]
+        items.nth.return_value = item
+        controls = Mock()
+        controls.count.return_value = 1
+        controls.nth.return_value = remove
+        scope = Mock()
+        scope.locator.side_effect = lambda selector: (
+            items if selector == '[data-testid="posting_attachment_item"]' else controls
+        )
+        page = Mock()
+
+        with (
+            patch("vk_queue_consumer._first_visible", return_value=scope),
+            patch("vk_queue_consumer._post_input", return_value=editor),
+        ):
+            self.assertEqual(
+                _clear_saved_composer_attachments(
+                    page,
+                    managed_texts=frozenset({"post"}),
+                    job_id="void-1234567890abcdef12345678",
+                ),
+                1,
+            )
+
+        item.hover.assert_called_once_with(timeout=3_000, force=True)
+        remove.click.assert_called_once()
+
+    def test_cleanup_fails_closed_when_attachment_item_does_not_disappear(self):
+        editor = Mock()
+        editor.input_value.return_value = "post"
+        remove = Mock()
+        remove.is_visible.return_value = True
+        item = Mock()
+        item.is_visible.return_value = True
+        items = Mock()
+        items.count.return_value = 1
+        items.nth.return_value = item
+        controls = Mock()
+        controls.count.return_value = 1
+        controls.nth.return_value = remove
+        scope = Mock()
+        scope.locator.side_effect = lambda selector: (
+            items if selector == '[data-testid="posting_attachment_item"]' else controls
+        )
+
+        with (
+            patch("vk_queue_consumer._first_visible", return_value=scope),
+            patch("vk_queue_consumer._post_input", return_value=editor),
+            self.assertRaisesRegex(RetryablePublishError, "did not disappear"),
+        ):
+            _clear_saved_composer_attachments(
+                Mock(),
+                managed_texts=frozenset({"post"}),
+                job_id="void-1234567890abcdef12345678",
+                removal_timeout=0,
+            )
+
+        remove.click.assert_called_once()
+
+    def test_missing_composer_attachment_scope_is_retryable(self):
+        with (
+            patch("vk_queue_consumer._first_visible", return_value=None),
+            self.assertRaisesRegex(RetryablePublishError, "attachment scope"),
+        ):
+            _clear_saved_composer_attachments(
+                Mock(),
+                managed_texts=frozenset({"post"}),
+                job_id="void-1234567890abcdef12345678",
+            )
+
+    def test_unmanaged_saved_composer_draft_is_never_overwritten(self):
+        editor = Mock()
+        editor.input_value.return_value = "manual administrator draft"
+        item = Mock()
+        item.is_visible.return_value = True
+        items = Mock()
+        items.count.return_value = 1
+        items.nth.return_value = item
+        scope = Mock()
+        scope.locator.return_value = items
+        with (
+            patch("vk_queue_consumer._first_visible", return_value=scope),
+            patch("vk_queue_consumer._post_input", return_value=editor),
+            patch("vk_queue_consumer._record_admin_notice") as notice,
+            self.assertRaisesRegex(VkComposerStructureError, "unmanaged"),
+        ):
+            _clear_saved_composer_attachments(
+                Mock(),
+                managed_texts=frozenset({"current queue post"}),
+                job_id="void-1234567890abcdef12345678",
+            )
+        notice.assert_called_once_with(
+            "void-1234567890abcdef12345678",
+            "vk_unmanaged_saved_composer_draft",
+        )
+        item.hover.assert_not_called()
 
     def test_published_post_evidence_requires_text_and_matching_audio(self):
         matching_audio = Mock()

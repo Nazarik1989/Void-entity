@@ -338,6 +338,9 @@ VOID_TOPICS = {
     "AI": [
         "ai", "artificial intelligence", "openai", "llm", "chatgpt", "model",
         "agent", "agents", "automation", "neural", "dataset", "robot",
+        "machine learning", "deepmind", "anthropic", "claude", "gemini",
+        "generative video", "text-to-video", "image generation", "diffusion",
+        "synthetic media", "voice model", "speech model", "computer vision",
     ],
     "ATTENTION": [
         "attention", "feed", "scroll", "social media", "algorithm", "screen time",
@@ -356,6 +359,170 @@ VOID_TOPICS = {
         "space", "battery", "chip", "compute", "research",
     ],
 }
+
+
+AI_UNAMBIGUOUS_TERMS = (
+    "artificial intelligence", "generative ai", "machine learning",
+    "artificial general intelligence", "large language model", "language model",
+    "reasoning model", "foundation model", "neural network", "multimodal",
+    "computer vision", "text-to-video", "generative video", "image generation",
+    "voice cloning", "voice model", "speech model", "synthetic media",
+    "ai agent", "agentic", "computer use", "robotics", "humanoid robot",
+    "openai", "chatgpt", "anthropic", "deepmind", "gpt", "xai", "deepseek",
+    "qwen", "midjourney", "elevenlabs",
+    "stable diffusion", "hugging face", "llm", "agi",
+)
+AI_CONTEXTUAL_BRANDS = (
+    "claude", "gemini", "grok", "mistral", "llama", "perplexity",
+    "sora", "veo", "runway",
+)
+AI_CONTEXT_CUES = (
+    "model", "chatbot", "assistant", "reasoning", "benchmark", "tokens",
+    "context window", "multimodal", "api", "agent", "video generation",
+    "image generation", "voice generation", "released", "launches", "update",
+)
+AI_NEWS_THEME_TERMS: dict[str, tuple[str, ...]] = {
+    "ai_models": (
+        "language model", "reasoning model", "foundation model", "llm", "gpt",
+        "chatgpt", "claude", "gemini", "grok", "xai",
+        "deepseek", "mistral", "qwen", "llama", "perplexity", "reasoning",
+        "benchmark", "evaluation", "context window", "training", "multimodal",
+    ),
+    "ai_agents": (
+        "agent", "agentic", "automation", "computer use", "copilot", "assistant",
+        "workflow", "orchestration", "autonomous",
+    ),
+    "ai_video": (
+        "video", "cinema", "film", "filmmaking", "sora", "veo", "runway",
+        "text-to-video", "virtual production",
+    ),
+    "ai_audio": (
+        "audio", "voice", "speech", "music", "song", "sound", "dubbing",
+        "elevenlabs", "voice cloning",
+    ),
+    "ai_images": (
+        "image", "photo", "photography", "design", "illustration", "midjourney",
+        "diffusion", "visual art",
+    ),
+    "ai_devices": (
+        "robot", "robotics", "humanoid", "device", "wearable", "sensor",
+        "autonomous car", "self-driving", "drone",
+    ),
+    "ai_science": (
+        "science", "research", "medicine", "medical", "health", "drug",
+        "biology", "education", "school", "student", "teacher",
+    ),
+    "ai_power": (
+        "copyright", "regulation", "law", "lawsuit", "safety", "surveillance",
+        "privacy", "labor", "job", "compute", "chip", "nvidia", "data center",
+        "energy", "policy", "platform", "antitrust",
+    ),
+}
+ADJACENT_NEWS_THEME_TERMS: dict[str, tuple[str, ...]] = {
+    "future_practice": (
+        "automation", "robot", "device", "wearable", "interface", "chip",
+        "compute", "research tool", "digital product",
+    ),
+    "creators": (
+        "creator", "artist", "designer", "filmmaker", "copyright", "royalties",
+        "creative work", "audience",
+    ),
+    "work": (
+        "work", "job", "labor", "workplace", "profession", "worker",
+    ),
+    "music": (
+        "music", "song", "album", "sound", "festival", "streaming", "playlist",
+    ),
+    "play": (
+        "game", "gaming", "film", "cinema", "performance", "fandom",
+    ),
+    "absurdity": (
+        "user interface", "social platform", "recommendation algorithm",
+        "content moderation", "terms of service",
+    ),
+}
+
+
+def _bounded_term_present(value: str, term: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?<![0-9a-z_]){re.escape(term.casefold())}(?![0-9a-z_])",
+            value,
+        )
+    )
+
+
+def ai_news_relevance_score(title: str, summary: str = "") -> int:
+    """Return a boundary-safe AI relevance score for sourced editorial ranking."""
+    value = f"{title} {summary}".casefold()
+    standalone_ai = bool(re.search(r"(?<![0-9a-z_])ai(?![0-9a-z_])", value))
+    strong_matches = sum(
+        _bounded_term_present(value, term) for term in AI_UNAMBIGUOUS_TERMS
+    )
+    contextual_matches = sum(
+        _bounded_term_present(value, term) for term in AI_CONTEXTUAL_BRANDS
+    )
+    has_context_cue = any(
+        _bounded_term_present(value, term) for term in AI_CONTEXT_CUES
+    )
+    contextual_score = (
+        contextual_matches * 2
+        if contextual_matches >= 2 or has_context_cue or standalone_ai or strong_matches
+        else 0
+    )
+    return (5 if standalone_ai else 0) + strong_matches * 2 + contextual_score
+
+
+def is_ai_segment_news_item(title: str, summary: str = "") -> bool:
+    return ai_news_relevance_score(title, summary) > 0
+
+
+def ai_semantic_themes_for_news(title: str, summary: str = "") -> tuple[str, ...]:
+    value = f"{title} {summary}".casefold()
+    relevance = ai_news_relevance_score(title, summary)
+    theme_terms = (
+        AI_NEWS_THEME_TERMS if relevance > 0 else ADJACENT_NEWS_THEME_TERMS
+    )
+    themes = tuple(
+        theme
+        for theme, terms in theme_terms.items()
+        if any(_bounded_term_present(value, term) for term in terms)
+    )
+    if themes:
+        return themes
+    if relevance > 0:
+        return ("ai_models",)
+    return ()
+
+
+def prioritize_ai_news_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return all AI items followed by at most two classified adjacent sources."""
+    indexed = list(enumerate(items))
+    ai_items = []
+    adjacent_items = []
+    for pair in indexed:
+        item = pair[1]
+        title = str(item.get("title") or "")
+        summary = str(item.get("summary") or "")
+        if ai_news_relevance_score(title, summary) > 0:
+            ai_items.append(pair)
+        elif ai_semantic_themes_for_news(title, summary):
+            adjacent_items.append(pair)
+
+    ai_items.sort(
+        key=lambda pair: (
+            -ai_news_relevance_score(
+                str(pair[1].get("title") or ""),
+                str(pair[1].get("summary") or ""),
+            ),
+            -int(pair[1].get("score", 0) or 0),
+            pair[0],
+        )
+    )
+    adjacent_items.sort(
+        key=lambda pair: (-int(pair[1].get("score", 0) or 0), pair[0])
+    )
+    return [item for _, item in (*ai_items, *adjacent_items[:2])]
 
 def build_rubric_header(mode: str, frequency: str = "HUMAN") -> str:
     base = MODE_RUBRICS.get(mode, "SIGNAL")
@@ -2612,13 +2779,21 @@ def image_visual_directions(draft_id: int, count: int, mode: str = "") -> list[s
     return directions
 
 
-def build_image_prompts_sync(draft: dict | sqlite3.Row) -> list[str]:
+def build_image_prompts_sync(
+    draft: dict | sqlite3.Row,
+    *,
+    max_images: int | None = None,
+) -> list[str]:
     draft_id = int(draft["id"] or 0)
     mode = draft["mode"] or "news"
     title = draft["title"] or "VOID signal"
     post = draft["post"] or ""
     source_name = draft["source_name"] or ""
     count = image_count_for_draft(mode, post)
+    if max_images is not None:
+        if max_images <= 0:
+            return []
+        count = min(count, max_images)
     raw_plan = str(draft["editorial_plan_json"] or "") if "editorial_plan_json" in draft.keys() else ""
     raw_package = str(draft["generation_package_json"] or "") if "generation_package_json" in draft.keys() else ""
     if raw_plan and raw_package:
@@ -2721,11 +2896,15 @@ Rules:
     ]
 
 
-def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
+def generate_post_images_sync(
+    draft: dict | sqlite3.Row,
+    *,
+    max_images: int | None = None,
+) -> list[bytes]:
     client = openai_client()
     images: list[bytes] = []
 
-    for prompt in build_image_prompts_sync(draft):
+    for prompt in build_image_prompts_sync(draft, max_images=max_images):
         try:
             response = client.images.generate(
                 model=OPENAI_IMAGE_MODEL,
@@ -3998,6 +4177,7 @@ def _ordered_track_history(values: Iterable[str]) -> list[str]:
 def choose_vk_music_track(
     draft: dict | sqlite3.Row,
     excluded_track_keys: Iterable[str] | None = None,
+    unavailable_track_keys: Iterable[str] | None = None,
 ) -> dict[str, Any] | None:
     loaded_tracks = load_vk_music_tracks()
     tracks_by_key = {
@@ -4005,7 +4185,10 @@ def choose_vk_music_track(
         for track in loaded_tracks
         if vk_music_track_query_key(track)
     }
-    tracks = list(tracks_by_key.values())
+    unavailable = set(_ordered_track_history(unavailable_track_keys or ()))
+    tracks = [
+        track for key, track in tracks_by_key.items() if key not in unavailable
+    ]
     if not tracks:
         return None
 
@@ -4854,6 +5037,27 @@ def scheduled_package_quality_check(
         return False, "internal_metadata"
     if package.visual_relation_to_thesis.casefold() in {"n/a", "none", "unrelated"}:
         return False, "visual_relevance"
+    length_match = re.fullmatch(
+        r"\s*(\d+)\s*-\s*(\d+)\s+characters\s*",
+        str(plan.length),
+        flags=re.IGNORECASE,
+    )
+    if length_match:
+        planned_min, planned_max = map(int, length_match.groups())
+        if planned_min > planned_max:
+            return False, "planned_length_invalid"
+        final_text = package.final_text.strip()
+        exact_source_line = f"Источник: {plan.source_ref}"
+        body = (
+            final_text[: -len(exact_source_line)].rstrip()
+            if final_text.endswith(exact_source_line)
+            else final_text
+        )
+        actual_length = len(body)
+        lower_bound = max(250, round(planned_min * 0.90))
+        upper_bound = round(planned_max * 1.10)
+        if actual_length < lower_bound or actual_length > upper_bound:
+            return False, "planned_length"
     return True, "ok"
 
 
@@ -4873,7 +5077,7 @@ async def generate_scheduled_package(
         prompt = editorial_orchestrator.generation_prompt(
             plan,
             persona_direction=(
-                f"{void_editorial_catalog.persona_direction(character)} "
+                f"{void_editorial_catalog.persona_direction(character, plan.mode)} "
                 "The publishable final_text must end with this exact source line: "
                 f"{source_line}"
             ),
@@ -4898,6 +5102,9 @@ async def generate_scheduled_package(
             raise ScheduledTechnicalFailure("generation_package_invalid_twice") from exc
         ok, reason = scheduled_package_quality_check(plan, package)
         if not ok:
+            if attempt == 0:
+                technical_reason = f"content_validation:{reason}"[:160]
+                continue
             raise ScheduledContentReject(reason)
         return package
     raise ScheduledTechnicalFailure("generation_package_unavailable")
@@ -4924,18 +5131,27 @@ async def scheduled_inputs(
         rubric_rows.append(row)
         if str(row.get("voice") or "void") == "news":
             if news_items is None:
-                news_items = await asyncio.to_thread(fetch_news)
+                fetched_news = await asyncio.to_thread(fetch_news)
+                news_items = prioritize_ai_news_items(fetched_news)
             for item in news_items[:10]:
                 ref = str(item.get("url") or "")
                 if not ref:
                     continue
+                title = str(item.get("title") or "")
+                summary = str(item.get("summary") or "")
+                relevance = ai_news_relevance_score(title, summary)
+                semantic_themes = ai_semantic_themes_for_news(title, summary)
+                if not semantic_themes:
+                    continue
                 source_rows.append(
                     {
                         "source_ref": ref,
-                        "topic": str(item.get("title") or row["brief"]),
+                        "topic": title or str(row["brief"]),
                         "source_type": "documented_source",
                         "rubric_keys": (key,),
                         "source_verified": ref.startswith("http"),
+                        "semantic_themes": semantic_themes,
+                        "weight": 1 + min(8, relevance),
                     }
                 )
                 source_items[ref] = item

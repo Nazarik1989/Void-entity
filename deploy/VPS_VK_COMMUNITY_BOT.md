@@ -30,6 +30,14 @@ The allowlist applies to both private messages and public wall activity. Public
 replies additionally require `VK_COMMUNITY_PUBLIC_REPLIES_ENABLED=true`; plain
 comments without a question or direct VOID invocation remain untouched.
 
+`VK_COMMUNITY_WELCOME_ENABLED=true` enables one static first-contact message for
+every new private writer, independently of the dialogue allowlist. Put the
+reviewed copy and HTTPS destinations in `VK_COMMUNITY_WELCOME_TEXT`, encoding
+line breaks as `\n`. Delivery uses the inbound event's stable `random_id`; the
+contact becomes `sent` only after VK accepts `messages.send`. Existing private
+correspondents are backfilled as already known during migration, and a closed
+user receives the welcome without gaining model access.
+
 ## Safe installation
 
 The VPS runs immutable release directories. Install the base unit and an exact

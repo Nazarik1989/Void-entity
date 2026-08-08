@@ -179,6 +179,15 @@ AUTH_SELECTORS = (
     '[data-testid="login_form"]',
     '[data-testid="login_button"]',
 )
+COMPOSER_SCOPE_SELECTORS = (
+    '[data-testid="posting_modal_box"]',
+    '[role="dialog"][data-testid*="posting"]',
+)
+COMPOSER_ATTACHMENT_REMOVE_SELECTOR = (
+    '[data-testid="posting_attachment_photo_item_remove"], '
+    '[data-testid^="posting_attachment_"][data-testid$="_remove"]'
+)
+COMPOSER_ATTACHMENT_ITEM_SELECTOR = '[data-testid="posting_attachment_item"]'
 
 
 class VkAuthenticationRequiredError(RuntimeError):
@@ -443,6 +452,188 @@ def _post_input(page: Any) -> Any:
     if candidate is not None:
         return candidate
     raise VkComposerStructureError("VK post editor input not found")
+
+
+def _composer_saved_text(editor: Any) -> str:
+    for method_name in ("input_value", "inner_text", "text_content"):
+        try:
+            value = getattr(editor, method_name)(timeout=2_000)
+        except Exception:
+            continue
+        if isinstance(value, str) and value.strip():
+            return _normalized_visible_text(value)
+    return ""
+
+
+def _visible_attachment_items(scope: Any, *, limit: int = 60) -> list[Any]:
+    try:
+        items = scope.locator(COMPOSER_ATTACHMENT_ITEM_SELECTOR)
+        count = min(int(items.count()), limit)
+    except Exception as exc:
+        raise RetryablePublishError(
+            "VK composer attachment items are unavailable; retry later"
+        ) from exc
+    visible: list[Any] = []
+    for index in range(count):
+        item = items.nth(index)
+        try:
+            if item.is_visible():
+                visible.append(item)
+        except Exception as exc:
+            raise RetryablePublishError(
+                "VK composer attachment item detached; retry later"
+            ) from exc
+    return visible
+
+
+def _wait_for_attachment_reduction(
+    page: Any,
+    scope: Any,
+    before: int,
+    *,
+    timeout: int,
+) -> list[Any]:
+    deadline = time.monotonic() + max(0, timeout) / 1000
+    while True:
+        attachments = _visible_attachment_items(scope)
+        if len(attachments) < before:
+            return attachments
+        if time.monotonic() >= deadline:
+            raise RetryablePublishError(
+                "VK saved composer attachment did not disappear; retry later"
+            )
+        page.wait_for_timeout(250)
+
+
+def _managed_saved_draft_texts(job: dict[str, Any]) -> frozenset[str]:
+    texts = {_normalized_visible_text(job["text"])}
+    for state in ("pending", "processing", "failed"):
+        state_root = QUEUE_DIR / state
+        if not state_root.is_dir() or state_root.is_symlink():
+            continue
+        for job_dir in state_root.iterdir():
+            if job_dir.is_symlink() or not job_dir.is_dir():
+                continue
+            try:
+                queued = validate_job(job_dir, GROUP_ID)
+            except Exception:
+                continue
+            text = _normalized_visible_text(str(queued.get("text") or ""))
+            if text:
+                texts.add(text)
+    return frozenset(texts)
+
+
+def _clear_saved_composer_attachments(
+    page: Any,
+    *,
+    managed_texts: frozenset[str],
+    job_id: str,
+    limit: int = 50,
+    removal_timeout: int = 5_000,
+) -> int:
+    """Remove attachments restored by VK from an unfinished composer draft.
+
+    VK persists a draft after a failed music lookup.  Without this cleanup,
+    every retry uploads the same image once more and eventually publishes a
+    carousel of clones.
+    """
+    scope = _first_visible(page, COMPOSER_SCOPE_SELECTORS)
+    if scope is None:
+        raise RetryablePublishError(
+            "VK composer attachment scope is unavailable; retry later"
+        )
+    editor = _post_input(page)
+    saved_text = _composer_saved_text(editor)
+    attachments = _visible_attachment_items(scope)
+    if (saved_text or attachments) and saved_text not in managed_texts:
+        _record_admin_notice(job_id, "vk_unmanaged_saved_composer_draft")
+        raise VkComposerStructureError(
+            "VK composer contains an unmanaged saved draft"
+        )
+
+    removed = 0
+    while attachments:
+        if removed >= limit:
+            raise RetryablePublishError(
+                "VK saved composer attachment cleanup exceeded safe limit"
+            )
+        candidate = None
+        try:
+            controls = scope.locator(COMPOSER_ATTACHMENT_REMOVE_SELECTOR)
+            count = min(int(controls.count()), limit)
+        except Exception as exc:
+            raise RetryablePublishError(
+                "VK saved composer attachments are unavailable; retry later"
+            ) from exc
+        for index in range(count):
+            current = controls.nth(index)
+            try:
+                if current.is_visible():
+                    candidate = current
+                    break
+            except Exception as exc:
+                raise RetryablePublishError(
+                    "VK saved composer attachment control detached; retry later"
+                ) from exc
+        if candidate is None:
+            try:
+                attachments[0].hover(timeout=3_000, force=True)
+                page.wait_for_timeout(150)
+                controls = scope.locator(COMPOSER_ATTACHMENT_REMOVE_SELECTOR)
+                for index in range(min(int(controls.count()), limit)):
+                    current = controls.nth(index)
+                    if current.is_visible():
+                        candidate = current
+                        break
+            except Exception as exc:
+                raise RetryablePublishError(
+                    "VK saved composer attachment controls are unavailable; retry later"
+                ) from exc
+        if candidate is None:
+            raise RetryablePublishError(
+                "VK saved composer attachment has no removable control; retry later"
+            )
+        before = len(attachments)
+        try:
+            candidate.click(timeout=5_000, force=True, no_wait_after=True)
+        except Exception as exc:
+            raise RetryablePublishError(
+                "VK saved composer attachment could not be removed; retry later"
+            ) from exc
+        removed += 1
+        attachments = _wait_for_attachment_reduction(
+            page,
+            scope,
+            before,
+            timeout=removal_timeout,
+        )
+    if _visible_attachment_items(scope):
+        raise RetryablePublishError(
+            "VK saved composer attachment cleanup was incomplete; retry later"
+        )
+    return removed
+
+
+def _wait_for_composer_attachment_count(
+    page: Any,
+    expected: int,
+    *,
+    timeout: int = 10_000,
+) -> None:
+    scope = _first_visible(page, COMPOSER_SCOPE_SELECTORS)
+    if scope is None:
+        raise RetryablePublishError(
+            "VK composer attachment scope is unavailable; retry later"
+        )
+    deadline = time.monotonic() + timeout / 1000
+    while time.monotonic() < deadline:
+        if len(_visible_attachment_items(scope)) == expected:
+            return
+        page.wait_for_timeout(250)
+    raise RetryablePublishError(
+        "VK composer attachment count did not match the queue job; retry later"
+    )
 
 
 def _tokens(value: str) -> set[str]:
@@ -940,7 +1131,7 @@ def _wait_for_publication_confirmation(
         else:
             page.wait_for_timeout(500)
     raise VkPublishConfirmationError(
-        "VK publish was attempted, but no new post with the requested audio was confirmed"
+        "VK publish was attempted, but no new post matching the job was confirmed"
     )
 
 
@@ -1169,7 +1360,9 @@ def publish_job(job: dict[str, Any], media: list[Path]) -> None:
             page.wait_for_timeout(2_500)
             try:
                 publication_before = _published_post_evidence(
-                    page, job["text"], job["track_query"]
+                    page,
+                    job["text"],
+                    job["track_query"],
                 )
             except Exception as exc:
                 raise RetryablePublishError(
@@ -1180,9 +1373,16 @@ def publish_job(job: dict[str, Any], media: list[Path]) -> None:
             except VkAuthenticationRequiredError:
                 _record_admin_notice(job["job_id"], "vk_session_authentication_required")
                 raise
+            _clear_saved_composer_attachments(
+                page,
+                managed_texts=_managed_saved_draft_texts(job),
+                job_id=job["job_id"],
+            )
+            _wait_for_composer_attachment_count(page, 0)
             if media:
                 page.locator("input[type=file]").last.set_input_files([str(path) for path in media])
                 page.wait_for_timeout(4_000)
+            _wait_for_composer_attachment_count(page, len(media))
             _post_input(page).fill(job["text"])
             page.wait_for_timeout(700)
             _click_first_text(page, (NEXT_TEXT,))
@@ -1249,10 +1449,19 @@ def consume_queue() -> int:
 
 
 def _reconcile_confirmed_unresolved(job: dict[str, Any]) -> None:
-    confirmed_ids = {
-        receipt["job_id"] for receipt in publication_receipts(QUEUE_DIR)
+    confirmed = {
+        receipt["job_id"]: receipt
+        for receipt in publication_receipts(QUEUE_DIR)
     }
-    if job["job_id"] not in confirmed_ids:
+    existing = confirmed.get(job["job_id"])
+    if existing is not None and (
+        existing["producer"] != job["producer"]
+        or existing["source_ref"] != job["source_ref"]
+    ):
+        raise RuntimeError(
+            "confirmed VK receipt does not match the unresolved attempt"
+        )
+    if existing is None:
         _record_publication_receipt(QUEUE_DIR, job)
     if _unresolved_publication_attempt():
         raise RuntimeError("confirmed VK receipt did not resolve publication marker")

@@ -77,6 +77,8 @@ class Settings:
     max_attempts: int
     retry_base_seconds: int
     processing_lease_seconds: int
+    welcome_enabled: bool = False
+    welcome_text: str = ""
 
     @classmethod
     def from_env(cls, *, require_token: bool = True) -> "Settings":
@@ -106,6 +108,18 @@ class Settings:
         token = os.getenv("VK_GROUP_ACCESS_TOKEN", "").strip()
         if require_token and not token:
             raise ValueError("VK_GROUP_ACCESS_TOKEN is required")
+        welcome_enabled = os.getenv(
+            "VK_COMMUNITY_WELCOME_ENABLED", "false"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        welcome_text = os.getenv("VK_COMMUNITY_WELCOME_TEXT", "").replace(
+            "\\n", "\n"
+        ).replace("\x00", "").strip()
+        if welcome_enabled and not welcome_text:
+            raise ValueError(
+                "VK_COMMUNITY_WELCOME_TEXT is required when welcome is enabled"
+            )
+        if len(welcome_text) > 4000:
+            raise ValueError("VK_COMMUNITY_WELCOME_TEXT is too long")
         return cls(
             enabled=enabled,
             group_id=group_id,
@@ -213,6 +227,8 @@ class Settings:
                     3600,
                 ),
             ),
+            welcome_enabled=welcome_enabled,
+            welcome_text=welcome_text,
         )
 
 
@@ -228,6 +244,8 @@ class InboundMessage:
     owner_id: int = 0
     post_id: int = 0
     comment_id: int = 0
+    dialog_allowed: bool = True
+    welcome_eligible: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,14 +298,27 @@ def normalize_message(
     # are outside this adapter's authority.
     if outgoing != 0 or user_id <= 0 or peer_id != user_id:
         return None
-    if settings.allowed_user_ids and user_id not in settings.allowed_user_ids:
+    dialog_allowed = (
+        not settings.allowed_user_ids or user_id in settings.allowed_user_ids
+    )
+    if not dialog_allowed and not settings.welcome_enabled:
         return None
     text = str(message.get("text") or "").replace("\x00", "").strip()
     if not text:
         return None
     text = text[: settings.max_text_chars]
     event_id = str(update.get("event_id") or "").strip() or _fallback_event_id(update)
-    return InboundMessage(event_id, group_id, user_id, peer_id, text, update)
+    return InboundMessage(
+        event_id,
+        group_id,
+        user_id,
+        peer_id,
+        text,
+        update,
+        event_kind="private_message",
+        dialog_allowed=dialog_allowed,
+        welcome_eligible=settings.welcome_enabled,
+    )
 
 
 PUBLIC_INVOCATIONS = frozenset(
@@ -509,6 +540,54 @@ class EventStore:
                 )
                 """
             )
+            contact_table_existed = connection.execute(
+                """
+                SELECT 1
+                FROM sqlite_master
+                WHERE type='table' AND name='vk_community_contacts'
+                """
+            ).fetchone() is not None
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS vk_community_contacts (
+                    user_id INTEGER PRIMARY KEY,
+                    first_seen_at REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'sent',
+                    welcome_event_id TEXT NOT NULL DEFAULT '',
+                    sent_at REAL
+                )
+                """
+            )
+            contact_columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(vk_community_contacts)"
+                ).fetchall()
+            }
+            contacts_need_backfill = not contact_table_existed
+            if "status" not in contact_columns:
+                connection.execute(
+                    "ALTER TABLE vk_community_contacts "
+                    "ADD COLUMN status TEXT NOT NULL DEFAULT 'sent'"
+                )
+                contacts_need_backfill = True
+            if "welcome_event_id" not in contact_columns:
+                connection.execute(
+                    "ALTER TABLE vk_community_contacts "
+                    "ADD COLUMN welcome_event_id TEXT NOT NULL DEFAULT ''"
+                )
+                contacts_need_backfill = True
+            if "sent_at" not in contact_columns:
+                connection.execute(
+                    "ALTER TABLE vk_community_contacts ADD COLUMN sent_at REAL"
+                )
+                contacts_need_backfill = True
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_vk_community_contacts_welcome
+                ON vk_community_contacts(status, welcome_event_id)
+                """
+            )
             rate_columns = {
                 str(row[1])
                 for row in connection.execute(
@@ -520,6 +599,51 @@ class EventStore:
                     "ALTER TABLE vk_community_rate_limits "
                     "ADD COLUMN notice_sent INTEGER NOT NULL DEFAULT 0"
                 )
+            if contacts_need_backfill:
+                # This table was introduced after private dialogue was already
+                # live. Treat every pre-migration private correspondent as
+                # welcomed so a restart or allowlist change cannot greet an
+                # existing user as if they were new.
+                connection.execute(
+                    """
+                    UPDATE vk_community_contacts
+                    SET status='sent', welcome_event_id='',
+                        sent_at=COALESCE(sent_at, first_seen_at)
+                    """
+                )
+                existing_events = connection.execute(
+                    """
+                    SELECT user_id, raw_json, received_at, completed_at
+                    FROM vk_community_events
+                    WHERE user_id > 0
+                    ORDER BY received_at, event_id
+                    """
+                ).fetchall()
+                for event in existing_events:
+                    try:
+                        routing = json.loads(str(event["raw_json"]))
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    if not isinstance(routing, Mapping):
+                        continue
+                    if str(routing.get("event_kind") or "private_message") != "private_message":
+                        continue
+                    first_seen_at = float(event["received_at"])
+                    sent_at = (
+                        float(event["completed_at"])
+                        if event["completed_at"] is not None
+                        else first_seen_at
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO vk_community_contacts(
+                            user_id, first_seen_at, status,
+                            welcome_event_id, sent_at
+                        ) VALUES(?, ?, 'sent', '', ?)
+                        ON CONFLICT(user_id) DO NOTHING
+                        """,
+                        (int(event["user_id"]), first_seen_at, sent_at),
+                    )
 
     def remember_post_contexts(
         self,
@@ -571,22 +695,28 @@ class EventStore:
             ).fetchone()
         return str(row["text"]) if row else ""
 
-    def ingest(self, messages: Sequence[InboundMessage], *, now: float | None = None) -> int:
+    def ingest(
+        self,
+        messages: Sequence[InboundMessage],
+        *,
+        now: float | None = None,
+    ) -> int:
         timestamp = time.time() if now is None else now
         inserted = 0
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
-            for message in messages:
+
+            def insert_event(message: InboundMessage, event_kind: str) -> int:
                 routing = {
                     "event_id": message.event_id,
                     "group_id": message.group_id,
                     "user_id": message.user_id,
                     "peer_id": message.peer_id,
                 }
-                if message.event_kind != "private_message":
+                if event_kind != "private_message":
                     routing.update(
                         {
-                            "event_kind": message.event_kind,
+                            "event_kind": event_kind,
                             "owner_id": message.owner_id,
                             "post_id": message.post_id,
                             "comment_id": message.comment_id,
@@ -612,7 +742,184 @@ class EventStore:
                         timestamp,
                     ),
                 )
-                inserted += cursor.rowcount
+                return int(cursor.rowcount)
+
+            for message in messages:
+                if message.event_kind not in {"private_message", "welcome_message"}:
+                    inserted += insert_event(message, message.event_kind)
+                    continue
+
+                welcome_candidate = (
+                    message.welcome_eligible
+                    or message.event_kind == "welcome_message"
+                )
+                contact = connection.execute(
+                    """
+                    SELECT status, welcome_event_id
+                    FROM vk_community_contacts
+                    WHERE user_id=?
+                    """,
+                    (message.user_id,),
+                ).fetchone()
+
+                if contact is not None and str(contact["status"]) == "pending":
+                    welcome_event_id = str(contact["welcome_event_id"] or "")
+                    pending_event = (
+                        connection.execute(
+                            """
+                            SELECT status, response_text
+                            FROM vk_community_events
+                            WHERE event_id=? AND user_id=?
+                            """,
+                            (welcome_event_id, message.user_id),
+                        ).fetchone()
+                        if welcome_event_id
+                        else None
+                    )
+                    if pending_event is not None and str(pending_event["status"]) == "dead":
+                        # A fresh inbound message is an explicit signal to retry a
+                        # previously exhausted welcome. Reuse the original event id
+                        # so VK sees the same idempotency key if the prior send was
+                        # accepted but its acknowledgement was lost.
+                        recovered = connection.execute(
+                            """
+                            UPDATE vk_community_events
+                            SET status=CASE
+                                    WHEN response_text='' THEN 'pending'
+                                    ELSE 'ready'
+                                END,
+                                attempts=0, claimed_at=NULL,
+                                next_attempt_at=?, last_error=''
+                            WHERE event_id=? AND user_id=? AND status='dead'
+                            """,
+                            (timestamp, welcome_event_id, message.user_id),
+                        )
+                        inserted += int(recovered.rowcount)
+                        continue
+                    if pending_event is not None and str(pending_event["status"]) == "done":
+                        # Repair a legacy or interrupted state conservatively: a
+                        # completed welcome must never be sent again.
+                        connection.execute(
+                            """
+                            UPDATE vk_community_contacts
+                            SET status='sent', sent_at=COALESCE(sent_at, ?)
+                            WHERE user_id=? AND status='pending'
+                            """,
+                            (timestamp, message.user_id),
+                        )
+                        contact = {"status": "sent", "welcome_event_id": welcome_event_id}
+                    elif pending_event is not None:
+                        continue
+                    else:
+                        # The linked event was removed or never committed. A new
+                        # event can safely take ownership of the pending contact.
+                        created = insert_event(message, "welcome_message")
+                        if created:
+                            connection.execute(
+                                """
+                                UPDATE vk_community_contacts
+                                SET welcome_event_id=?, first_seen_at=MIN(first_seen_at, ?)
+                                WHERE user_id=? AND status='pending'
+                                """,
+                                (message.event_id, timestamp, message.user_id),
+                            )
+                            inserted += created
+                        continue
+
+                if contact is None and welcome_candidate:
+                    created = insert_event(message, "welcome_message")
+                    if created:
+                        connection.execute(
+                            """
+                            INSERT INTO vk_community_contacts(
+                                user_id, first_seen_at, status,
+                                welcome_event_id, sent_at
+                            ) VALUES(?, ?, 'pending', ?, NULL)
+                            """,
+                            (message.user_id, timestamp, message.event_id),
+                        )
+                        inserted += created
+                        continue
+
+                    # Event ids are globally unique. Only adopt a collision when
+                    # it is demonstrably this user's existing welcome; otherwise
+                    # leave the contact unrecorded so their next update can retry.
+                    collision = connection.execute(
+                        """
+                        SELECT user_id, status, raw_json
+                        FROM vk_community_events
+                        WHERE event_id=?
+                        """,
+                        (message.event_id,),
+                    ).fetchone()
+                    if (
+                        collision is not None
+                        and int(collision["user_id"]) == message.user_id
+                    ):
+                        try:
+                            collision_routing = json.loads(str(collision["raw_json"]))
+                        except (json.JSONDecodeError, TypeError):
+                            collision_routing = {}
+                        collision_kind = (
+                            str(collision_routing.get("event_kind") or "private_message")
+                            if isinstance(collision_routing, Mapping)
+                            else ""
+                        )
+                        if collision_kind == "welcome_message":
+                            collision_status = str(collision["status"])
+                            contact_status = (
+                                "sent" if collision_status == "done" else "pending"
+                            )
+                            connection.execute(
+                                """
+                                INSERT INTO vk_community_contacts(
+                                    user_id, first_seen_at, status,
+                                    welcome_event_id, sent_at
+                                ) VALUES(?, ?, ?, ?, ?)
+                                """,
+                                (
+                                    message.user_id,
+                                    timestamp,
+                                    contact_status,
+                                    message.event_id,
+                                    timestamp if contact_status == "sent" else None,
+                                ),
+                            )
+                            if collision_status == "dead":
+                                recovered = connection.execute(
+                                    """
+                                    UPDATE vk_community_events
+                                    SET status=CASE
+                                            WHEN response_text='' THEN 'pending'
+                                            ELSE 'ready'
+                                        END,
+                                        attempts=0, claimed_at=NULL,
+                                        next_attempt_at=?, last_error=''
+                                    WHERE event_id=? AND user_id=? AND status='dead'
+                                    """,
+                                    (timestamp, message.event_id, message.user_id),
+                                )
+                                inserted += int(recovered.rowcount)
+                    continue
+
+                if contact is None:
+                    # Welcome is disabled. Remember the correspondent now so
+                    # enabling it later cannot reclassify an existing dialogue.
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO vk_community_contacts(
+                            user_id, first_seen_at, status,
+                            welcome_event_id, sent_at
+                        ) VALUES(?, ?, 'sent', '', ?)
+                        """,
+                        (message.user_id, timestamp, timestamp),
+                    )
+
+                if message.event_kind == "welcome_message":
+                    continue
+                if not message.dialog_allowed:
+                    continue
+                inserted += insert_event(message, "private_message")
         return inserted
 
     def claim_next(
@@ -659,7 +966,9 @@ class EventStore:
         if not isinstance(routing, Mapping):
             raise RuntimeError("stored VK event routing is invalid")
         event_kind = str(routing.get("event_kind") or "private_message")
-        if event_kind not in {"private_message", "wall_comment", "wall_post"}:
+        if event_kind not in {
+            "private_message", "welcome_message", "wall_comment", "wall_post"
+        }:
             raise RuntimeError("stored VK event kind is invalid")
         return QueuedEvent(
             event_id=str(row["event_id"]),
@@ -696,6 +1005,67 @@ class EventStore:
                 (timestamp, event_id),
             )
 
+    def complete_welcome(
+        self,
+        event_id: str,
+        user_id: int,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Atomically acknowledge a welcome only after ``messages.send``.
+
+        If VK accepted the request but this transaction fails, the queued event
+        remains retryable and keeps the same event id/random_id. VK can then
+        deduplicate the retry while this method repairs the local acknowledgement.
+        """
+
+        timestamp = time.time() if now is None else now
+        with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
+            event = connection.execute(
+                """
+                SELECT status, raw_json
+                FROM vk_community_events
+                WHERE event_id=? AND user_id=?
+                """,
+                (event_id, user_id),
+            ).fetchone()
+            if event is None:
+                raise RuntimeError("VK welcome event is missing")
+            try:
+                routing = json.loads(str(event["raw_json"]))
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise RuntimeError("stored VK welcome routing is invalid") from exc
+            if (
+                not isinstance(routing, Mapping)
+                or str(routing.get("event_kind") or "") != "welcome_message"
+            ):
+                raise RuntimeError("VK event is not a welcome")
+            if str(event["status"]) not in {"processing", "done"}:
+                raise RuntimeError("VK welcome event is not claimed")
+            connection.execute(
+                """
+                UPDATE vk_community_events
+                SET status='done', completed_at=?, claimed_at=NULL, last_error=''
+                WHERE event_id=? AND user_id=?
+                  AND status IN ('processing', 'done')
+                """,
+                (timestamp, event_id, user_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO vk_community_contacts(
+                    user_id, first_seen_at, status,
+                    welcome_event_id, sent_at
+                ) VALUES(?, ?, 'sent', ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    status='sent',
+                    welcome_event_id=excluded.welcome_event_id,
+                    sent_at=COALESCE(vk_community_contacts.sent_at, excluded.sent_at)
+                """,
+                (user_id, timestamp, event_id, timestamp),
+            )
+
     def fail(
         self,
         event_id: str,
@@ -709,11 +1079,17 @@ class EventStore:
         with closing(self._connect()) as connection, connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT attempts, response_text FROM vk_community_events WHERE event_id=?",
+                """
+                SELECT attempts, response_text, status
+                FROM vk_community_events
+                WHERE event_id=?
+                """,
                 (event_id,),
             ).fetchone()
             if row is None:
                 return "missing"
+            if str(row["status"]) != "processing":
+                return str(row["status"])
             attempts = int(row["attempts"]) + 1
             status = "dead" if attempts >= max_attempts else (
                 "ready" if row["response_text"] else "pending"
@@ -723,7 +1099,7 @@ class EventStore:
                 """
                 UPDATE vk_community_events
                 SET status=?, attempts=?, claimed_at=NULL, next_attempt_at=?, last_error=?
-                WHERE event_id=?
+                WHERE event_id=? AND status='processing'
                 """,
                 (status, attempts, timestamp + delay, error_kind[:120], event_id),
             )
@@ -996,12 +1372,17 @@ class CommunityBot:
         try:
             response_text = event.response_text
             if not response_text:
-                rate_decision = self.store.rate_decision(
-                    event.user_id,
-                    limit=self.settings.rate_limit_count,
-                    window_seconds=self.settings.rate_limit_window_seconds,
-                )
-                if rate_decision == "allow":
+                if event.event_kind == "welcome_message":
+                    response_text = self.settings.welcome_text
+                else:
+                    rate_decision = self.store.rate_decision(
+                        event.user_id,
+                        limit=self.settings.rate_limit_count,
+                        window_seconds=self.settings.rate_limit_window_seconds,
+                    )
+                if event.event_kind == "welcome_message":
+                    pass
+                elif rate_decision == "allow":
                     post_context = ""
                     if event.event_kind == "wall_post":
                         post_context = event.text
@@ -1037,7 +1418,7 @@ class CommunityBot:
                 response_text = (response_text or "").replace("\x00", "").strip()
                 if not response_text:
                     response_text = "Не успел сформулировать ответ. Попробуй ещё раз."
-                if event.event_kind == "private_message":
+                if event.event_kind in {"private_message", "welcome_message"}:
                     response_text = response_text[: self.settings.max_reply_chars]
                 else:
                     response_text = (
@@ -1046,7 +1427,7 @@ class CommunityBot:
                 self.store.save_response(event.event_id, response_text)
             if self.transport is None:  # pragma: no cover - run() always supplies it
                 raise RuntimeError("VK transport is unavailable")
-            if event.event_kind == "private_message":
+            if event.event_kind in {"private_message", "welcome_message"}:
                 await self.transport.send_message(
                     event.user_id,
                     response_text,
@@ -1063,7 +1444,10 @@ class CommunityBot:
                     response_text,
                     self.comment_guid(event.event_id),
                 )
-            self.store.complete(event.event_id)
+            if event.event_kind == "welcome_message":
+                self.store.complete_welcome(event.event_id, event.user_id)
+            else:
+                self.store.complete(event.event_id)
             self.last_event_at = time.time()
             self.write_health("running")
         except Exception as exc:
