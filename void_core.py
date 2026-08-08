@@ -820,7 +820,7 @@ RUBRIC_SCHEDULE = [
         "frequency": "HUMAN",
         "hours": [19, 20, 21, 22],
         "weight": 7,
-        "brief": "Evening AI culture with movement: generated video, cinema, images, music, voice, creators, taste, and one adult ironic turn.",
+        "brief": "Evening AI culture with movement: generated video, cinema, images, music, voice, creators, taste, and one concrete adult observation.",
     },
     {
         "name": "The Vault",
@@ -856,7 +856,7 @@ RUBRIC_SCHEDULE = [
         "frequency": "AI",
         "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
         "weight": 6,
-        "brief": "A short original VOID take on one concrete AI capability, product behavior, failure, or absurdity.",
+        "brief": "An original VOID take on one concrete AI capability, product behavior, failure, or absurdity.",
     },
     {
         "name": "News Signal",
@@ -870,70 +870,13 @@ RUBRIC_SCHEDULE = [
 ]
 
 
+# Telegram and VK intentionally share one editorial rubric matrix. Platform
+# differences belong to the platform context and publisher, not to a second
+# copy of the subject/tone schedule that can silently drift back to sameness.
+# Copy every row (and its mutable hours list) so tests or administrative code
+# cannot mutate one platform's runtime schedule through the other.
 TELEGRAM_VOID_SCHEDULE = [
-    {
-        "name": "Midnight",
-        "voice": "void",
-        "mode": "midnight",
-        "frequency": "HUMAN",
-        "hours": [0, 1, 2],
-        "weight": 10,
-        "brief": "Night-only VOID signal grounded in a specific room, task, route, sound, memory, encounter, or physical detail.",
-    },
-    {
-        "name": "Frequency",
-        "voice": "void",
-        "mode": "frequency",
-        "frequency": "HUMAN",
-        "hours": [19, 20, 21, 22],
-        "weight": 7,
-        "brief": "Evening music/culture signal: headphones, mood, memory, sound, city rhythm.",
-    },
-    {
-        "name": "The Vault",
-        "voice": "void",
-        "mode": "vault",
-        "frequency": "HUMAN",
-        "hours": [22, 23],
-        "weight": 4,
-        "brief": "A deeper thought for VOID memory. Quiet, saved, worth returning to.",
-    },
-    {
-        "name": "Observation",
-        "voice": "void",
-        "mode": "observation",
-        "frequency": "ATTENTION",
-        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-        "weight": 6,
-        "brief": "A precise observation grounded in one habit, place, object, ritual, craft, or encounter.",
-    },
-    {
-        "name": "Future File",
-        "voice": "void",
-        "mode": "future",
-        "frequency": "FUTURE",
-        "hours": [12, 13, 14, 15, 16, 17, 18],
-        "weight": 5,
-        "brief": "Future shift without hype: tools, interfaces, work, cities, creators, behavior.",
-    },
-    {
-        "name": "Signal",
-        "voice": "void",
-        "mode": "signal",
-        "frequency": "HUMAN",
-        "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-        "weight": 5,
-        "brief": "Short original VOID observation grounded in one concrete scene, object, action, or encounter.",
-    },
-    {
-        "name": "News Signal",
-        "voice": "news",
-        "mode": "news",
-        "frequency": "AI",
-        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-        "weight": 4,
-        "brief": "Fresh real-world signal from sources, only when there is something worth catching.",
-    },
+    {**row, "hours": list(row["hours"])} for row in RUBRIC_SCHEDULE
 ]
 
 

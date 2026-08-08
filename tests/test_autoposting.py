@@ -108,16 +108,6 @@ class AutopostingRubricTests(unittest.TestCase):
             ("Signal", "void", "signal", "AI", (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 6),
             ("News Signal", "news", "news", "AI", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19), 8),
         ]
-        expected_telegram = [
-            ("Midnight", "void", "midnight", "HUMAN", (0, 1, 2), 10),
-            ("Frequency", "void", "frequency", "HUMAN", (19, 20, 21, 22), 7),
-            ("The Vault", "void", "vault", "HUMAN", (22, 23), 4),
-            ("Observation", "void", "observation", "ATTENTION", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 6),
-            ("Future File", "void", "future", "FUTURE", (12, 13, 14, 15, 16, 17, 18), 5),
-            ("Signal", "void", "signal", "HUMAN", (8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18), 5),
-            ("News Signal", "news", "news", "AI", (9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19), 4),
-        ]
-
         def compact(schedule):
             return [
                 (item["name"], item["voice"], item["mode"], item["frequency"], tuple(item["hours"]), item["weight"])
@@ -125,9 +115,37 @@ class AutopostingRubricTests(unittest.TestCase):
             ]
 
         self.assertEqual(compact(RUBRIC_SCHEDULE), expected_rubrics)
-        self.assertEqual(compact(TELEGRAM_VOID_SCHEDULE), expected_telegram)
+        self.assertEqual(compact(TELEGRAM_VOID_SCHEDULE), expected_rubrics)
+        self.assertEqual(TELEGRAM_VOID_SCHEDULE, RUBRIC_SCHEDULE)
+        self.assertTrue(
+            all(
+                telegram is not vk and telegram["hours"] is not vk["hours"]
+                for telegram, vk in zip(TELEGRAM_VOID_SCHEDULE, RUBRIC_SCHEDULE)
+            )
+        )
         self.assertNotIn("material", {slot["mode"] for slot in CONTENT_PLAN})
         self.assertFalse(MATERIAL_RUBRIC["scheduled"])
+
+    def test_telegram_daytime_rubrics_keep_the_broad_ai_contract(self) -> None:
+        by_mode = {slot["mode"]: slot for slot in TELEGRAM_VOID_SCHEDULE}
+        self.assertEqual(by_mode["signal"]["frequency"], "AI")
+        self.assertNotIn("short", by_mode["signal"]["brief"].casefold())
+        self.assertNotIn("ironic turn", by_mode["frequency"]["brief"].casefold())
+        for mode in ("signal", "observation", "future", "frequency", "news"):
+            with self.subTest(mode=mode):
+                brief = by_mode[mode]["brief"].casefold()
+                self.assertTrue(
+                    any(
+                        marker in brief
+                        for marker in (
+                            "ai", "models", "agents", "video", "audio", "images"
+                        )
+                    ),
+                    brief,
+                )
+        for mode in ("midnight", "vault"):
+            with self.subTest(mode=mode):
+                self.assertEqual(by_mode[mode]["frequency"], "HUMAN")
 
     def test_content_plan_has_non_news_modes(self) -> None:
         modes = {slot["mode"] for slot in CONTENT_PLAN}

@@ -73,6 +73,10 @@ python main.py
 
 For Telegram publishing, add the bot to the target channel as an administrator. `CHANNEL_ID` may be a channel username; `ADMIN_ID` is the administrator’s numeric Telegram ID.
 Scheduled VOID posts use `Europe/Moscow`; configure exact daily slots with `VOID_TELEGRAM_AUTO_TIMES` (default: `12:00,16:00,20:00,00:00`).
+Telegram and VK scheduled releases share the same broad-AI rubric matrix and
+cooldowns for themes, structures, lengths, energy, and humor. `Midnight` and
+`The Vault` remain deliberately quieter night modes; platform-specific format
+and delivery are applied only after the shared editorial plan is selected.
 
 ## Main commands
 

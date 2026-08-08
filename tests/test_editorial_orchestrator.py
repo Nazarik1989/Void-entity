@@ -368,6 +368,43 @@ class EditorialOrchestratorTests(unittest.TestCase):
             self.assertEqual(plan.production_mode, "standard")
             history.append(plan.to_dict())
         self.assertEqual(len(history), 50)
+        day_plans = [
+            item
+            for item in history
+            if item["mode"] not in void_editorial_catalog.NIGHT_MODES
+        ]
+        night_plans = [
+            item
+            for item in history
+            if item["mode"] in void_editorial_catalog.NIGHT_MODES
+        ]
+        for axis in ("structure", "length", "humor", "energy", "tempo"):
+            with self.subTest(axis=axis):
+                self.assertEqual(
+                    {item[axis] for item in day_plans},
+                    set(void_editorial_catalog.DAY_CONSTRAINTS[axis]),
+                )
+        self.assertTrue(
+            {
+                "ai_models",
+                "ai_agents",
+                "ai_video",
+                "ai_audio",
+                "ai_images",
+                "ai_devices",
+                "ai_science",
+                "ai_power",
+            }.issubset({item["semantic_theme"] for item in day_plans})
+        )
+        self.assertTrue(night_plans)
+        self.assertLessEqual(
+            {item["energy"] for item in night_plans},
+            set(void_editorial_catalog.NIGHT_CONSTRAINTS["energy"]),
+        )
+        self.assertLessEqual(
+            {item["tempo"] for item in night_plans},
+            set(void_editorial_catalog.NIGHT_CONSTRAINTS["tempo"]),
+        )
 
     def test_diversity_exhaustion_and_crosspost_contract(self):
         first = eo.plan_release(context(seed="one"))
