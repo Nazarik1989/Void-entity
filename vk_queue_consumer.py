@@ -188,9 +188,36 @@ COMPOSER_ATTACHMENT_REMOVE_SELECTOR = (
     '[data-testid^="posting_attachment_"][data-testid$="_remove"]'
 )
 COMPOSER_ATTACHMENT_ITEM_SELECTOR = '[data-testid="posting_attachment_item"]'
+COMPOSER_DEVICE_UPLOAD_TESTID = "posting_base_screen_download_from_device"
 COMPOSER_DEVICE_UPLOAD_SELECTOR = (
     'input[type="file"]'
-    '[data-testid="posting_base_screen_download_from_device"]'
+    f'[data-testid="{COMPOSER_DEVICE_UPLOAD_TESTID}"]'
+)
+COMPOSER_DEVICE_VIDEO_ACCEPT_TOKENS = frozenset(
+    {
+        "video/*",
+        ".avi",
+        ".mp4",
+        ".3gp",
+        ".mpeg",
+        ".mov",
+        ".flv",
+        ".f4v",
+        ".wmv",
+        ".mkv",
+        ".webm",
+        ".vob",
+        ".rm",
+        ".rmvb",
+        ".m4v",
+        ".mpg",
+        ".ogv",
+        ".ts",
+        ".m2ts",
+        ".mts",
+        ".mxf",
+        ".quicktime",
+    }
 )
 
 
@@ -641,46 +668,69 @@ def _wait_for_composer_attachment_count(
 
 
 def _image_file_input_score(candidate: Any) -> int | None:
-    try:
-        accept = str(candidate.get_attribute("accept") or "").casefold()
-        testid = str(candidate.get_attribute("data-testid") or "")
-    except Exception:
-        return None
+    accept = str(candidate.get_attribute("accept") or "").casefold()
+    testid = str(candidate.get_attribute("data-testid") or "")
     accepted = tuple(
         token.strip() for token in accept.split(",") if token.strip()
     )
     if not accepted or not any(token.startswith("image/") for token in accepted):
         return None
-    if any(token.startswith("audio/") for token in accepted):
+    non_image = frozenset(
+        token for token in accepted if not token.startswith("image/")
+    )
+    if not non_image:
+        return 225 if testid == COMPOSER_DEVICE_UPLOAD_TESTID else 200
+    if (
+        testid != COMPOSER_DEVICE_UPLOAD_TESTID
+        or not non_image.issubset(COMPOSER_DEVICE_VIDEO_ACCEPT_TOKENS)
+    ):
         return None
-    image_only = all(token.startswith("image/") for token in accepted)
-    score = 200 if image_only else 100
-    if testid == "posting_base_screen_download_from_device":
-        score += 25
-    return score
+    return 125
 
 
 def _best_image_file_input(root: Any, selector: str) -> Any | None:
     try:
         inputs = root.locator(selector)
-        count = min(int(inputs.count()), 20)
+        count = int(inputs.count())
+        if count > 20:
+            raise RetryablePublishError(
+                "VK composer has an unexpected number of image upload inputs; retry later"
+            )
     except Exception as exc:
+        if isinstance(exc, RetryablePublishError):
+            raise
         raise RetryablePublishError(
             "VK composer image upload inputs are unavailable; retry later"
         ) from exc
-    selected = None
-    selected_score = -1
+    eligible: list[tuple[int, Any]] = []
     for index in range(count):
-        candidate = inputs.nth(index)
-        score = _image_file_input_score(candidate)
-        if score is not None and score > selected_score:
-            selected = candidate
-            selected_score = score
-    return selected
+        try:
+            candidate = inputs.nth(index)
+            score = _image_file_input_score(candidate)
+        except Exception as exc:
+            raise RetryablePublishError(
+                "VK composer image upload input changed during selection; retry later"
+            ) from exc
+        if score is not None:
+            eligible.append((score, candidate))
+    if not eligible:
+        return None
+    best_score = max(score for score, _candidate in eligible)
+    best = [candidate for score, candidate in eligible if score == best_score]
+    if len(best) != 1:
+        raise RetryablePublishError(
+            "VK composer image upload input selection is ambiguous; retry later"
+        )
+    return best[0]
 
 
 def _composer_image_file_input(page: Any) -> Any:
-    scope = _first_visible(page, COMPOSER_SCOPE_SELECTORS)
+    try:
+        scope = _first_visible(page, COMPOSER_SCOPE_SELECTORS)
+    except Exception as exc:
+        raise RetryablePublishError(
+            "VK composer image upload scope is unavailable; retry later"
+        ) from exc
     if scope is None:
         raise RetryablePublishError(
             "VK composer image upload scope is unavailable; retry later"
@@ -697,6 +747,18 @@ def _composer_image_file_input(page: Any) -> Any:
     raise RetryablePublishError(
         "VK composer image upload input is unavailable; retry later"
     )
+
+
+def _set_composer_image_files(page: Any, media: list[Path]) -> None:
+    try:
+        upload = _composer_image_file_input(page)
+        upload.set_input_files([str(path) for path in media])
+    except RetryablePublishError:
+        raise
+    except Exception as exc:
+        raise RetryablePublishError(
+            "VK composer image upload failed; retry later"
+        ) from exc
 
 
 def _tokens(value: str) -> set[str]:
@@ -1443,9 +1505,7 @@ def publish_job(job: dict[str, Any], media: list[Path]) -> None:
             )
             _wait_for_composer_attachment_count(page, 0)
             if media:
-                _composer_image_file_input(page).set_input_files(
-                    [str(path) for path in media]
-                )
+                _set_composer_image_files(page, media)
                 page.wait_for_timeout(4_000)
             _wait_for_composer_attachment_count(page, len(media))
             _post_input(page).fill(job["text"])
