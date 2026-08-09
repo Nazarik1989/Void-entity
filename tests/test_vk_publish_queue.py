@@ -59,6 +59,7 @@ from vk_queue_consumer import (
     _clear_saved_composer_attachments,
     _composer_image_file_input,
     _confirm_track_attached,
+    _inspect_evidence_with_bounded_scroll,
     _inspect_unresolved_publication,
     _locator_or_ancestor_audio_matches,
     _load_publication_attempt,
@@ -68,6 +69,7 @@ from vk_queue_consumer import (
     _publication_cooldown_remaining,
     _publish_and_confirm,
     _published_post_evidence,
+    _published_text_matches,
     _record_admin_notice,
     _record_publication_attempt,
     _reconcile_confirmed_unresolved,
@@ -1972,6 +1974,143 @@ class VkPublishQueueTests(unittest.TestCase):
         ):
             _inspect_unresolved_publication()
 
+    def test_unresolved_inspection_scrolls_until_matching_post_is_visible(self):
+        missing = _PublicationEvidence(frozenset(), 0)
+        found = _PublicationEvidence(
+            frozenset({"wall:-237593988_123"}),
+            0,
+            frozenset({"wall:-237593988_123"}),
+        )
+        page = Mock()
+        with patch(
+            "vk_queue_consumer._published_post_evidence",
+            side_effect=[missing, missing, found],
+        ) as inspect:
+            evidence = _inspect_evidence_with_bounded_scroll(
+                page,
+                "Exact post",
+                "KVPV Hit The Beat",
+                max_scrolls=6,
+                wait_ms=25,
+            )
+
+        self.assertIs(evidence, found)
+        self.assertEqual(inspect.call_count, 3)
+        self.assertEqual(
+            page.mouse.wheel.call_args_list,
+            [call(0, 900), call(0, 900)],
+        )
+        self.assertEqual(
+            page.wait_for_timeout.call_args_list,
+            [call(25), call(25)],
+        )
+
+    def test_unresolved_inspection_feed_scroll_is_bounded(self):
+        missing = _PublicationEvidence(frozenset(), 0)
+        page = Mock()
+        with patch(
+            "vk_queue_consumer._published_post_evidence",
+            return_value=missing,
+        ) as inspect:
+            evidence = _inspect_evidence_with_bounded_scroll(
+                page,
+                "Exact post",
+                "KVPV Hit The Beat",
+                max_scrolls=3,
+                wait_ms=0,
+            )
+
+        self.assertIs(evidence, missing)
+        self.assertEqual(inspect.call_count, 4)
+        self.assertEqual(page.mouse.wheel.call_count, 3)
+
+    def test_unresolved_inspection_does_not_stop_on_anonymous_evidence(self):
+        anonymous = _PublicationEvidence(frozenset(), 1)
+        identified = _PublicationEvidence(
+            frozenset({"wall:-237593988_123"}),
+            0,
+            frozenset({"wall:-237593988_123"}),
+        )
+        page = Mock()
+        with patch(
+            "vk_queue_consumer._published_post_evidence",
+            side_effect=[anonymous, identified],
+        ) as inspect:
+            evidence = _inspect_evidence_with_bounded_scroll(
+                page,
+                "Exact post",
+                "KVPV Hit The Beat",
+                max_scrolls=3,
+                wait_ms=0,
+            )
+
+        self.assertIs(evidence, identified)
+        self.assertEqual(inspect.call_count, 2)
+        page.mouse.wheel.assert_called_once_with(0, 900)
+
+    def test_anonymous_only_inspection_never_reconciles_a_receipt(self):
+        job = self.job(dedupe_key="anonymous-inspection")
+        directory = self.enqueue(job)
+        failed = self.root / "failed"
+        failed.mkdir(exist_ok=True)
+        os.replace(directory, failed / directory.name)
+        profile = self.root / "profile"
+        profile.mkdir()
+
+        candidates = Mock()
+        candidates.count.return_value = 0
+        page = Mock()
+        page.get_by_text.return_value = candidates
+        page.evaluate.return_value = []
+        context = Mock()
+        context.new_page.return_value = page
+        browser_api = Mock()
+        browser_api.chromium.launch_persistent_context.return_value = context
+        playwright_manager = MagicMock()
+        playwright_manager.__enter__.return_value = browser_api
+        playwright_manager.__exit__.return_value = False
+        playwright_package = types.ModuleType("playwright")
+        playwright_package.__path__ = []
+        playwright_sync_api = types.ModuleType("playwright.sync_api")
+        playwright_sync_api.sync_playwright = Mock(
+            return_value=playwright_manager
+        )
+        playwright_package.sync_api = playwright_sync_api
+
+        with (
+            patch("vk_queue_consumer.QUEUE_DIR", self.root),
+            patch("vk_queue_consumer.PROFILE_DIR", profile),
+            patch("vk_queue_consumer.GROUP_ID", self.group),
+            patch.dict(
+                sys.modules,
+                {
+                    "playwright": playwright_package,
+                    "playwright.sync_api": playwright_sync_api,
+                },
+            ),
+            patch(
+                "vk_queue_consumer._load_publication_attempt",
+                return_value={"job_id": job["job_id"]},
+            ),
+            patch(
+                "vk_queue_consumer.allowed_community_url",
+                return_value="https://vk.com/club237593988",
+            ),
+            patch("vk_queue_consumer._authentication_required", return_value=False),
+            patch(
+                "vk_queue_consumer._inspect_evidence_with_bounded_scroll",
+                return_value=_PublicationEvidence(frozenset(), 1),
+            ),
+            patch("vk_queue_consumer._reconcile_confirmed_unresolved") as reconcile,
+        ):
+            self.assertEqual(
+                _inspect_unresolved_publication(reconcile_confirmed=True),
+                75,
+            )
+
+        reconcile.assert_not_called()
+        self.assertEqual(publication_receipts(self.root), [])
+
     def test_confirmed_unresolved_reconciliation_records_receipt_first(self):
         job = self.job(dedupe_key="confirmed-reconciliation")
         with (
@@ -2674,6 +2813,198 @@ class VkPublishQueueTests(unittest.TestCase):
         self.assertEqual(
             wrong_audio_evidence.observed_identified,
             frozenset({"wall:-237593988_777"}),
+        )
+
+    def test_published_text_matches_vk_shortened_trailing_source_on_same_host(self):
+        body = (
+            "«Помогать?» — «Не всегда, спасибо». И вот заголовок ломается "
+            "о простую вещь: большой контекст не решает за вас."
+        )
+        expected = (
+            f"{body}\nИсточник: https://www.wired.com/story/"
+            "how-to-disable-the-gemini-ai-features-in-gmail-and-google-docs/"
+        )
+        rendered = (
+            f"поймаешь - поймёшь {body}\n"
+            "Источник: www.wired.com/story/how-to-disable-the-gemini-ai-... "
+            "KVPV Hit The Beat"
+        )
+
+        self.assertTrue(_published_text_matches(rendered, expected))
+        self.assertTrue(_published_text_matches(rendered.replace("...", "…"), expected))
+        self.assertTrue(
+            _published_text_matches(
+                rendered.replace("Источник:", "Source:").replace(
+                    "www.wired.com", "wired.com"
+                ),
+                expected,
+            )
+        )
+
+    def test_source_match_accepts_full_equal_path_modulo_trailing_slash(self):
+        body = "Exact core body."
+
+        self.assertTrue(
+            _published_text_matches(
+                f"{body} Source: http://wired.com/story/full-path",
+                f"{body} Источник: https://www.wired.com/story/full-path/",
+            )
+        )
+        self.assertTrue(
+            _published_text_matches(
+                f"{body} Источник: www.wired.com/story/full-path/",
+                f"{body} Source: https://wired.com/story/full-path",
+            )
+        )
+
+    def test_source_match_checks_nondefault_port_and_query_identity(self):
+        body = "Exact core body."
+        expected = (
+            f"{body} Source: https://www.wired.com/story/full-path/"
+            "?article=alpha&view=full"
+        )
+
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Source: www.wired.com:444/story/full-path/"
+                "?article=alpha&view=full",
+                expected,
+            )
+        )
+        self.assertTrue(
+            _published_text_matches(
+                f"{body} Source: www.wired.com:444/story/full-path/",
+                f"{body} Source: https://wired.com:444/story/full-path",
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Source: www.wired.com/story/full-path/"
+                "?article=beta&view=full",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Source: www.wired.com/story/full-...",
+                expected,
+            )
+        )
+        self.assertTrue(
+            _published_text_matches(
+                f"{body} Source: www.wired.com/story/full-path/"
+                "?article=al...",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Source: www.wired.com/story/full-path/?wrong=...",
+                expected,
+            )
+        )
+
+    def test_shortened_source_match_rejects_wrong_host_or_changed_core(self):
+        body = "Exact core body with punctuation — unchanged."
+        expected = f"{body}\nИсточник: https://www.wired.com/story/full-path/"
+
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Источник: www.wired.com.evil/story/full-...",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Источник: www.wired.com/story/different-article...",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Источник: www.wired.com/story/different-article",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Источник: www.wired.com",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Источник: www.wired.com/...",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Источник: www.wired.com/s...",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                "Changed core body with punctuation — unchanged. "
+                "Источник: www.wired.com/story/full-...",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} extra claim Источник: www.wired.com/story/full-...",
+                expected,
+            )
+        )
+        self.assertFalse(
+            _published_text_matches(
+                f"{body} Источник: javascript://wired.com/path",
+                expected,
+            )
+        )
+
+    def test_shortened_source_evidence_still_requires_exact_audio(self):
+        body = "Exact core body."
+        expected = f"{body}\nИсточник: https://www.wired.com/story/full-path/"
+        post = Mock()
+        post.is_visible.return_value = True
+        post.inner_text.return_value = (
+            f"{body}\nИсточник: www.wired.com/story/full-...\nWrong audio"
+        )
+        post.text_content.return_value = post.inner_text.return_value
+        post.get_attribute.side_effect = lambda name: (
+            "-237593988_123" if name == "data-post-id" else None
+        )
+        posts = Mock()
+        posts.count.return_value = 1
+        posts.nth.return_value = post
+        page = Mock()
+        page.locator.return_value = posts
+
+        with patch(
+            "vk_queue_consumer._post_has_matching_audio",
+            return_value=False,
+        ):
+            wrong_audio = _published_post_evidence(
+                page,
+                expected,
+                "KVPV Hit The Beat",
+            )
+        self.assertEqual(wrong_audio.identified, frozenset())
+
+        with patch(
+            "vk_queue_consumer._post_has_matching_audio",
+            return_value=True,
+        ):
+            matching_audio = _published_post_evidence(
+                page,
+                expected,
+                "KVPV Hit The Beat",
+            )
+        self.assertEqual(
+            matching_audio.identified,
+            frozenset({"wall:-237593988_123"}),
         )
 
     def test_publish_confirmation_rejects_only_preexisting_matching_post(self):

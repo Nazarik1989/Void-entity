@@ -838,6 +838,136 @@ def _normalized_visible_text(value: str) -> str:
     return " ".join(without_zero_width.split()).casefold()
 
 
+@dataclass(frozen=True)
+class _SourceReference:
+    hostname: str
+    port: int | None
+    path: str
+    query: str
+    truncated_component: str | None
+
+
+MIN_TRUNCATED_SOURCE_PATH_PREFIX_LENGTH = 8
+
+
+def _normalized_source_reference(value: str) -> _SourceReference | None:
+    candidate = value.strip().strip("<>()[]{}\"'")
+    if not candidate:
+        return None
+    truncated = False
+    if candidate.endswith("..."):
+        candidate = candidate[:-3]
+        truncated = True
+    elif candidate.endswith("…"):
+        candidate = candidate[:-1]
+        truncated = True
+    if not candidate:
+        return None
+    try:
+        parsed = urlparse(candidate if "://" in candidate else f"//{candidate}")
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme and parsed.scheme not in {"http", "https"}:
+        return None
+    if not hostname or parsed.username is not None or parsed.password is not None:
+        return None
+    hostname = hostname.casefold().rstrip(".")
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        return None
+    if (
+        (parsed.scheme == "http" and port == 80)
+        or (parsed.scheme == "https" and port == 443)
+        or (not parsed.scheme and port in {80, 443})
+    ):
+        port = None
+    path = parsed.path.rstrip("/") or "/"
+    truncated_component = None
+    if truncated:
+        truncated_component = "query" if "?" in candidate else "path"
+    return _SourceReference(
+        hostname=hostname,
+        port=port,
+        path=path,
+        query=parsed.query,
+        truncated_component=truncated_component,
+    )
+
+
+def _source_references_are_compatible(rendered: str, expected: str) -> bool:
+    rendered_reference = _normalized_source_reference(rendered)
+    expected_reference = _normalized_source_reference(expected)
+    if rendered_reference is None or expected_reference is None:
+        return False
+    if (
+        rendered_reference.hostname != expected_reference.hostname
+        or rendered_reference.port != expected_reference.port
+        or expected_reference.truncated_component is not None
+    ):
+        return False
+    if rendered_reference.truncated_component == "path":
+        return (
+            len(rendered_reference.path)
+            >= MIN_TRUNCATED_SOURCE_PATH_PREFIX_LENGTH
+            and expected_reference.path.startswith(rendered_reference.path)
+            and not expected_reference.query
+        )
+    if rendered_reference.truncated_component == "query":
+        return (
+            rendered_reference.path == expected_reference.path
+            and bool(rendered_reference.query)
+            and expected_reference.query.startswith(rendered_reference.query)
+        )
+    return (
+        rendered_reference.path == expected_reference.path
+        and rendered_reference.query == expected_reference.query
+    )
+
+
+def _published_text_matches(rendered: str, expected: str) -> bool:
+    """Match VK-rendered post text without trusting a shortened source URL.
+
+    VK may replace the scheme and truncate the visible path of a final source
+    link.  The fallback therefore requires the complete pre-source body, the
+    same normalized host/port, and either the complete path/query or VK's
+    meaningful visible prefix of the path or query.  It never relaxes
+    arbitrary body text or a non-trailing source field in the queued post.
+    """
+
+    rendered_text = _normalized_visible_text(rendered)
+    expected_text = _normalized_visible_text(expected)
+    if not rendered_text or not expected_text:
+        return False
+    if expected_text in rendered_text:
+        return True
+    expected_source = re.fullmatch(
+        r"(?s)(?P<body>.+?)\s+(?:источник|source)\s*:\s*(?P<source>\S+)\s*",
+        expected_text,
+    )
+    if expected_source is None:
+        return False
+    body = expected_source.group("body").strip()
+    expected_reference = expected_source.group("source")
+    if not body or _normalized_source_reference(expected_reference) is None:
+        return False
+    rendered_sources = re.finditer(
+        rf"{re.escape(body)}\s+(?:источник|source)\s*:\s*(?P<source>\S+)",
+        rendered_text,
+    )
+    return any(
+        _source_references_are_compatible(
+            match.group("source"),
+            expected_reference,
+        )
+        for match in rendered_sources
+    )
+
+
 def _locator_search_values(locator: Any) -> tuple[str, ...]:
     values: list[str] = []
     for method_name in ("inner_text", "text_content"):
@@ -1205,8 +1335,9 @@ def _published_post_evidence(
         identifier = _post_identifier(post)
         if identifier is not None:
             observed_identified.add(identifier)
-        post_text = _normalized_visible_text(_locator_search_text(post))
-        if expected_text not in post_text or not _post_has_matching_audio(
+        if not _published_text_matches(
+            _locator_search_text(post), text
+        ) or not _post_has_matching_audio(
             post, track_query
         ):
             continue
@@ -1592,6 +1723,27 @@ def _reconcile_confirmed_unresolved(job: dict[str, Any]) -> None:
         raise RuntimeError("confirmed VK receipt did not resolve publication marker")
 
 
+def _inspect_evidence_with_bounded_scroll(
+    page: Any,
+    text: str,
+    track_query: str,
+    *,
+    max_scrolls: int = 6,
+    scroll_step: int = 900,
+    wait_ms: int = 750,
+) -> _PublicationEvidence:
+    evidence = _published_post_evidence(page, text, track_query)
+    if evidence.identified:
+        return evidence
+    for _ in range(max(0, max_scrolls)):
+        page.mouse.wheel(0, scroll_step)
+        page.wait_for_timeout(wait_ms)
+        evidence = _published_post_evidence(page, text, track_query)
+        if evidence.identified:
+            break
+    return evidence
+
+
 def _inspect_unresolved_publication(*, reconcile_confirmed: bool = False) -> int:
     attempt = _load_publication_attempt()
     if attempt is None:
@@ -1627,7 +1779,7 @@ def _inspect_unresolved_publication(*, reconcile_confirmed: bool = False) -> int
                 raise VkAuthenticationRequiredError(
                     "VK browser session authentication is required"
                 )
-            evidence = _published_post_evidence(
+            evidence = _inspect_evidence_with_bounded_scroll(
                 page,
                 job["text"],
                 job["track_query"],
@@ -1696,7 +1848,7 @@ def _inspect_unresolved_publication(*, reconcile_confirmed: bool = False) -> int
             if value and value not in safe_testids:
                 safe_testids.append(value)
     matching_ids = sorted(evidence.identified)
-    confirmed = bool(matching_ids or evidence.anonymous_count)
+    confirmed = bool(matching_ids)
     reconciled = False
     if reconcile_confirmed and confirmed:
         _reconcile_confirmed_unresolved(job)
