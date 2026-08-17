@@ -187,6 +187,9 @@ COMPOSER_ATTACHMENT_REMOVE_SELECTOR = (
     '[data-testid="posting_attachment_photo_item_remove"], '
     '[data-testid^="posting_attachment_"][data-testid$="_remove"]'
 )
+COMPOSER_ATTACHMENT_REMOVE_CONFIRM_SELECTOR = (
+    '[data-testid="posting_attachments_remove_photo_and_audio_submit"]'
+)
 COMPOSER_ATTACHMENT_ITEM_SELECTOR = '[data-testid="posting_attachment_item"]'
 COMPOSER_DEVICE_UPLOAD_TESTID = "posting_base_screen_download_from_device"
 COMPOSER_DEVICE_UPLOAD_SELECTOR = (
@@ -525,10 +528,55 @@ def _wait_for_attachment_reduction(
     timeout: int,
 ) -> list[Any]:
     deadline = time.monotonic() + max(0, timeout) / 1000
+    confirmation_clicked = False
     while True:
         attachments = _visible_attachment_items(scope)
         if len(attachments) < before:
             return attachments
+        if not confirmation_clicked:
+            try:
+                controls = page.locator(
+                    COMPOSER_ATTACHMENT_REMOVE_CONFIRM_SELECTOR
+                )
+                count = int(controls.count())
+            except Exception as exc:
+                raise RetryablePublishError(
+                    "VK saved composer attachment removal confirmation is unavailable; retry later"
+                ) from exc
+            if count > 20:
+                raise RetryablePublishError(
+                    "VK saved composer attachment removal confirmation is ambiguous; retry later"
+                )
+            visible: list[Any] = []
+            for index in range(count):
+                control = controls.nth(index)
+                try:
+                    if control.is_visible():
+                        visible.append(control)
+                except Exception as exc:
+                    raise RetryablePublishError(
+                        "VK saved composer attachment removal confirmation detached; retry later"
+                    ) from exc
+            if len(visible) > 1:
+                raise RetryablePublishError(
+                    "VK saved composer attachment removal confirmation is ambiguous; retry later"
+                )
+            if visible:
+                try:
+                    visible[0].click(
+                        timeout=5_000,
+                        no_wait_after=True,
+                    )
+                except Exception as exc:
+                    raise RetryablePublishError(
+                        "VK saved composer attachment removal could not be confirmed; retry later"
+                    ) from exc
+                confirmation_clicked = True
+                deadline = max(
+                    deadline,
+                    time.monotonic() + max(0, timeout) / 1000,
+                )
+                continue
         if time.monotonic() >= deadline:
             raise RetryablePublishError(
                 "VK saved composer attachment did not disappear; retry later"

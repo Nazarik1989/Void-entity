@@ -2446,6 +2446,66 @@ class VkPublishQueueTests(unittest.TestCase):
             force=True,
             no_wait_after=True,
         )
+        page.locator.assert_not_called()
+
+    def test_saved_composer_attachment_action_sheet_is_confirmed_exactly(self):
+        state = {"attachments": 1, "confirmation_visible": False}
+        events = []
+        editor = Mock()
+        editor.input_value.return_value = "post"
+        remove = Mock()
+        remove.is_visible.return_value = True
+        remove.click.side_effect = lambda **_: (
+            events.append("initial_remove"),
+            state.update(confirmation_visible=True),
+        )
+        confirmation = Mock()
+        confirmation.is_visible.side_effect = lambda: state["confirmation_visible"]
+        confirmation.click.side_effect = lambda **_: (
+            events.append("confirm_remove"),
+            state.update(attachments=0, confirmation_visible=False),
+        )
+        item = Mock()
+        item.is_visible.return_value = True
+        items = Mock()
+        items.count.side_effect = lambda: state["attachments"]
+        items.nth.return_value = item
+        remove_controls = Mock()
+        remove_controls.count.return_value = 1
+        remove_controls.nth.return_value = remove
+        confirmation_controls = Mock()
+        confirmation_controls.count.return_value = 1
+        confirmation_controls.nth.return_value = confirmation
+        scope = Mock()
+        scope.locator.side_effect = lambda selector: (
+            items
+            if selector == '[data-testid="posting_attachment_item"]'
+            else remove_controls
+        )
+        page = Mock()
+        page.locator.return_value = confirmation_controls
+
+        with (
+            patch("vk_queue_consumer._first_visible", return_value=scope),
+            patch("vk_queue_consumer._post_input", return_value=editor),
+        ):
+            self.assertEqual(
+                _clear_saved_composer_attachments(
+                    page,
+                    managed_texts=frozenset({"post"}),
+                    job_id="void-1234567890abcdef12345678",
+                ),
+                1,
+            )
+
+        page.locator.assert_called_once_with(
+            '[data-testid="posting_attachments_remove_photo_and_audio_submit"]'
+        )
+        confirmation.click.assert_called_once_with(
+            timeout=5_000,
+            no_wait_after=True,
+        )
+        self.assertEqual(events, ["initial_remove", "confirm_remove"])
 
     def test_hidden_remove_control_is_revealed_by_hover_before_cleanup(self):
         editor = Mock()
@@ -2499,6 +2559,10 @@ class VkPublishQueueTests(unittest.TestCase):
         scope.locator.side_effect = lambda selector: (
             items if selector == '[data-testid="posting_attachment_item"]' else controls
         )
+        confirmations = Mock()
+        confirmations.count.return_value = 0
+        page = Mock()
+        page.locator.return_value = confirmations
 
         with (
             patch("vk_queue_consumer._first_visible", return_value=scope),
@@ -2506,13 +2570,60 @@ class VkPublishQueueTests(unittest.TestCase):
             self.assertRaisesRegex(RetryablePublishError, "did not disappear"),
         ):
             _clear_saved_composer_attachments(
-                Mock(),
+                page,
                 managed_texts=frozenset({"post"}),
                 job_id="void-1234567890abcdef12345678",
                 removal_timeout=0,
             )
 
         remove.click.assert_called_once()
+        page.locator.assert_called_once_with(
+            '[data-testid="posting_attachments_remove_photo_and_audio_submit"]'
+        )
+
+    def test_cleanup_fails_closed_on_ambiguous_visible_confirmations(self):
+        editor = Mock()
+        editor.input_value.return_value = "post"
+        remove = Mock()
+        remove.is_visible.return_value = True
+        item = Mock()
+        item.is_visible.return_value = True
+        items = Mock()
+        items.count.return_value = 1
+        items.nth.return_value = item
+        remove_controls = Mock()
+        remove_controls.count.return_value = 1
+        remove_controls.nth.return_value = remove
+        confirmations = Mock()
+        confirmations.count.return_value = 2
+        visible_confirmations = [Mock(), Mock()]
+        for confirmation in visible_confirmations:
+            confirmation.is_visible.return_value = True
+        confirmations.nth.side_effect = visible_confirmations
+        scope = Mock()
+        scope.locator.side_effect = lambda selector: (
+            items
+            if selector == '[data-testid="posting_attachment_item"]'
+            else remove_controls
+        )
+        page = Mock()
+        page.locator.return_value = confirmations
+
+        with (
+            patch("vk_queue_consumer._first_visible", return_value=scope),
+            patch("vk_queue_consumer._post_input", return_value=editor),
+            self.assertRaisesRegex(RetryablePublishError, "confirmation is ambiguous"),
+        ):
+            _clear_saved_composer_attachments(
+                page,
+                managed_texts=frozenset({"post"}),
+                job_id="void-1234567890abcdef12345678",
+                removal_timeout=0,
+            )
+
+        remove.click.assert_called_once()
+        for confirmation in visible_confirmations:
+            confirmation.click.assert_not_called()
 
     def test_missing_composer_attachment_scope_is_retryable(self):
         with (
