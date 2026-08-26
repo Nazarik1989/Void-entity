@@ -72,7 +72,7 @@ python main.py
 ```
 
 For Telegram publishing, add the bot to the target channel as an administrator. `CHANNEL_ID` may be a channel username; `ADMIN_ID` is the administrator’s numeric Telegram ID.
-Scheduled VOID posts use `Europe/Moscow`; configure exact daily slots with `VOID_TELEGRAM_AUTO_TIMES` (default: `12:00,16:00,20:00,00:00`).
+Scheduled VOID posts use `Europe/Moscow`. Telegram runs daily at `12:00` and `22:00`; configure those exact slots with `VOID_TELEGRAM_AUTO_TIMES` (default: `12:00,22:00`). Telegram deduplication uses a date-qualified Moscow slot, so a new calendar day cannot reuse the previous day's claim.
 Telegram and VK scheduled releases share the same broad-AI rubric matrix and
 cooldowns for themes, structures, lengths, energy, and humor. `Midnight` and
 `The Vault` remain deliberately quieter night modes; platform-specific format
@@ -185,7 +185,7 @@ VK music uses one shared publication history with producer-aware rotation rules.
 
 The browser consumer confirms that the requested audio was attached and then requires a newly visible wall post containing both the expected text and that audio before a publication receipt can advance the rotation. It writes an atomic unresolved-attempt marker immediately before clicking Publish. If the browser outcome or the hand-off to the receipt is ambiguous, later consumer runs stop with exit code `75` until an operator reconciles that exact job, preventing a possible post from being followed by an untracked repeat.
 
-`void-vk-producer.timer` generates scheduled VOID content and enqueues it without opening a browser. VOID queues one cover and generates only that one image. `void-vk-autopost.timer` runs only `vk_queue_consumer.py`, which does not import `main.py`, Telegram, or LLM code. Before uploading, it identifies a restored composer draft by its exact managed job text, removes every persisted attachment, proves that the composer is empty, uploads the expected media count, and refuses to touch an unrelated manual draft.
+`void-vk-producer.timer` generates scheduled VOID content daily at `12:00` and `22:00` Europe/Moscow and enqueues it without opening a browser. Its timer is non-persistent so a deployment or outage cannot trigger a missed producer slot immediately. A one-time migration from `Persistent=true` must clear the stopped timer's old state under the producer condition guard before activation; the VPS runbook contains the exact sequence. VOID queues one cover and generates only that one image. `void-vk-autopost.timer` runs only `vk_queue_consumer.py`, which does not import `main.py`, Telegram, or LLM code. The consumer timer keeps its independent frequent retry cadence. Before uploading, it identifies a restored composer draft by its exact managed job text, removes every persisted attachment, proves that the composer is empty, uploads the expected media count, and refuses to touch an unrelated manual draft.
 
 The consumer has a kill switch at `/etc/void-vk-publisher.disabled`. Complete user/group permissions, systemd hardening, one-time VPS profile authorization, service installation, and requeue operations are documented in `deploy/VPS_VK_PUBLISHER.md`.
 

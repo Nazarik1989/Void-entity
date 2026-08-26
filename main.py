@@ -105,7 +105,7 @@ CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exch
 CROSSPOST_EXCHANGE_INTERVAL_SECONDS = max(60, int(os.getenv("CROSSPOST_EXCHANGE_INTERVAL_SECONDS", "300") or "300"))
 CROSSPOST_EXCHANGE_MAX_PER_RUN = max(1, min(int(os.getenv("CROSSPOST_EXCHANGE_MAX_PER_RUN", "1") or "1"), 5))
 EDITORIAL_DELIVERY_STALE_SECONDS = 30 * 60
-VOID_TELEGRAM_AUTO_TIMES_RAW = os.getenv("VOID_TELEGRAM_AUTO_TIMES", "12:00,16:00,20:00,00:00").strip()
+VOID_TELEGRAM_AUTO_TIMES_RAW = os.getenv("VOID_TELEGRAM_AUTO_TIMES", "12:00,22:00").strip()
 VOID_SCHEDULED_WORK_DIR = Path(
     os.getenv("VOID_SCHEDULED_WORK_DIR", "/run/void-entity-scheduled-work").strip()
 )
@@ -159,8 +159,8 @@ def resolved_void_schedule_snapshot() -> dict[str, Any]:
             "weekly_times": (),
         },
         "void.vk": {
-            "daily_times": ("13:30", "20:30"),
-            "weekly_times": (((4, 5), "23:30"),),
+            "daily_times": ("12:00", "22:00"),
+            "weekly_times": (),
         },
     }
 

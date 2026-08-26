@@ -2,10 +2,9 @@
 Description=Create scheduled VOID VK queue jobs
 
 [Timer]
-OnCalendar=*-*-* 13:30:00 Europe/Moscow
-OnCalendar=*-*-* 20:30:00 Europe/Moscow
-OnCalendar=Fri,Sat *-*-* 23:30:00 Europe/Moscow
-Persistent=true
+OnCalendar=*-*-* 12:00:00 Europe/Moscow
+OnCalendar=*-*-* 22:00:00 Europe/Moscow
+Persistent=false
 AccuracySec=1min
 Unit=void-vk-producer.service
 

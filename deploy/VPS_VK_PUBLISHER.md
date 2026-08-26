@@ -48,7 +48,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now void-vk-autopost.timer void-vk-producer.timer
 ```
 
-The consumer timer only consumes. The producer timer invokes LLM/media generation and atomically enqueues a `producer=void` job; it never opens Chromium.
+The consumer timer only consumes and keeps its independent frequent retry cadence. The producer timer invokes LLM/media generation daily at `12:00` and `22:00` Europe/Moscow and atomically enqueues a `producer=void` job; it never opens Chromium. The producer timer uses `Persistent=false`, so a missed slot is not started immediately after a deployment or outage. When migrating from a persistent timer, first create the existing `/etc/void-vk-producer.disabled` condition guard, stop the timer, and run `systemctl clean --what=state void-vk-producer.timer` before installing and starting the new timer. Verify that the producer service was not invoked and that `NEXT` is a future natural slot before removing the guard. Run the whole sequence outside the publication embargo; do not start the producer service itself.
 
 ## One-time authorization
 

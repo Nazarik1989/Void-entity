@@ -45,7 +45,7 @@ EXPECTED_BOT_WORK_KEYS = frozenset(
 )
 
 NAZ_TELEGRAM_TIMES = ("10:00", "14:00", "18:00", "22:00")
-VOID_TELEGRAM_TIMES = ("12:00", "16:00", "20:00", "00:00")
+VOID_TELEGRAM_TIMES = ("12:00", "22:00")
 DEFAULT_MARKER_DIRS = {
     # This is Naz's actual runtime default. Only hidden scheduled-work marker
     # files are inspected; DB/env/content files in this directory are ignored.
@@ -92,8 +92,7 @@ def default_schedule_snapshots() -> dict[str, ScheduleSnapshot]:
         ),
         "void.telegram": ScheduleSnapshot(daily_times=VOID_TELEGRAM_TIMES),
         "void.vk": ScheduleSnapshot(
-            daily_times=("13:30", "20:30"),
-            weekly_times=(((4, 5), "23:30"),),  # Fri, Sat.
+            daily_times=("12:00", "22:00"),
         ),
     }
 

@@ -71,23 +71,43 @@ from void_core import (
 class AutopostingRubricTests(unittest.TestCase):
     def test_void_daily_times_are_normalized_and_deduplicated(self) -> None:
         self.assertEqual(
-            parse_daily_times("12:00, 16:00,20:00,00:00,12:00,bad,24:00"),
-            ("12:00", "16:00", "20:00", "00:00"),
+            parse_daily_times("12:00, 22:00,12:00,22:00,bad,24:00"),
+            ("12:00", "22:00"),
         )
 
     def test_void_schedule_recognizes_all_requested_moscow_slots(self) -> None:
-        schedule = ("12:00", "16:00", "20:00", "00:00")
-        for hour in (12, 16, 20):
+        schedule = ("12:00", "22:00")
+        for hour in (12, 22):
             with self.subTest(hour=hour):
                 self.assertEqual(
                     current_void_schedule_slot(datetime(2026, 7, 15, hour, 0), schedule),
                     f"2026-07-15:{hour:02d}:00",
                 )
-        self.assertEqual(
-            current_void_schedule_slot(datetime(2026, 7, 16, 0, 0), schedule),
-            "2026-07-16:00:00",
-        )
+        self.assertIsNone(current_void_schedule_slot(datetime(2026, 7, 16, 0, 0), schedule))
         self.assertIsNone(current_void_schedule_slot(datetime(2026, 7, 15, 13, 0), schedule))
+
+    def test_void_slot_deduplication_survives_moscow_midnight_rollover(self) -> None:
+        schedule = ("12:00", "22:00")
+
+        self.assertIsNone(
+            current_void_schedule_slot(datetime(2026, 7, 15, 23, 59, 59), schedule)
+        )
+        self.assertIsNone(
+            current_void_schedule_slot(datetime(2026, 7, 16, 0, 0), schedule)
+        )
+        previous_day = current_void_schedule_slot(
+            datetime(2026, 7, 15, 12, 0, 1), schedule
+        )
+        first_poll = current_void_schedule_slot(
+            datetime(2026, 7, 16, 12, 0, 1), schedule
+        )
+        second_poll = current_void_schedule_slot(
+            datetime(2026, 7, 16, 12, 0, 41), schedule
+        )
+        self.assertEqual(previous_day, "2026-07-15:12:00")
+        self.assertEqual(first_poll, "2026-07-16:12:00")
+        self.assertNotEqual(first_poll, previous_day)
+        self.assertEqual(second_poll, first_poll)
 
     def test_build_rubric_header_for_news_mode(self) -> None:
         self.assertEqual(build_rubric_header("news", "AI"), "SIGNAL / AI")
@@ -878,12 +898,26 @@ class AutopostingRubricTests(unittest.TestCase):
             encoding="utf-8"
         )
 
-        self.assertIn("OnCalendar=*-*-* 13:30:00 Europe/Moscow", timer)
-        self.assertIn("OnCalendar=*-*-* 20:30:00 Europe/Moscow", timer)
-        self.assertIn(
-            "OnCalendar=Fri,Sat *-*-* 23:30:00 Europe/Moscow", timer
+        calendar_lines = {
+            line.strip()
+            for line in timer.splitlines()
+            if line.strip().startswith("OnCalendar=")
+        }
+        self.assertEqual(
+            calendar_lines,
+            {
+                "OnCalendar=*-*-* 12:00:00 Europe/Moscow",
+                "OnCalendar=*-*-* 22:00:00 Europe/Moscow",
+            },
         )
-        self.assertNotIn("00,03,06,09,12,15,18,21", timer)
+        self.assertIn("Persistent=false", timer)
+        self.assertNotIn("Persistent=true", timer)
+
+        consumer = Path("deploy/systemd/void-vk-autopost.timer").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("OnUnitActiveSec=2min", consumer)
+        self.assertIn("Persistent=true", consumer)
 
 
 class VkPublishingRoutingTests(unittest.IsolatedAsyncioTestCase):
