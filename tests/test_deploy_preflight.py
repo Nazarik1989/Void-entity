@@ -47,10 +47,10 @@ class DeployPreflightTests(unittest.TestCase):
         self.assertEqual(decision.seconds_to_nearest_slot, 600)
 
     def test_vk_slot_inside_fifteen_minutes_blocks_deploy(self):
-        decision = assess(datetime(2026, 7, 22, 13, 20, tzinfo=MSK))
+        decision = assess(datetime(2026, 7, 22, 11, 50, 1, tzinfo=MSK))
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.nearest_slot.destination, "vk")
-        self.assertEqual(decision.nearest_slot.scheduled_at.strftime("%H:%M"), "13:30")
+        vk_slot = next(slot for slot in decision.next_slots if slot.route == "void.vk")
+        self.assertEqual(vk_slot.scheduled_at.strftime("%H:%M"), "12:00")
 
     def test_exactly_fifteen_minutes_is_allowed_when_no_unit_is_running(self):
         decision = assess(datetime(2026, 7, 22, 11, 45, tzinfo=MSK))
@@ -63,7 +63,7 @@ class DeployPreflightTests(unittest.TestCase):
         self.assertIn("post_slot_claim_grace:naz.telegram", decision.blockers)
 
     def test_systemd_accuracy_claim_grace_blocks_at_slot_plus_one_second(self):
-        decision = assess(datetime(2026, 7, 22, 13, 30, 1, tzinfo=MSK))
+        decision = assess(datetime(2026, 7, 22, 12, 0, 1, tzinfo=MSK))
         self.assertFalse(decision.allowed)
         self.assertIn("post_slot_claim_grace", decision.reason_codes)
         self.assertIn("post_slot_claim_grace:void.vk", decision.blockers)
@@ -88,15 +88,24 @@ class DeployPreflightTests(unittest.TestCase):
         self.assertTrue(decision.allowed)
         self.assertNotIn("unit_in_flight", decision.reason_codes)
 
-    def test_helper_and_systemd_keep_existing_void_schedules(self):
+    def test_helper_and_systemd_have_exact_target_void_schedules(self):
         timer = Path("deploy/systemd/void-vk-producer.timer").read_text(encoding="utf-8")
         self.assertEqual(
             deploy_preflight.VOID_TELEGRAM_TIMES,
-            ("12:00", "16:00", "20:00", "00:00"),
+            ("12:00", "22:00"),
         )
-        self.assertIn("OnCalendar=*-*-* 13:30:00 Europe/Moscow", timer)
-        self.assertIn("OnCalendar=*-*-* 20:30:00 Europe/Moscow", timer)
-        self.assertIn("OnCalendar=Fri,Sat *-*-* 23:30:00 Europe/Moscow", timer)
+        self.assertEqual(
+            {
+                line.strip()
+                for line in timer.splitlines()
+                if line.strip().startswith("OnCalendar=")
+            },
+            {
+                "OnCalendar=*-*-* 12:00:00 Europe/Moscow",
+                "OnCalendar=*-*-* 22:00:00 Europe/Moscow",
+            },
+        )
+        self.assertIn("Persistent=false", timer)
 
     def test_canonical_evaluator_returns_all_four_routes_and_valid_until(self):
         decision = deploy_preflight.assess_coordinated_deploy(
@@ -173,7 +182,7 @@ class DeployPreflightTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertIn("runtime_state_unknown", decision.reason_codes)
 
-    def test_moscow_midnight_rollover_uses_next_day_slot(self):
+    def test_moscow_midnight_rollover_uses_next_day_without_midnight_void_slot(self):
         decision = deploy_preflight.assess_coordinated_deploy(
             datetime(2026, 7, 22, 23, 55, tzinfo=MSK),
             schedules=deploy_preflight.default_schedule_snapshots(),
@@ -182,9 +191,20 @@ class DeployPreflightTests(unittest.TestCase):
             queue_processing_count=0,
             consumer_lock_held=False,
         )
-        self.assertEqual(decision.nearest_slot.route, "void.telegram")
-        self.assertEqual(decision.nearest_slot.scheduled_at.strftime("%Y-%m-%d %H:%M"), "2026-07-23 00:00")
-        self.assertFalse(decision.allowed)
+        void_slots = {
+            slot.route: slot.scheduled_at.strftime("%Y-%m-%d %H:%M")
+            for slot in decision.next_slots
+            if slot.persona == "void"
+        }
+        self.assertEqual(
+            void_slots,
+            {
+                "void.telegram": "2026-07-23 12:00",
+                "void.vk": "2026-07-23 12:00",
+            },
+        )
+        self.assertTrue(all(not value.endswith(" 00:00") for value in void_slots.values()))
+        self.assertTrue(decision.allowed)
 
     def test_weekly_naz_vk_slot_and_every_in_flight_signal_block(self):
         decision = deploy_preflight.assess_coordinated_deploy(
@@ -211,8 +231,8 @@ class DeployPreflightTests(unittest.TestCase):
             snapshot["void.telegram"]["daily_times"],
             main.VOID_TELEGRAM_AUTO_TIMES,
         )
-        self.assertEqual(snapshot["void.vk"]["daily_times"], ("13:30", "20:30"))
-        self.assertEqual(snapshot["void.vk"]["weekly_times"], (((4, 5), "23:30"),))
+        self.assertEqual(snapshot["void.vk"]["daily_times"], ("12:00", "22:00"))
+        self.assertEqual(snapshot["void.vk"]["weekly_times"], ())
 
     def test_schedule_snapshot_loader_and_live_collector_never_read_env(self):
         with tempfile.TemporaryDirectory() as root:

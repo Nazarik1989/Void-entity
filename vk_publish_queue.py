@@ -25,7 +25,14 @@ MAX_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_TRACK_QUERY_LENGTH = 300
 MAX_DEDUPE_KEY_LENGTH = 256
 RECENT_TRACK_LIMIT = 8
+TRACK_ROTATION_SIZE = int(os.getenv("VK_TRACK_ROTATION_SIZE", "149") or "149")
+if TRACK_ROTATION_SIZE <= 0:
+    raise ValueError("VK_TRACK_ROTATION_SIZE must be positive")
+VK_MUSIC_TRACKS_FILE = Path(
+    os.getenv("VK_MUSIC_TRACKS_FILE", "data/vk_music_tracks.json")
+)
 TRACK_HISTORY_FILENAME = "recent-tracks.json"
+UNAVAILABLE_TRACKS_FILENAME = "unavailable-tracks.json"
 TRACK_HISTORY_BACKFILL_MARKER = ".track-history-v2-complete"
 LEGACY_RECEIPT_HISTORY_SCHEMA = "vk_publish_job.v2"
 LEGACY_TRACK_HISTORY_CHECKPOINT_SCHEMA = "vk_track_history_checkpoint.v2"
@@ -37,6 +44,13 @@ PUBLICATION_RECEIPT_FIELDS = frozenset(
     {"schema", "job_id", "producer", "source_ref", "published_at"}
 )
 RETRY_DELAY_SECONDS = 30 * 60
+RETRY_STATE_FILENAME = "retry.json"
+LEGACY_RETRY_STATE_SCHEMA = "vk_publish_retry.v1"
+RETRY_STATE_SCHEMA = "vk_publish_retry.v2"
+RETRYABLE_EXIT_CODE = 75
+MAX_RETRY_ATTEMPTS = int(os.getenv("VK_MAX_PUBLISH_RETRIES", "12") or "12")
+if MAX_RETRY_ATTEMPTS <= 0:
+    raise ValueError("VK_MAX_PUBLISH_RETRIES must be positive")
 JOB_ID_RE = re.compile(r"^(naz|void)-[0-9a-f]{24}$")
 
 
@@ -60,6 +74,36 @@ def normalize_track_query(value: str) -> str:
     return " ".join(re.findall(r"[0-9a-zа-яё]+", str(value).casefold()))
 
 
+def _void_track_catalog_entries() -> tuple[tuple[str, str], ...]:
+    try:
+        payload = json.loads(VK_MUSIC_TRACKS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QueueValidationError("VOID VK track catalog is unavailable") from exc
+    tracks = payload.get("tracks", payload) if isinstance(payload, dict) else payload
+    if not isinstance(tracks, list):
+        raise QueueValidationError("VOID VK track catalog is invalid")
+    entries: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        query = f"{track.get('artist', '')} {track.get('title', '')}".strip()
+        key = normalize_track_query(query)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        entries.append((key, query))
+    if len(entries) != TRACK_ROTATION_SIZE:
+        raise QueueValidationError(
+            "VOID VK track catalog size does not match VK_TRACK_ROTATION_SIZE"
+        )
+    return tuple(entries)
+
+
+def _void_track_catalog_keys() -> frozenset[str]:
+    return frozenset(key for key, _query in _void_track_catalog_entries())
+
+
 def recent_track_keys(
     queue_root: Path,
     limit: int | None = RECENT_TRACK_LIMIT,
@@ -72,6 +116,8 @@ def recent_track_keys(
     if limit is not None and limit <= 0:
         return []
     path = Path(queue_root) / TRACK_HISTORY_FILENAME
+    if path.is_symlink():
+        raise QueueValidationError("shared VK track history is unavailable")
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -111,6 +157,79 @@ def _record_published_track(queue_root: Path, job: dict[str, Any]) -> None:
     temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.chmod(temp, 0o644)
     os.replace(temp, path)
+
+
+def unavailable_track_keys(queue_root: Path) -> list[str]:
+    """Return tracks that VK search proved unavailable, separate from plays."""
+    path = Path(queue_root) / UNAVAILABLE_TRACKS_FILENAME
+    if path.is_symlink():
+        raise QueueValidationError("unavailable track history is unsafe")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    except (OSError, json.JSONDecodeError) as exc:
+        raise QueueValidationError("unavailable track history is invalid") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"tracks"}
+        or not isinstance(payload["tracks"], list)
+    ):
+        raise QueueValidationError("unavailable track history is invalid")
+    keys: list[str] = []
+    for item in payload["tracks"]:
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"key"}
+            or not isinstance(item["key"], str)
+        ):
+            raise QueueValidationError("unavailable track history is invalid")
+        key = item["key"]
+        if not key or normalize_track_query(key) != key or key in keys:
+            raise QueueValidationError("unavailable track history is invalid")
+        keys.append(key)
+    return keys
+
+
+def _record_unavailable_track_query(
+    queue_root: Path,
+    track_query: str,
+) -> None:
+    queue_root = Path(queue_root)
+    path = queue_root / UNAVAILABLE_TRACKS_FILENAME
+    key = normalize_track_query(track_query)
+    if not key:
+        raise QueueValidationError("unavailable track query is invalid")
+    keys = unavailable_track_keys(queue_root)
+    if key in keys:
+        return
+    keys.append(key)
+    payload = {"tracks": [{"key": item} for item in keys]}
+    temp = queue_root / f".{UNAVAILABLE_TRACKS_FILENAME}.tmp-{uuid.uuid4().hex}"
+    try:
+        with temp.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o644)
+        os.replace(temp, path)
+        _sync_directory(queue_root)
+    finally:
+        if temp.exists() and not temp.is_symlink():
+            temp.unlink()
+
+
+def _sync_directory(path: Path) -> None:
+    """Make a completed atomic rename durable before dependent state advances."""
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 
 
 def _validated_receipt_history_job(
@@ -252,7 +371,7 @@ def _backfill_full_track_history(queue_root: Path, allowed_group_id: str) -> Non
     # file can be restored from the v3 checkpoint and publication receipts.
     current_recent = recent_track_keys(queue_root, None)
 
-    def receipt_track_key(receipt: dict[str, str]) -> str:
+    def receipt_track_key(receipt: dict[str, Any]) -> str | None:
         job_dir = next(
             (
                 candidate
@@ -283,9 +402,10 @@ def _backfill_full_track_history(queue_root: Path, allowed_group_id: str) -> Non
         ]
         for receipt in pending_receipts:
             key = receipt_track_key(receipt)
-            if key in ordered:
-                ordered.remove(key)
-            ordered.append(key)
+            if key is not None:
+                if key in ordered:
+                    ordered.remove(key)
+                ordered.append(key)
             processed.add(receipt["job_id"])
         if not set(current_recent).issubset(ordered):
             raise QueueValidationError(
@@ -299,9 +419,10 @@ def _backfill_full_track_history(queue_root: Path, allowed_group_id: str) -> Non
         receipt_order: list[str] = []
         for receipt in receipts:
             key = receipt_track_key(receipt)
-            if key in receipt_order:
-                receipt_order.remove(key)
-            receipt_order.append(key)
+            if key is not None:
+                if key in receipt_order:
+                    receipt_order.remove(key)
+                receipt_order.append(key)
             processed.add(receipt["job_id"])
         current_keys = set(current_recent)
         ordered = [key for key in receipt_order if key not in current_keys]
@@ -336,7 +457,8 @@ def _publication_receipt_path(queue_root: Path, job_id: str) -> Path:
 
 
 def _record_publication_receipt(queue_root: Path, job: dict[str, Any]) -> None:
-    receipts = Path(queue_root) / PUBLICATION_RECEIPTS_DIRNAME
+    queue_root = Path(queue_root)
+    receipts = queue_root / PUBLICATION_RECEIPTS_DIRNAME
     receipts.mkdir(mode=0o770, parents=True, exist_ok=True)
     receipt = {
         "schema": PUBLICATION_RECEIPT_SCHEMA,
@@ -347,19 +469,28 @@ def _record_publication_receipt(queue_root: Path, job: dict[str, Any]) -> None:
     }
     final = _publication_receipt_path(queue_root, job["job_id"])
     temp = receipts / f".{job['job_id']}.tmp-{uuid.uuid4().hex}"
-    temp.write_text(
-        json.dumps(receipt, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    os.chmod(temp, 0o640)
-    os.replace(temp, final)
+    try:
+        with temp.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(receipt, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o640)
+        os.replace(temp, final)
+        _sync_directory(receipts)
+        # ``receipts`` may have been created in this call, so persist its
+        # directory entry as well as the receipt entry inside it.
+        _sync_directory(queue_root)
+    finally:
+        if temp.exists() and not temp.is_symlink():
+            temp.unlink()
 
 
 def publication_receipts(
     queue_root: Path,
     *,
     producer: str | None = None,
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     if producer is not None and producer not in PRODUCERS:
         raise QueueValidationError("unknown receipt producer")
     receipts = Path(queue_root) / PUBLICATION_RECEIPTS_DIRNAME
@@ -367,7 +498,7 @@ def publication_receipts(
         return []
     if not receipts.is_dir() or receipts.is_symlink():
         raise QueueValidationError("publication receipt directory is unavailable")
-    result: list[dict[str, str]] = []
+    result: list[dict[str, Any]] = []
     for path in sorted(receipts.glob("*.json")):
         if not path.is_file() or path.is_symlink():
             raise QueueValidationError("invalid publication receipt path")
@@ -399,7 +530,7 @@ def publication_receipts(
             raise QueueValidationError("publication timestamp must include timezone")
         if producer is None or receipt["producer"] == producer:
             result.append(
-                {key: str(receipt[key]) for key in PUBLICATION_RECEIPT_FIELDS}
+                {key: receipt[key] for key in PUBLICATION_RECEIPT_FIELDS}
             )
     return result
 
@@ -428,10 +559,130 @@ def _backfill_publication_receipts(
     os.replace(temp, marker)
 
 
-def _ensure_track_is_fresh(queue_root: Path, track_query: str) -> None:
+def _ensure_track_is_fresh(
+    queue_root: Path,
+    track_query: str,
+    producer: str,
+) -> None:
     key = normalize_track_query(track_query)
-    if key in set(recent_track_keys(queue_root, RECENT_TRACK_LIMIT)):
-        raise DuplicateTrackError("track was used in the last 8 published VK posts")
+    history = recent_track_keys(queue_root, limit=None)
+    if producer == "void":
+        catalog_keys = _void_track_catalog_keys()
+        if key not in catalog_keys:
+            raise QueueValidationError(
+                "VOID track_query is not present in the current track catalog"
+            )
+        unavailable = set(unavailable_track_keys(queue_root)) & set(catalog_keys)
+        if key in unavailable:
+            raise DuplicateTrackError(
+                "VOID track is quarantined because VK search could not find it"
+            )
+        active_catalog = set(catalog_keys) - unavailable
+        history = [item for item in history if item in active_catalog]
+        cooldown_size = min(len(active_catalog) - 1, len(history))
+        if cooldown_size and key in set(history[-cooldown_size:]):
+            raise DuplicateTrackError(
+                "VOID track cannot repeat until the other "
+                f"{len(active_catalog) - 1} available catalog tracks have been published"
+            )
+        return
+    if key in set(history[-RECENT_TRACK_LIMIT:]):
+        raise DuplicateTrackError(
+            "track was used in the last 8 published VK posts"
+        )
+
+
+def _select_void_replacement_track(
+    queue_root: Path,
+    failed_track_query: str,
+) -> str:
+    entries = _void_track_catalog_entries()
+    if not entries:
+        raise QueueValidationError("VOID VK track catalog is empty")
+    unavailable = set(unavailable_track_keys(queue_root))
+    active = [(key, query) for key, query in entries if key not in unavailable]
+    if not active:
+        raise QueueValidationError("no available VOID VK tracks remain")
+    active_keys = {key for key, _query in active}
+    history = [
+        key
+        for key in recent_track_keys(queue_root, limit=None)
+        if key in active_keys
+    ]
+    cooldown_size = min(len(active) - 1, len(history))
+    blocked = set(history[-cooldown_size:]) if cooldown_size else set()
+    candidates = {
+        key: query for key, query in active if key not in blocked
+    }
+    if not candidates:
+        raise QueueValidationError("no fresh available VOID VK track remains")
+
+    failed_key = normalize_track_query(failed_track_query)
+    index_by_key = {key: index for index, (key, _query) in enumerate(entries)}
+    failed_index = index_by_key.get(failed_key, -1)
+    catalog_size = len(entries)
+    selected_key = min(
+        candidates,
+        key=lambda key: (
+            (index_by_key[key] - failed_index) % catalog_size or catalog_size,
+            index_by_key[key],
+        ),
+    )
+    return candidates[selected_key]
+
+
+def _replace_job_track_query(
+    job_dir: Path,
+    allowed_group_id: str,
+    replacement_track_query: str,
+) -> dict[str, Any]:
+    job_dir = Path(job_dir)
+    current = validate_job(job_dir, allowed_group_id)
+    replacement = str(replacement_track_query).strip()
+    if not normalize_track_query(replacement):
+        raise QueueValidationError("replacement track query is invalid")
+    updated = dict(current)
+    updated["track_query"] = replacement
+    updated = _validate_shape(updated, allowed_group_id)
+    final = job_dir / "job.json"
+    temp = job_dir / f".job.json.track-{uuid.uuid4().hex}"
+    try:
+        with temp.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(updated, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o640)
+        os.replace(temp, final)
+        _sync_directory(job_dir)
+    finally:
+        if temp.exists() and not temp.is_symlink():
+            temp.unlink()
+    return validate_job(job_dir, allowed_group_id)
+
+
+def _promote_quarantined_void_job(
+    queue_root: Path,
+    job_dir: Path,
+    allowed_group_id: str,
+) -> tuple[dict[str, Any], str]:
+    current = validate_job(job_dir, allowed_group_id)
+    if current["producer"] != "void":
+        raise QueueValidationError("only VOID jobs use catalog track promotion")
+    current_key = normalize_track_query(current["track_query"])
+    if current_key not in set(unavailable_track_keys(queue_root)):
+        raise QueueValidationError("VOID job track is not quarantined")
+    replacement = _select_void_replacement_track(
+        queue_root,
+        current["track_query"],
+    )
+    promoted = _replace_job_track_query(
+        job_dir,
+        allowed_group_id,
+        replacement,
+    )
+    _remove_runtime_markers(job_dir)
+    return promoted, current_key
 
 
 def canonical_job_id(producer: str, dedupe_key: str) -> str:
@@ -445,6 +696,248 @@ def canonical_job_id(producer: str, dedupe_key: str) -> str:
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _retry_error_code(exc: RetryablePublishError) -> str:
+    message = str(exc).casefold()
+    if "no matching vk audio result" in message:
+        return "vk_audio_no_match"
+    if "audio search input" in message:
+        return "vk_audio_search_unavailable"
+    if "audio attachment" in message or "did not confirm" in message:
+        return "vk_audio_attachment_unconfirmed"
+    if "authentication" in message:
+        return "vk_authentication_required"
+    if "composer" in message:
+        return "vk_composer_unavailable"
+    return "vk_publish_retryable"
+
+
+def _retry_job_identity(job_dir: Path) -> tuple[str, str]:
+    job_file = Path(job_dir) / "job.json"
+    if job_file.is_symlink() or not job_file.is_file():
+        raise QueueValidationError("retry job is unavailable")
+    try:
+        payload = json.loads(job_file.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QueueValidationError("retry job is unavailable") from exc
+    if not isinstance(payload, dict):
+        raise QueueValidationError("retry job is unavailable")
+    producer = payload.get("producer")
+    key = normalize_track_query(payload.get("track_query", ""))
+    if producer not in PRODUCERS or not key:
+        raise QueueValidationError("retry job is unavailable")
+    return str(producer), key
+
+
+def _load_retry_state(job_dir: Path) -> dict[str, Any] | None:
+    path = Path(job_dir) / RETRY_STATE_FILENAME
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise QueueValidationError("retry state is unsafe")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise QueueValidationError("retry state is invalid") from exc
+    legacy_expected = {
+        "schema",
+        "attempts",
+        "error_code",
+        "first_failed_at",
+        "last_failed_at",
+    }
+    transitional_expected = legacy_expected | {"audio_unavailable"}
+    expected = legacy_expected | {"unavailable_track_queries"}
+    if (
+        not isinstance(payload, dict)
+        or frozenset(payload) not in {
+            frozenset(legacy_expected),
+            frozenset(transitional_expected),
+            frozenset(expected),
+        }
+        or payload.get("schema")
+        not in {LEGACY_RETRY_STATE_SCHEMA, RETRY_STATE_SCHEMA}
+        or not isinstance(payload.get("attempts"), int)
+        or payload["attempts"] <= 0
+        or not isinstance(payload.get("error_code"), str)
+        or not payload["error_code"]
+    ):
+        raise QueueValidationError("retry state is invalid")
+    if payload["schema"] == LEGACY_RETRY_STATE_SCHEMA:
+        if set(payload) != legacy_expected:
+            raise QueueValidationError("retry state is invalid")
+        producer, current_key = _retry_job_identity(job_dir)
+        payload["unavailable_track_queries"] = (
+            [current_key]
+            if producer == "void" and payload["error_code"] == "vk_audio_no_match"
+            else []
+        )
+    elif set(payload) == transitional_expected:
+        if not isinstance(payload.get("audio_unavailable"), bool):
+            raise QueueValidationError("retry state is invalid")
+        producer, current_key = _retry_job_identity(job_dir)
+        payload["unavailable_track_queries"] = (
+            [current_key]
+            if producer == "void" and payload["audio_unavailable"]
+            else []
+        )
+        payload.pop("audio_unavailable")
+    elif set(payload) != expected:
+        raise QueueValidationError("retry state is invalid")
+    unavailable = payload.get("unavailable_track_queries")
+    if (
+        not isinstance(unavailable, list)
+        or len(unavailable) > TRACK_ROTATION_SIZE
+        or any(
+            not isinstance(key, str)
+            or not key
+            or normalize_track_query(key) != key
+            for key in unavailable
+        )
+        or len(set(unavailable)) != len(unavailable)
+    ):
+        raise QueueValidationError("retry state is invalid")
+    for field in ("first_failed_at", "last_failed_at"):
+        try:
+            parsed = datetime.fromisoformat(str(payload[field]).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise QueueValidationError("retry state timestamp is invalid") from exc
+        if parsed.tzinfo is None:
+            raise QueueValidationError("retry state timestamp must include timezone")
+    return payload
+
+
+def _record_retry_state(job_dir: Path, exc: RetryablePublishError) -> dict[str, Any]:
+    job_dir = Path(job_dir)
+    previous = _load_retry_state(job_dir)
+    now = _utc_now()
+    error_code = _retry_error_code(exc)
+    unavailable = list(
+        (previous or {}).get("unavailable_track_queries", ())
+    )
+    producer, attempted_track_key = _retry_job_identity(job_dir)
+    if (
+        producer == "void"
+        and error_code == "vk_audio_no_match"
+        and attempted_track_key not in unavailable
+    ):
+        unavailable.append(attempted_track_key)
+    payload = {
+        "schema": RETRY_STATE_SCHEMA,
+        # Count every retryable failure. Resetting the counter when VK alternates
+        # between two error shapes would let one poisoned job live forever.
+        "attempts": int(previous["attempts"]) + 1 if previous is not None else 1,
+        "error_code": error_code,
+        "unavailable_track_queries": unavailable,
+        "first_failed_at": (
+            str(previous["first_failed_at"]) if previous is not None else now
+        ),
+        "last_failed_at": now,
+    }
+    final = job_dir / RETRY_STATE_FILENAME
+    temp = job_dir / f".{RETRY_STATE_FILENAME}.tmp-{uuid.uuid4().hex}"
+    try:
+        with temp.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp, 0o640)
+        os.replace(temp, final)
+        _sync_directory(job_dir)
+    finally:
+        if temp.exists() and not temp.is_symlink():
+            temp.unlink()
+    (job_dir / "retry.txt").write_text(
+        f"{type(exc).__name__}: {exc}\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
+def _backfill_unavailable_tracks(
+    queue_root: Path,
+    allowed_group_id: str,
+) -> None:
+    """Recover missing-track quarantine from durable retry records."""
+    known = set(unavailable_track_keys(queue_root))
+    for state in ("failed", "pending", "processing"):
+        state_root = Path(queue_root) / state
+        if not state_root.exists():
+            continue
+        for job_dir in sorted(state_root.iterdir()):
+            if (
+                job_dir.is_symlink()
+                or not job_dir.is_dir()
+                or not JOB_ID_RE.fullmatch(job_dir.name)
+            ):
+                continue
+            retry_state = _load_retry_state(job_dir)
+            if retry_state is None:
+                continue
+            job = validate_job(job_dir, allowed_group_id)
+            if job["producer"] != "void":
+                continue
+            catalog = _void_track_catalog_keys()
+            for key in retry_state["unavailable_track_queries"]:
+                if key not in catalog:
+                    raise QueueValidationError(
+                        "retry state track is outside the current VOID catalog"
+                    )
+                if key not in known:
+                    _record_unavailable_track_query(queue_root, key)
+                    known.add(key)
+
+
+def _remove_runtime_markers(job_dir: Path) -> None:
+    for name in ("error.txt", "retry.txt", RETRY_STATE_FILENAME):
+        path = Path(job_dir) / name
+        if path.exists() and not path.is_symlink():
+            path.unlink()
+
+
+def _recover_interrupted_jobs(queue_root: Path, allowed_group_id: str) -> None:
+    """Recover work left between atomic queue-state transitions.
+
+    The consumer is protected by a host-wide flock, so a directory in
+    ``processing`` at startup cannot belong to another live consumer. A durable
+    publication receipt wins and advances the job to ``done``; otherwise the
+    original pending job is restored. Receipt-backed ``failed`` jobs are also
+    reconciled because they represent a post that reached VK before a local
+    bookkeeping write failed.
+    """
+
+    queue_root = Path(queue_root)
+    published_ids = {
+        receipt["job_id"] for receipt in publication_receipts(queue_root)
+    }
+    for state in ("processing", "failed"):
+        source_root = queue_root / state
+        for source in sorted(source_root.iterdir()):
+            if source.is_symlink():
+                raise QueueValidationError(f"unsafe {state} queue entry")
+            if not source.is_dir() or source.name.startswith("."):
+                continue
+            # Historical queues can contain administrative marker directories;
+            # only canonical jobs participate in crash recovery.
+            if not JOB_ID_RE.fullmatch(source.name):
+                continue
+            job = validate_job(source, allowed_group_id)
+            is_published = job["job_id"] in published_ids
+            if state == "failed" and not is_published:
+                continue
+            target_root = queue_root / ("done" if is_published else "pending")
+            target = target_root / source.name
+            if target.exists():
+                raise QueueValidationError(
+                    f"cannot recover {job['job_id']}: target already exists"
+                )
+            if is_published:
+                _remove_runtime_markers(source)
+            os.replace(source, target)
+            _sync_directory(source_root)
+            _sync_directory(target_root)
 
 
 def _safe_media_name(value: Any) -> str:
@@ -569,7 +1062,7 @@ def enqueue_job(queue_root: Path, job: dict[str, Any], media: dict[str, bytes]) 
     if set(media) != set(job["media"]):
         raise QueueValidationError("media payload does not match job.media")
     queue_root = Path(queue_root)
-    _ensure_track_is_fresh(queue_root, job["track_query"])
+    _ensure_track_is_fresh(queue_root, job["track_query"], job["producer"])
     pending = queue_root / "pending"
     pending.mkdir(parents=True, exist_ok=True)
     final = pending / job["job_id"]
@@ -616,9 +1109,7 @@ def requeue_failed(queue_root: Path, job_id: str, allowed_group_id: str) -> Path
     target = queue_root / "pending" / job_id
     if target.exists():
         raise DuplicateJobError("pending job already exists")
-    error_file = source / "error.txt"
-    if error_file.exists() and not error_file.is_symlink():
-        error_file.unlink()
+    _remove_runtime_markers(source)
     os.replace(source, target)
     return target
 
@@ -628,7 +1119,9 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
     for state in STATES:
         (queue_root / state).mkdir(parents=True, exist_ok=True)
     _backfill_publication_receipts(queue_root, allowed_group_id)
+    _recover_interrupted_jobs(queue_root, allowed_group_id)
     _backfill_full_track_history(queue_root, allowed_group_id)
+    _backfill_unavailable_tracks(queue_root, allowed_group_id)
     for source in sorted((queue_root / "pending").iterdir()):
         if not source.is_dir() or source.is_symlink() or source.name.startswith("."):
             continue
@@ -642,31 +1135,150 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
             if _dedupe_seen(queue_root, job["dedupe_key"], processing):
                 raise DuplicateJobError("duplicate dedupe_key")
             retry_file = processing / "retry.txt"
+            retry_state = _load_retry_state(processing)
+            replacement_required = bool(
+                job["producer"] == "void"
+                and normalize_track_query(job["track_query"])
+                in set(unavailable_track_keys(queue_root))
+            )
+            if (
+                job["producer"] == "void"
+                and retry_state is not None
+                and retry_state["error_code"] == "vk_audio_no_match"
+                and normalize_track_query(job["track_query"])
+                not in set(retry_state["unavailable_track_queries"])
+            ):
+                # A crash can land after the atomic job.json replacement but
+                # before old retry markers are removed. The replacement query
+                # proves promotion won, so stale missing-audio backoff is safe
+                # to discard.
+                _remove_runtime_markers(processing)
+                retry_file = processing / "retry.txt"
+                retry_state = None
+            # An exact catalog track can legitimately be absent from VK's
+            # current search index. Replace it durably on the same queue job;
+            # every published post still has an exact, confirmed audio track.
             if (
                 retry_file.is_file()
                 and not retry_file.is_symlink()
                 and time.time() - retry_file.stat().st_mtime < RETRY_DELAY_SECONDS
+                and not replacement_required
             ):
                 os.replace(processing, source)
                 continue
             if job["not_before"] and datetime.fromisoformat(job["not_before"].replace("Z", "+00:00")) > datetime.now(timezone.utc):
                 os.replace(processing, source)
                 continue
-            _ensure_track_is_fresh(queue_root, job["track_query"])
+            if replacement_required:
+                job, missing_key = _promote_quarantined_void_job(
+                    queue_root,
+                    processing,
+                    allowed_group_id,
+                )
+                os.replace(processing, source)
+                print(
+                    "VK publisher replaced unavailable audio "
+                    f"job_id={source.name} "
+                    f"missing={missing_key} "
+                    f"replacement={normalize_track_query(job['track_query'])}",
+                    flush=True,
+                )
+                # Promotion is a durable state transition, not a publish
+                # attempt.  Let the next timer open a clean composer for the
+                # replacement track instead of reusing this browser run.
+                return 0
+            _ensure_track_is_fresh(
+                queue_root,
+                job["track_query"],
+                job["producer"],
+            )
             publish(job, [processing / name for name in job["media"]])
             _record_publication_receipt(queue_root, job)
             _record_published_track(queue_root, job)
             _backfill_full_track_history(queue_root, allowed_group_id)
-            if retry_file.exists() and not retry_file.is_symlink():
-                retry_file.unlink()
+            for retry_name in ("retry.txt", RETRY_STATE_FILENAME):
+                completed_retry_file = processing / retry_name
+                if (
+                    completed_retry_file.exists()
+                    and not completed_retry_file.is_symlink()
+                ):
+                    completed_retry_file.unlink()
             os.replace(processing, queue_root / "done" / source.name)
             return 0
         except RetryablePublishError as exc:
-            (processing / "retry.txt").write_text(
-                f"{type(exc).__name__}: {exc}\n", encoding="utf-8"
-            )
+            try:
+                retry_state = _record_retry_state(processing, exc)
+            except Exception as state_exc:
+                try:
+                    (processing / "error.txt").write_text(
+                        f"RetryStateError: {type(state_exc).__name__}\n",
+                        encoding="utf-8",
+                    )
+                except OSError:
+                    pass
+                os.replace(processing, queue_root / "failed" / source.name)
+                print(
+                    "VK publisher retry-state failure "
+                    f"job_id={source.name} error={type(state_exc).__name__}",
+                    flush=True,
+                )
+                return 1
+            if (
+                job["producer"] == "void"
+                and retry_state["error_code"] == "vk_audio_no_match"
+            ):
+                try:
+                    for missing_key in retry_state["unavailable_track_queries"]:
+                        _record_unavailable_track_query(queue_root, missing_key)
+                    promoted, missing_key = _promote_quarantined_void_job(
+                        queue_root,
+                        processing,
+                        allowed_group_id,
+                    )
+                except Exception as promotion_exc:
+                    (processing / "error.txt").write_text(
+                        "TrackPromotionError: "
+                        f"{type(promotion_exc).__name__}: {promotion_exc}\n",
+                        encoding="utf-8",
+                    )
+                    os.replace(processing, queue_root / "failed" / source.name)
+                    print(
+                        "VK publisher track promotion failed "
+                        f"job_id={source.name} error={type(promotion_exc).__name__}",
+                        flush=True,
+                    )
+                    return 1
+                os.replace(processing, source)
+                print(
+                    "VK publisher quarantined missing track and promoted job "
+                    f"job_id={source.name} missing={missing_key} "
+                    f"replacement={normalize_track_query(promoted['track_query'])}",
+                    flush=True,
+                )
+                return 0
+            if int(retry_state["attempts"]) >= MAX_RETRY_ATTEMPTS:
+                (processing / "error.txt").write_text(
+                    "RetryExhaustedError: "
+                    f"{retry_state['error_code']} after "
+                    f"{retry_state['attempts']} attempts\n",
+                    encoding="utf-8",
+                )
+                os.replace(processing, queue_root / "failed" / source.name)
+                print(
+                    "VK publisher retry exhausted "
+                    f"job_id={source.name} error={retry_state['error_code']} "
+                    f"attempts={retry_state['attempts']}",
+                    flush=True,
+                )
+                return 1
             os.replace(processing, source)
-            return 0
+            print(
+                "VK publisher will retry "
+                f"job_id={source.name} error={retry_state['error_code']} "
+                f"attempt={retry_state['attempts']}/{MAX_RETRY_ATTEMPTS}",
+                flush=True,
+            )
+            return RETRYABLE_EXIT_CODE
         except Exception as exc:
             failed_target = queue_root / "failed" / source.name
             if isinstance(exc, DuplicateJobError) and failed_target.is_dir():
@@ -675,4 +1287,6 @@ def consume_once(queue_root: Path, allowed_group_id: str, publish: Callable[[dic
             (processing / "error.txt").write_text(f"{type(exc).__name__}: {exc}\n", encoding="utf-8")
             os.replace(processing, failed_target)
             return 1
+    # A job waiting for its bounded backoff is healthy timer state, not a
+    # systemd failure.  The original failed attempt has already been logged.
     return 0

@@ -14,6 +14,7 @@ from vk_publish_queue import (
     enqueue_job,
     publication_receipts,
     recent_track_keys,
+    unavailable_track_keys,
 )
 
 QUEUE_DIR = Path(os.getenv("VK_PUBLISH_QUEUE_DIR", "/var/lib/void-vk-publisher/queue"))
@@ -71,11 +72,17 @@ def enqueue_draft(draft_id: int) -> Path:
     ok, reason = main.quality_check(draft["post"])
     if not ok:
         raise RuntimeError(f"Draft #{draft_id} blocked: {reason}")
-    images = main.generate_post_images_sync(draft)
-    media = {f"image-{index}.png": content for index, content in enumerate(images[:4], start=1)}
+    images = main.generate_post_images_sync(draft, max_images=1)
+    # VK keeps an unfinished composer draft between browser sessions.  A
+    # retry must never turn one VOID cover into a carousel, and VOID's wall
+    # format intentionally uses one strong cover rather than a frame pack.
+    media = {"image-1.png": images[0]} if images else {}
+    played_tracks = recent_track_keys(QUEUE_DIR, limit=None)
+    unavailable_tracks = unavailable_track_keys(QUEUE_DIR)
     track = main.choose_vk_music_track(
         draft,
-        excluded_track_keys=recent_track_keys(QUEUE_DIR, limit=None),
+        excluded_track_keys=played_tracks,
+        unavailable_track_keys=unavailable_tracks,
     )
     if not track:
         raise RuntimeError("No suitable fresh VK music track is available; draft was not queued")

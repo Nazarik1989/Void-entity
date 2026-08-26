@@ -72,7 +72,11 @@ python main.py
 ```
 
 For Telegram publishing, add the bot to the target channel as an administrator. `CHANNEL_ID` may be a channel username; `ADMIN_ID` is the administrator’s numeric Telegram ID.
-Scheduled VOID posts use `Europe/Moscow`; configure exact daily slots with `VOID_TELEGRAM_AUTO_TIMES` (default: `12:00,16:00,20:00,00:00`).
+Scheduled VOID posts use `Europe/Moscow`. Telegram runs daily at `12:00` and `22:00`; configure those exact slots with `VOID_TELEGRAM_AUTO_TIMES` (default: `12:00,22:00`). Telegram deduplication uses a date-qualified Moscow slot, so a new calendar day cannot reuse the previous day's claim.
+Telegram and VK scheduled releases share the same broad-AI rubric matrix and
+cooldowns for themes, structures, lengths, energy, and humor. `Midnight` and
+`The Vault` remain deliberately quieter night modes; platform-specific format
+and delivery are applied only after the shared editorial plan is selected.
 
 ## Main commands
 
@@ -146,11 +150,10 @@ The manual browser helper is retained for diagnosis:
 python -m playwright install chromium
 python vk_browser_publisher.py login
 python vk_browser_publisher.py prepare-draft 259
-python vk_browser_publisher.py open-payload data/vk_browser_payloads/draft-259.json
 python vk_browser_publisher.py publish-draft 259
 ```
 
-Manual VK and music commands are documented by `/vk_commands`. Keep dry-run enabled while checking any API-based diagnostic path.
+Manual VK and music commands are documented by `/vk_commands`. `publish-draft` and `/publish_vk --yes` enqueue work for the canonical consumer; prepared-composer previews and direct browser/API publication are disabled so they cannot bypass track history. Keep dry-run enabled while checking any API-based diagnostic path.
 
 ## Isolated VPS VK pipeline
 
@@ -170,14 +173,31 @@ Canonical paths:
 
 ```text
 VK_PUBLISH_QUEUE_DIR=/var/lib/void-vk-publisher/queue
+VK_TRACK_ROTATION_SIZE=149
+VK_PUBLISH_MIN_INTERVAL_SECONDS=3600
+VK_MUSIC_TRACKS_FILE=data/vk_music_tracks.json
 VK_BROWSER_PROFILE_DIR=/var/lib/void-vk-publisher/profile
 ```
 
 Each `vk_publish_job.v1` job is an atomically renamed directory. Producers can write only `pending`; only `publisher` can read the browser profile and move jobs through `processing`, `done`, and `failed`. Global deduplication is enforced by the consumer across all states. Failed jobs may be retried only through the administrative `requeue-failed` command.
 
-`void-vk-producer.timer` generates scheduled VOID content and enqueues it without opening a browser. `void-vk-autopost.timer` runs only `vk_queue_consumer.py`, which does not import `main.py`, Telegram, or LLM code. It opens exactly the configured allowlisted VK community, creates a post, attaches local media, selects the requested track, and exits with a meaningful status.
+VK music uses one shared publication history with producer-aware rotation rules. Every VOID job starts with a track from the 149-entry allowlist, and an available track cannot return until every other currently available VOID track has played. If current VK search proves an exact catalog track unavailable, the consumer durably removes it from the active rotation and advances the same job to the next fresh catalog track; it never counts the missing track as played and never publishes that job without music. The quarantine is separate from the source catalog so an operator can audit or reverse it. Naz keeps its independent smaller-catalog policy.
+
+The browser consumer confirms that the requested audio was attached and then requires a newly visible wall post containing both the expected text and that audio before a publication receipt can advance the rotation. It writes an atomic unresolved-attempt marker immediately before clicking Publish. If the browser outcome or the hand-off to the receipt is ambiguous, later consumer runs stop with exit code `75` until an operator reconciles that exact job, preventing a possible post from being followed by an untracked repeat.
+
+`void-vk-producer.timer` generates scheduled VOID content daily at `12:00` and `22:00` Europe/Moscow and enqueues it without opening a browser. Its timer is non-persistent so a deployment or outage cannot trigger a missed producer slot immediately. A one-time migration from `Persistent=true` must clear the stopped timer's old state under the producer condition guard before activation; the VPS runbook contains the exact sequence. VOID queues one cover and generates only that one image. `void-vk-autopost.timer` runs only `vk_queue_consumer.py`, which does not import `main.py`, Telegram, or LLM code. The consumer timer keeps its independent frequent retry cadence. Before uploading, it identifies a restored composer draft by its exact managed job text, removes every persisted attachment, proves that the composer is empty, uploads the expected media count, and refuses to touch an unrelated manual draft.
 
 The consumer has a kill switch at `/etc/void-vk-publisher.disabled`. Complete user/group permissions, systemd hardening, one-time VPS profile authorization, service installation, and requeue operations are documented in `deploy/VPS_VK_PUBLISHER.md`.
+
+Retryable browser failures leave a structured `retry.json`, exit with code `75`, and are written to the systemd journal. A missing exact VOID audio result advances to another fresh active track on the next safe run; other failures remain bounded by `VK_MAX_PUBLISH_RETRIES` (default `12`). Work left in `processing` by a killed consumer is recovered from durable receipt state, including the exact replacement track that was actually attached.
+
+The consumer timer may run frequently for fast retries, while `VK_PUBLISH_MIN_INTERVAL_SECONDS` applies a separate receipt-backed delay after each confirmed publication. This keeps an outage backlog durable without releasing it as a burst of wall posts when VK recovers.
+
+## VOID in VK community conversations
+
+`vk_community_bot.py` runs VOID in the same allowlisted VK community through Bots Long Poll. It handles private messages and, behind an independent feature gate, direct questions or VOID invocations in new wall comments and user-authored wall posts. Community-authored `wall_post_new` events populate a bounded local post-text cache, so public comment replies receive the source publication as separate model context instead of guessing from the comment. It is isolated from the wall publisher, has no `wall.post`, edit, delete, or wall-read API method, uses a dedicated community token, deduplicates inbound events, persists replies before send retries, and stores VK dialogue history in a separate SQLite database. Public replies use only the explicitly allowlisted `wall.createComment` method and a stable VK `guid` so delivery retries cannot duplicate a comment.
+
+The service is deliberately disabled by default. Enable community messages and `message_new` Long Poll events in VK, add `wall_reply_new` and `wall_post_new` only when public replies are wanted, create a narrowly scoped community token, and follow `deploy/VPS_VK_COMMUNITY_BOT.md`. An optional first-contact welcome is independent of dialogue access: it is marked sent only after VK accepts `messages.send`, while non-allowlisted users still cannot reach the model. The token must never be committed or pasted into a public log.
 
 The Windows Task Scheduler scripts are retained only for legacy manual diagnostics. They are not a production scheduler.
 
@@ -191,6 +211,8 @@ The Windows Task Scheduler scripts are retained only for legacy manual diagnosti
 - `vk_publish_queue.py` — strict filesystem queue contract.
 - `void_vk_producer.py` — VOID queue producer; never opens Chromium.
 - `vk_queue_consumer.py` — standalone allowlisted production consumer.
+- `vk_community_bot.py` — durable VK Bots Long Poll conversation adapter.
+- `void_dialog_adapter.py` — transport-neutral VOID dialogue engine with isolated VK history.
 - `vk_browser_publisher.py` — retained manual browser diagnostics.
 - `deploy/` — VPS documentation and systemd units.
 - `tests/` — unit and compatibility tests.

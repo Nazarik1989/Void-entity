@@ -105,7 +105,7 @@ CROSSPOST_EXCHANGE_DIR = Path(os.getenv("CROSSPOST_EXCHANGE_DIR", "/opt/bot_exch
 CROSSPOST_EXCHANGE_INTERVAL_SECONDS = max(60, int(os.getenv("CROSSPOST_EXCHANGE_INTERVAL_SECONDS", "300") or "300"))
 CROSSPOST_EXCHANGE_MAX_PER_RUN = max(1, min(int(os.getenv("CROSSPOST_EXCHANGE_MAX_PER_RUN", "1") or "1"), 5))
 EDITORIAL_DELIVERY_STALE_SECONDS = 30 * 60
-VOID_TELEGRAM_AUTO_TIMES_RAW = os.getenv("VOID_TELEGRAM_AUTO_TIMES", "12:00,16:00,20:00,00:00").strip()
+VOID_TELEGRAM_AUTO_TIMES_RAW = os.getenv("VOID_TELEGRAM_AUTO_TIMES", "12:00,22:00").strip()
 VOID_SCHEDULED_WORK_DIR = Path(
     os.getenv("VOID_SCHEDULED_WORK_DIR", "/run/void-entity-scheduled-work").strip()
 )
@@ -159,8 +159,8 @@ def resolved_void_schedule_snapshot() -> dict[str, Any]:
             "weekly_times": (),
         },
         "void.vk": {
-            "daily_times": ("13:30", "20:30"),
-            "weekly_times": (((4, 5), "23:30"),),
+            "daily_times": ("12:00", "22:00"),
+            "weekly_times": (),
         },
     }
 
@@ -338,6 +338,9 @@ VOID_TOPICS = {
     "AI": [
         "ai", "artificial intelligence", "openai", "llm", "chatgpt", "model",
         "agent", "agents", "automation", "neural", "dataset", "robot",
+        "machine learning", "deepmind", "anthropic", "claude", "gemini",
+        "generative video", "text-to-video", "image generation", "diffusion",
+        "synthetic media", "voice model", "speech model", "computer vision",
     ],
     "ATTENTION": [
         "attention", "feed", "scroll", "social media", "algorithm", "screen time",
@@ -356,6 +359,170 @@ VOID_TOPICS = {
         "space", "battery", "chip", "compute", "research",
     ],
 }
+
+
+AI_UNAMBIGUOUS_TERMS = (
+    "artificial intelligence", "generative ai", "machine learning",
+    "artificial general intelligence", "large language model", "language model",
+    "reasoning model", "foundation model", "neural network", "multimodal",
+    "computer vision", "text-to-video", "generative video", "image generation",
+    "voice cloning", "voice model", "speech model", "synthetic media",
+    "ai agent", "agentic", "computer use", "robotics", "humanoid robot",
+    "openai", "chatgpt", "anthropic", "deepmind", "gpt", "xai", "deepseek",
+    "qwen", "midjourney", "elevenlabs",
+    "stable diffusion", "hugging face", "llm", "agi",
+)
+AI_CONTEXTUAL_BRANDS = (
+    "claude", "gemini", "grok", "mistral", "llama", "perplexity",
+    "sora", "veo", "runway",
+)
+AI_CONTEXT_CUES = (
+    "model", "chatbot", "assistant", "reasoning", "benchmark", "tokens",
+    "context window", "multimodal", "api", "agent", "video generation",
+    "image generation", "voice generation", "released", "launches", "update",
+)
+AI_NEWS_THEME_TERMS: dict[str, tuple[str, ...]] = {
+    "ai_models": (
+        "language model", "reasoning model", "foundation model", "llm", "gpt",
+        "chatgpt", "claude", "gemini", "grok", "xai",
+        "deepseek", "mistral", "qwen", "llama", "perplexity", "reasoning",
+        "benchmark", "evaluation", "context window", "training", "multimodal",
+    ),
+    "ai_agents": (
+        "agent", "agentic", "automation", "computer use", "copilot", "assistant",
+        "workflow", "orchestration", "autonomous",
+    ),
+    "ai_video": (
+        "video", "cinema", "film", "filmmaking", "sora", "veo", "runway",
+        "text-to-video", "virtual production",
+    ),
+    "ai_audio": (
+        "audio", "voice", "speech", "music", "song", "sound", "dubbing",
+        "elevenlabs", "voice cloning",
+    ),
+    "ai_images": (
+        "image", "photo", "photography", "design", "illustration", "midjourney",
+        "diffusion", "visual art",
+    ),
+    "ai_devices": (
+        "robot", "robotics", "humanoid", "device", "wearable", "sensor",
+        "autonomous car", "self-driving", "drone",
+    ),
+    "ai_science": (
+        "science", "research", "medicine", "medical", "health", "drug",
+        "biology", "education", "school", "student", "teacher",
+    ),
+    "ai_power": (
+        "copyright", "regulation", "law", "lawsuit", "safety", "surveillance",
+        "privacy", "labor", "job", "compute", "chip", "nvidia", "data center",
+        "energy", "policy", "platform", "antitrust",
+    ),
+}
+ADJACENT_NEWS_THEME_TERMS: dict[str, tuple[str, ...]] = {
+    "future_practice": (
+        "automation", "robot", "device", "wearable", "interface", "chip",
+        "compute", "research tool", "digital product",
+    ),
+    "creators": (
+        "creator", "artist", "designer", "filmmaker", "copyright", "royalties",
+        "creative work", "audience",
+    ),
+    "work": (
+        "work", "job", "labor", "workplace", "profession", "worker",
+    ),
+    "music": (
+        "music", "song", "album", "sound", "festival", "streaming", "playlist",
+    ),
+    "play": (
+        "game", "gaming", "film", "cinema", "performance", "fandom",
+    ),
+    "absurdity": (
+        "user interface", "social platform", "recommendation algorithm",
+        "content moderation", "terms of service",
+    ),
+}
+
+
+def _bounded_term_present(value: str, term: str) -> bool:
+    return bool(
+        re.search(
+            rf"(?<![0-9a-z_]){re.escape(term.casefold())}(?![0-9a-z_])",
+            value,
+        )
+    )
+
+
+def ai_news_relevance_score(title: str, summary: str = "") -> int:
+    """Return a boundary-safe AI relevance score for sourced editorial ranking."""
+    value = f"{title} {summary}".casefold()
+    standalone_ai = bool(re.search(r"(?<![0-9a-z_])ai(?![0-9a-z_])", value))
+    strong_matches = sum(
+        _bounded_term_present(value, term) for term in AI_UNAMBIGUOUS_TERMS
+    )
+    contextual_matches = sum(
+        _bounded_term_present(value, term) for term in AI_CONTEXTUAL_BRANDS
+    )
+    has_context_cue = any(
+        _bounded_term_present(value, term) for term in AI_CONTEXT_CUES
+    )
+    contextual_score = (
+        contextual_matches * 2
+        if contextual_matches >= 2 or has_context_cue or standalone_ai or strong_matches
+        else 0
+    )
+    return (5 if standalone_ai else 0) + strong_matches * 2 + contextual_score
+
+
+def is_ai_segment_news_item(title: str, summary: str = "") -> bool:
+    return ai_news_relevance_score(title, summary) > 0
+
+
+def ai_semantic_themes_for_news(title: str, summary: str = "") -> tuple[str, ...]:
+    value = f"{title} {summary}".casefold()
+    relevance = ai_news_relevance_score(title, summary)
+    theme_terms = (
+        AI_NEWS_THEME_TERMS if relevance > 0 else ADJACENT_NEWS_THEME_TERMS
+    )
+    themes = tuple(
+        theme
+        for theme, terms in theme_terms.items()
+        if any(_bounded_term_present(value, term) for term in terms)
+    )
+    if themes:
+        return themes
+    if relevance > 0:
+        return ("ai_models",)
+    return ()
+
+
+def prioritize_ai_news_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return all AI items followed by at most two classified adjacent sources."""
+    indexed = list(enumerate(items))
+    ai_items = []
+    adjacent_items = []
+    for pair in indexed:
+        item = pair[1]
+        title = str(item.get("title") or "")
+        summary = str(item.get("summary") or "")
+        if ai_news_relevance_score(title, summary) > 0:
+            ai_items.append(pair)
+        elif ai_semantic_themes_for_news(title, summary):
+            adjacent_items.append(pair)
+
+    ai_items.sort(
+        key=lambda pair: (
+            -ai_news_relevance_score(
+                str(pair[1].get("title") or ""),
+                str(pair[1].get("summary") or ""),
+            ),
+            -int(pair[1].get("score", 0) or 0),
+            pair[0],
+        )
+    )
+    adjacent_items.sort(
+        key=lambda pair: (-int(pair[1].get("score", 0) or 0), pair[0])
+    )
+    return [item for _, item in (*ai_items, *adjacent_items[:2])]
 
 def build_rubric_header(mode: str, frequency: str = "HUMAN") -> str:
     base = MODE_RUBRICS.get(mode, "SIGNAL")
@@ -1739,8 +1906,7 @@ def vk_commands_text() -> str:
         "VK commands\n\n"
         "Publisher:\n"
         "/vk_status - VK env and mode status\n"
-        "/vk_test text - dry-run raw VK text post\n"
-        "/vk_test --yes text - publish raw VK test post\n"
+        "/vk_test text - preview raw VK text locally\n"
         "/publish_vk ID - dry-run draft VK post\n"
         "/publish_vk --yes ID - publish draft to VK\n\n"
         "Rubric schedule:\n"
@@ -2613,13 +2779,21 @@ def image_visual_directions(draft_id: int, count: int, mode: str = "") -> list[s
     return directions
 
 
-def build_image_prompts_sync(draft: dict | sqlite3.Row) -> list[str]:
+def build_image_prompts_sync(
+    draft: dict | sqlite3.Row,
+    *,
+    max_images: int | None = None,
+) -> list[str]:
     draft_id = int(draft["id"] or 0)
     mode = draft["mode"] or "news"
     title = draft["title"] or "VOID signal"
     post = draft["post"] or ""
     source_name = draft["source_name"] or ""
     count = image_count_for_draft(mode, post)
+    if max_images is not None:
+        if max_images <= 0:
+            return []
+        count = min(count, max_images)
     raw_plan = str(draft["editorial_plan_json"] or "") if "editorial_plan_json" in draft.keys() else ""
     raw_package = str(draft["generation_package_json"] or "") if "generation_package_json" in draft.keys() else ""
     if raw_plan and raw_package:
@@ -2722,11 +2896,15 @@ Rules:
     ]
 
 
-def generate_post_images_sync(draft: dict | sqlite3.Row) -> list[bytes]:
+def generate_post_images_sync(
+    draft: dict | sqlite3.Row,
+    *,
+    max_images: int | None = None,
+) -> list[bytes]:
     client = openai_client()
     images: list[bytes] = []
 
-    for prompt in build_image_prompts_sync(draft):
+    for prompt in build_image_prompts_sync(draft, max_images=max_images):
         try:
             response = client.images.generate(
                 model=OPENAI_IMAGE_MODEL,
@@ -3999,6 +4177,7 @@ def _ordered_track_history(values: Iterable[str]) -> list[str]:
 def choose_vk_music_track(
     draft: dict | sqlite3.Row,
     excluded_track_keys: Iterable[str] | None = None,
+    unavailable_track_keys: Iterable[str] | None = None,
 ) -> dict[str, Any] | None:
     loaded_tracks = load_vk_music_tracks()
     tracks_by_key = {
@@ -4006,7 +4185,10 @@ def choose_vk_music_track(
         for track in loaded_tracks
         if vk_music_track_query_key(track)
     }
-    tracks = list(tracks_by_key.values())
+    unavailable = set(_ordered_track_history(unavailable_track_keys or ()))
+    tracks = [
+        track for key, track in tracks_by_key.items() if key not in unavailable
+    ]
     if not tracks:
         return None
 
@@ -4047,9 +4229,7 @@ def choose_vk_music_track(
     )
     used = set(history)
     candidates = [
-        track
-        for track in tracks
-        if vk_music_track_query_key(track) not in used
+        track for track in tracks if vk_music_track_query_key(track) not in used
     ]
     if not candidates:
         positions = {key: index for index, key in enumerate(history)}
@@ -4154,6 +4334,14 @@ def post_to_vk_wall(text: str, *, force: bool = False, attachments: list[str] | 
     if not text.strip():
         raise RuntimeError("VK post text is empty")
 
+    # This helper is retained only for a local, redacted API payload preview.
+    # A real wall.post would bypass the canonical queue, its publication
+    # receipt, and the full-catalog music rotation.
+    if force or not VK_DRY_RUN:
+        raise RuntimeError(
+            "direct VK API publication is disabled; use the canonical VK queue"
+        )
+
     owner_id = vk_owner_id_from_group_id(VK_GROUP_ID)
     params = {
         "owner_id": str(owner_id),
@@ -4165,26 +4353,12 @@ def post_to_vk_wall(text: str, *, force: bool = False, attachments: list[str] | 
     if attachments:
         params["attachments"] = ",".join(attachments)
 
-    if VK_DRY_RUN and not force:
-        safe = {**params, "access_token": "***"}
-        return {"ok": True, "dry_run": True, "post_id": None, "response": {"dry_run": safe}}
-
-    if not VK_USER_ACCESS_TOKEN:
-        raise RuntimeError("VK_USER_ACCESS_TOKEN is empty")
-
-    data = urlencode(params).encode("utf-8")
-    request = Request("https://api.vk.com/method/wall.post", data=data, method="POST")
-    with urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-
-    if "error" in payload:
-        raise RuntimeError(format_vk_error(payload["error"]))
-
+    safe = {**params, "access_token": "***"}
     return {
         "ok": True,
-        "dry_run": False,
-        "post_id": payload.get("response", {}).get("post_id"),
-        "response": payload,
+        "dry_run": True,
+        "post_id": None,
+        "response": {"dry_run": safe},
     }
 
 
@@ -4367,41 +4541,28 @@ async def publish_draft_to_vk(draft_id: int, *, force: bool = False) -> str:
     if not ok:
         return f"VK publish blocked: {reason}. Check /preview {draft_id} first."
 
+    if force:
+        try:
+            # All real VK publications must pass through the canonical queue,
+            # where the shared full-catalog rotation is enforced immediately
+            # before the browser opens the composer.
+            import void_vk_producer
+
+            path = await asyncio.to_thread(void_vk_producer.enqueue_draft, draft_id)
+        except Exception as e:
+            return f"VK queue failed: {type(e).__name__}: {e}"
+        return f"VK queued: draft #{draft_id}. job={path.name}."
+
     track = await asyncio.to_thread(choose_vk_music_track, draft)
     if not track:
         return "VK publish blocked: no suitable fresh music track is available."
-    post_text = f"{draft['post']}{format_vk_music_track(track)}"
-    attachments: list[str] = []
-    image_error = ""
-
-    if force:
-        try:
-            image_attachment = await asyncio.to_thread(build_vk_image_attachment_sync, draft)
-            attachments.append(image_attachment)
-        except Exception as e:
-            image_error = f" image=failed:{type(e).__name__}:{e}"
-
-    try:
-        result = await asyncio.to_thread(post_to_vk_wall, post_text, force=force, attachments=attachments)
-    except Exception as e:
-        return f"VK publish failed: {type(e).__name__}: {e}"
-
-    status = "dry-run" if result.get("dry_run") else "published"
-    post_id = result.get("post_id")
-    if result.get("dry_run"):
-        track_note = " track=yes" if track else " track=none"
-        return f"VK {status}: draft #{draft_id}. post_id={post_id}.{track_note} image=skipped. To publish for real: /publish_vk --yes {draft_id}"
-
-    mark_vk_published(
-        draft_id,
-        int(post_id or 0),
-        vk_owner_id_from_group_id(VK_GROUP_ID),
-        attachments=attachments,
-        music_track=track,
+    artist = str(track.get("artist") or "").strip()
+    title = str(track.get("title") or "").strip()
+    label = f"{artist} - {title}" if artist else title
+    return (
+        f"VK dry-run: draft #{draft_id}. track={label}. "
+        f"To queue for real: /publish_vk --yes {draft_id}"
     )
-    image_note = " image=yes" if attachments else image_error or " image=none"
-    track_note = " track=yes" if track else " track=none"
-    return f"VK {status}: draft #{draft_id}. post_id={post_id}.{image_note}{track_note}"
 
 
 async def make_news_drafts(limit: int = 5) -> tuple[int, int]:
@@ -4876,6 +5037,27 @@ def scheduled_package_quality_check(
         return False, "internal_metadata"
     if package.visual_relation_to_thesis.casefold() in {"n/a", "none", "unrelated"}:
         return False, "visual_relevance"
+    length_match = re.fullmatch(
+        r"\s*(\d+)\s*-\s*(\d+)\s+characters\s*",
+        str(plan.length),
+        flags=re.IGNORECASE,
+    )
+    if length_match:
+        planned_min, planned_max = map(int, length_match.groups())
+        if planned_min > planned_max:
+            return False, "planned_length_invalid"
+        final_text = package.final_text.strip()
+        exact_source_line = f"Источник: {plan.source_ref}"
+        body = (
+            final_text[: -len(exact_source_line)].rstrip()
+            if final_text.endswith(exact_source_line)
+            else final_text
+        )
+        actual_length = len(body)
+        lower_bound = max(250, round(planned_min * 0.90))
+        upper_bound = round(planned_max * 1.10)
+        if actual_length < lower_bound or actual_length > upper_bound:
+            return False, "planned_length"
     return True, "ok"
 
 
@@ -4895,7 +5077,7 @@ async def generate_scheduled_package(
         prompt = editorial_orchestrator.generation_prompt(
             plan,
             persona_direction=(
-                f"{void_editorial_catalog.persona_direction(character)} "
+                f"{void_editorial_catalog.persona_direction(character, plan.mode)} "
                 "The publishable final_text must end with this exact source line: "
                 f"{source_line}"
             ),
@@ -4920,6 +5102,9 @@ async def generate_scheduled_package(
             raise ScheduledTechnicalFailure("generation_package_invalid_twice") from exc
         ok, reason = scheduled_package_quality_check(plan, package)
         if not ok:
+            if attempt == 0:
+                technical_reason = f"content_validation:{reason}"[:160]
+                continue
             raise ScheduledContentReject(reason)
         return package
     raise ScheduledTechnicalFailure("generation_package_unavailable")
@@ -4946,18 +5131,27 @@ async def scheduled_inputs(
         rubric_rows.append(row)
         if str(row.get("voice") or "void") == "news":
             if news_items is None:
-                news_items = await asyncio.to_thread(fetch_news)
+                fetched_news = await asyncio.to_thread(fetch_news)
+                news_items = prioritize_ai_news_items(fetched_news)
             for item in news_items[:10]:
                 ref = str(item.get("url") or "")
                 if not ref:
                     continue
+                title = str(item.get("title") or "")
+                summary = str(item.get("summary") or "")
+                relevance = ai_news_relevance_score(title, summary)
+                semantic_themes = ai_semantic_themes_for_news(title, summary)
+                if not semantic_themes:
+                    continue
                 source_rows.append(
                     {
                         "source_ref": ref,
-                        "topic": str(item.get("title") or row["brief"]),
+                        "topic": title or str(row["brief"]),
                         "source_type": "documented_source",
                         "rubric_keys": (key,),
                         "source_verified": ref.startswith("http"),
+                        "semantic_themes": semantic_themes,
+                        "weight": 1 + min(8, relevance),
                     }
                 )
                 source_items[ref] = item
@@ -5972,8 +6166,7 @@ async def vk_status_command(message: Message):
         f"VK_DRY_RUN: {VK_DRY_RUN}\n\n"
         "Проверка: /vk_test текст\n"
         "Тест черновика: /publish_vk ID\n"
-        "Реальная публикация: /publish_vk --yes ID\n"
-        "Реальная тест-публикация: /vk_test --yes текст"
+        "Реальная публикация только через очередь: /publish_vk --yes ID"
     )
 
 
@@ -5985,24 +6178,22 @@ async def vk_test_command(message: Message):
 
     payload = (message.text or "").split(maxsplit=1)
     text = payload[1].strip() if len(payload) > 1 else ""
-    force = False
-    if text.startswith("--yes "):
-        force = True
-        text = text.removeprefix("--yes ").strip()
+    force = text == "--yes" or text.startswith("--yes ")
+    if force:
+        text = text.removeprefix("--yes").strip()
+
+    if force:
+        await message.answer(
+            "Direct /vk_test publishing is disabled. "
+            "Create a draft and use /publish_vk --yes ID so publication goes through the VK queue."
+        )
+        return
 
     if len(text) < 3:
-        await message.answer("Используй: /vk_test текст\nРеально опубликовать: /vk_test --yes текст")
+        await message.answer("Use: /vk_test text")
         return
 
-    try:
-        result = await asyncio.to_thread(post_to_vk_wall, text, force=force)
-    except Exception as e:
-        await message.answer(f"VK publish failed: {type(e).__name__}: {e}")
-        return
-
-    status = "dry-run" if result.get("dry_run") else "published"
-    post_id = result.get("post_id")
-    await message.answer(f"VK {status}. post_id={post_id}")
+    await message.answer(f"VK local preview (not published):\n\n{text}")
 
 
 @router.message(Command("cross_status"))

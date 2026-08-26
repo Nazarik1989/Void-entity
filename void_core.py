@@ -135,6 +135,7 @@ MATERIAL_RUBRIC = {
     "music_source": "current allowlist only",
     "shared_recent_track_limit": 8,
     "track_rotation": "full_catalog_lru",
+    "shared_track_rotation": "full_catalog_lru",
     "scheduled": False,
 }
 
@@ -202,19 +203,58 @@ SEMANTIC_THEMES = {
         "Creators and culture: the choices, constraints, collaboration, audience, "
         "or economics behind a real creative act. Avoid generic inspiration."
     ),
+    "ai_models": (
+        "Language models and multimodal intelligence: reasoning, context, memory, "
+        "evaluation, training, failure modes, and what a demonstrated capability "
+        "actually changes. Separate evidence from a beautifully typeset promise."
+    ),
+    "ai_agents": (
+        "Agents and automation: tools, handoffs, permissions, orchestration, computer "
+        "use, reliability, and the awkward distance between a demo and unattended work."
+    ),
+    "ai_video": (
+        "Generative video and synthetic cinema: direction, consistency, editing, "
+        "virtual production, performance, distribution, and the new bottlenecks that "
+        "appear when making a shot becomes cheap."
+    ),
+    "ai_audio": (
+        "AI audio, music, speech, and voice: generation, performance, dubbing, "
+        "sound design, identity, consent, and what listeners can or cannot hear."
+    ),
+    "ai_images": (
+        "Generative images and visual design: control, taste, authorship, iteration, "
+        "visual sameness, provenance, and the craft that remains after generation."
+    ),
+    "ai_devices": (
+        "Embodied AI: robots, wearables, assistants, cars, sensors, and machines that "
+        "leave the chat window and acquire physical consequences."
+    ),
+    "ai_science": (
+        "AI in science, medicine, and education: discovery, evidence, expertise, "
+        "measurement, access, and the difference between assistance and authority."
+    ),
+    "ai_power": (
+        "The power layer of AI: compute, money, labor, copyright, law, surveillance, "
+        "platform control, safety, and who receives the convenience or the invoice."
+    ),
 }
 
 
 MODE_SEMANTIC_THEMES = {
-    "signal": ("craft", "city", "work", "relationship", "play", "maintenance", "body", "absurdity"),
-    "observation": ("city", "work", "relationship", "play", "maintenance", "body", "absurdity"),
-    "culture": ("music", "memory", "relationship", "play", "creators", "city"),
-    "frequency": ("music", "memory", "city", "relationship", "creators"),
+    "signal": ("ai_models", "ai_agents", "ai_video", "ai_audio", "ai_images", "ai_devices", "ai_science", "ai_power", "future_practice", "creators", "absurdity"),
+    "observation": ("ai_models", "ai_agents", "ai_devices", "ai_power", "future_practice", "creators", "absurdity"),
+    "culture": ("ai_video", "ai_audio", "ai_images", "creators", "music", "play"),
+    "frequency": ("ai_video", "ai_audio", "ai_images", "creators", "music", "play"),
     "midnight": ("memory", "work", "relationship", "city", "body", "maintenance"),
-    "future": ("future_practice", "craft", "work", "city", "maintenance", "creators"),
+    "future": ("ai_models", "ai_agents", "ai_video", "ai_audio", "ai_images", "ai_devices", "ai_science", "ai_power", "future_practice", "creators"),
+    "news": (
+        "ai_models", "ai_agents", "ai_video", "ai_audio", "ai_images",
+        "ai_devices", "ai_science", "ai_power", "future_practice",
+        "creators", "work", "music", "play", "absurdity",
+    ),
     "vault": ("memory", "craft", "relationship", "maintenance", "creators", "work"),
-    "archive": ("memory", "city", "work", "play", "creators", "maintenance"),
-    "digest": ("city", "work", "play", "future_practice", "creators"),
+    "archive": ("ai_models", "ai_agents", "ai_video", "ai_audio", "ai_images", "ai_devices", "ai_science", "ai_power"),
+    "digest": ("ai_models", "ai_agents", "ai_video", "ai_audio", "ai_images", "ai_devices", "ai_science", "ai_power"),
 }
 
 
@@ -426,6 +466,142 @@ MEANING_CARDS = {
             "moral": "End with responsibility to a specific audience without preaching engagement.",
         },
     ),
+    "ai_models": (
+        {
+            "key": "ai_models_benchmark_theatre",
+            "thought": "A benchmark victory matters only when the measured advantage survives contact with a real task.",
+            "moral": "End by naming the practical test still owed, not by declaring intelligence solved.",
+        },
+        {
+            "key": "ai_models_context_is_not_memory",
+            "thought": "A larger context window can hold more material without necessarily understanding what deserves to persist.",
+            "moral": "Distinguish storage, retrieval, and judgment through one concrete consequence.",
+        },
+        {
+            "key": "ai_models_capability_price",
+            "thought": "A model becomes culturally important when a rare capability becomes cheap enough to feel ordinary.",
+            "moral": "Conclude with the behavior that changes after the price falls, not with model worship.",
+        },
+    ),
+    "ai_agents": (
+        {
+            "key": "ai_agents_permission_is_product",
+            "thought": "An agent's real product is not initiative but a trustworthy boundary around what it may change.",
+            "moral": "End with the permission or rollback mechanism that makes autonomy usable.",
+        },
+        {
+            "key": "ai_agents_demo_to_shift",
+            "thought": "A successful agent demo lasts minutes; useful delegated work must survive interruptions, ambiguity, and tomorrow morning.",
+            "moral": "Conclude with the boring reliability test the demo politely avoided.",
+        },
+        {
+            "key": "ai_agents_handoff_tax",
+            "thought": "Automation can remove clicks while creating a new job: checking what acted, why, and whether it should be undone.",
+            "moral": "Locate the new handoff instead of claiming that work disappeared.",
+        },
+    ),
+    "ai_video": (
+        {
+            "key": "ai_video_generation_to_direction",
+            "thought": "When a plausible shot becomes cheap, taste moves from producing pixels to choosing continuity, rhythm, and what to omit.",
+            "moral": "End with direction as the scarce act, not with amazement that a clip exists.",
+        },
+        {
+            "key": "ai_video_consistency_invoice",
+            "thought": "A striking synthetic clip can hide the invoice for keeping character, space, and intention consistent across a sequence.",
+            "moral": "Conclude through the exact continuity failure that separates a demo from a scene.",
+        },
+        {
+            "key": "ai_video_abundant_footage",
+            "thought": "Infinite footage does not create an infinite appetite; it makes editing and attention more severe constraints.",
+            "moral": "End with the cut that becomes more valuable when generation is abundant.",
+        },
+    ),
+    "ai_audio": (
+        {
+            "key": "ai_audio_voice_is_identity",
+            "thought": "A generated voice is not merely a sound preset when listeners attach memory, trust, and a person to it.",
+            "moral": "Conclude with consent and context, not a generic fear of fakes.",
+        },
+        {
+            "key": "ai_audio_music_selection",
+            "thought": "When generating another acceptable track takes seconds, listening, choosing, and building a reason to return become the work.",
+            "moral": "End with curation as authorship rather than scarcity nostalgia.",
+        },
+        {
+            "key": "ai_audio_conversation_timing",
+            "thought": "A voice model feels intelligent as much through pauses and turn-taking as through the words it produces.",
+            "moral": "Conclude with timing as an interface decision, not synthetic charm.",
+        },
+    ),
+    "ai_images": (
+        {
+            "key": "ai_images_prompt_to_art_direction",
+            "thought": "Generating an attractive image is no longer the same as building a coherent visual system.",
+            "moral": "End with the repeated decision that turns a picture into art direction.",
+        },
+        {
+            "key": "ai_images_average_beauty",
+            "thought": "A tool trained to produce plausible beauty can make taste visible by how quickly everything begins to resemble everything else.",
+            "moral": "Conclude with the specific imperfection or constraint that restores identity.",
+        },
+        {
+            "key": "ai_images_provenance",
+            "thought": "The easier an image is to produce, the more valuable it becomes to know who chose it, changed it, and stands behind it.",
+            "moral": "End with provenance as responsibility, not as a purity ritual.",
+        },
+    ),
+    "ai_devices": (
+        {
+            "key": "ai_devices_physical_latency",
+            "thought": "A mistake in a chat is a sentence; a mistake in a robot has weight, distance, and repair costs.",
+            "moral": "Conclude with the physical safeguard that changes the meaning of intelligence.",
+        },
+        {
+            "key": "ai_devices_interface_disappears",
+            "thought": "When an assistant leaves the screen, its interface becomes timing, movement, attention, and the right to interrupt.",
+            "moral": "End with one bodily or spatial consequence of the new interface.",
+        },
+        {
+            "key": "ai_devices_boring_robot",
+            "thought": "The useful robot may look less like science fiction and more like a machine that repeats one unpleasant task without theatre.",
+            "moral": "Conclude with the ordinary routine that proves the machine matters.",
+        },
+    ),
+    "ai_science": (
+        {
+            "key": "ai_science_hypothesis_speed",
+            "thought": "Faster hypothesis generation increases the value of experiments that can still prove the model wrong.",
+            "moral": "End with the evidence bottleneck, not the number of generated ideas.",
+        },
+        {
+            "key": "ai_science_assistance_authority",
+            "thought": "A system can assist an expert long before it deserves authority over a patient, student, or result.",
+            "moral": "Conclude by drawing the boundary through one decision with consequences.",
+        },
+        {
+            "key": "ai_science_access_tradeoff",
+            "thought": "Cheap expertise can widen access while quietly standardizing which questions and explanations receive attention.",
+            "moral": "End with both gains visible and one limit precisely named.",
+        },
+    ),
+    "ai_power": (
+        {
+            "key": "ai_power_compute_is_policy",
+            "thought": "Compute allocation looks technical until it decides who can train, experiment, compete, or inspect the result.",
+            "moral": "Conclude with the actor whose options changed, not with abstract scale.",
+        },
+        {
+            "key": "ai_power_convenience_invoice",
+            "thought": "Every frictionless AI feature has an invoice in data, energy, moderation, labor, or dependency; the interesting question is who receives it.",
+            "moral": "End by naming the payer without turning the post into a sermon.",
+        },
+        {
+            "key": "ai_power_copyright_bargain",
+            "thought": "The copyright argument is also a bargaining argument about whose past work becomes infrastructure for whose future product.",
+            "moral": "Conclude with the concrete negotiation hidden behind moral theatre.",
+        },
+    ),
 }
 
 
@@ -461,6 +637,30 @@ NARRATIVE_SHAPES = (
     {
         "key": "open_observation",
         "instruction": "Build from several precise observations toward a restrained, non-totalizing open conclusion.",
+    },
+    {
+        "key": "cold_open_punch",
+        "instruction": "Open with one blunt, slightly funny sentence, explain the concrete mechanism, then land a sharper second meaning.",
+    },
+    {
+        "key": "three_signal_stack",
+        "instruction": "Use three compact numbered or separated signals; make the third reframe the first two and finish with one verdict.",
+    },
+    {
+        "key": "myth_mechanism_reality",
+        "instruction": "State the attractive story, expose the actual mechanism, then show the less glamorous but more useful reality.",
+    },
+    {
+        "key": "micro_dialogue_then_verdict",
+        "instruction": "Use a two-line imagined dialogue only as a cold open, then move into precise analysis and a dry final verdict.",
+    },
+    {
+        "key": "field_note_with_receipt",
+        "instruction": "Write like a field note: observed fact, what changed, who pays or benefits, and one compact receipt-like conclusion.",
+    },
+    {
+        "key": "before_after_without_miracle",
+        "instruction": "Contrast the workflow before and after the AI shift, including the new inconvenience that the sales demo forgot.",
     },
 )
 
@@ -531,8 +731,12 @@ PLATFORM_CHANNELS = {
         "format": "text-first post with optional one visual",
     },
     "vk": {
-        "role": "atmosphere, music, culture, visual mood, cities, community memory",
-        "format": "visual-first post, softer rhythm, more cultural context",
+        "role": "the whole AI field through culture, products, media, people, power, and dry adult observation",
+        "format": "one-cover post with deliberately varied length, pace, and structure",
+    },
+    "vk_public": {
+        "role": "public community conversation, culture, curiosity, and dry observation",
+        "format": "one concise conversational reply without markdown or a generic greeting",
     },
     "max": {
         "role": "compact signals, announcements, direct interaction",
@@ -544,11 +748,11 @@ PLATFORM_CHANNELS = {
 CONTENT_PLAN = [
     {
         "mode": "signal",
-        "frequency": "HUMAN",
-        "name": "Human Signal",
+        "frequency": "AI",
+        "name": "AI Signal",
         "brief": (
-            "A short original VOID observation built around one concrete scene, "
-            "object, action, or encounter. No news hook and no default digital-noise thesis."
+            "A short, lively take on one concrete AI capability, product behavior, "
+            "failure, or absurdity. One sharp point; no generic digital-noise thesis."
         ),
     },
     {
@@ -556,8 +760,8 @@ CONTENT_PLAN = [
         "frequency": "ATTENTION",
         "name": "Attention Observation",
         "brief": (
-            "A precise cultural observation grounded in one habit, place, object, "
-            "ritual, craft, or encounter. Let the selected theme set the subject."
+            "A precise observation about a habit, profession, interface, creator, "
+            "or institution changing around AI. Let the selected theme set the subject."
         ),
     },
     {
@@ -565,8 +769,8 @@ CONTENT_PLAN = [
         "frequency": "HUMAN",
         "name": "Frequency",
         "brief": (
-            "An atmospheric post about music, night cities, headphones, sound, "
-            "memory, mood, or the state a track can leave in a person."
+            "An evening AI culture post about generated video, images, music, voice, "
+            "cinema, creators, or the absurd new rituals forming around them."
         ),
     },
     {
@@ -574,8 +778,8 @@ CONTENT_PLAN = [
         "frequency": "FUTURE",
         "name": "Future File",
         "brief": (
-            "A non-hype note about a possible future shift: interfaces, work, "
-            "tools, cities, creators, or how technology changes behavior."
+            "A non-hype note about a concrete AI shift across models, agents, media, "
+            "devices, science, work, creators, law, or power."
         ),
     },
     {
@@ -583,8 +787,8 @@ CONTENT_PLAN = [
         "frequency": "HUMAN",
         "name": "Midnight",
         "brief": (
-            "A quieter night signal grounded in a specific room, task, route, sound, "
-            "memory, encounter, or physical detail."
+            "The one deliberately slower register: a night signal grounded in a "
+            "specific room, task, route, sound, memory, encounter, or physical detail."
         ),
     },
     {
@@ -616,7 +820,7 @@ RUBRIC_SCHEDULE = [
         "frequency": "HUMAN",
         "hours": [19, 20, 21, 22],
         "weight": 7,
-        "brief": "Evening music/culture mood: sound, headphones, memory, motion, night city, track as atmosphere.",
+        "brief": "Evening AI culture with movement: generated video, cinema, images, music, voice, creators, taste, and one concrete adult observation.",
     },
     {
         "name": "The Vault",
@@ -633,8 +837,8 @@ RUBRIC_SCHEDULE = [
         "mode": "future",
         "frequency": "FUTURE",
         "hours": [12, 13, 14, 15, 16, 17, 18],
-        "weight": 5,
-        "brief": "A non-hype future shift: interfaces, work, tools, cities, creators, behavior.",
+        "weight": 7,
+        "brief": "A concrete non-hype AI shift across models, agents, video, audio, images, robots, science, work, law, or power.",
     },
     {
         "name": "Observation",
@@ -642,17 +846,17 @@ RUBRIC_SCHEDULE = [
         "mode": "observation",
         "frequency": "ATTENTION",
         "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-        "weight": 6,
-        "brief": "A precise cultural observation grounded in one habit, place, object, ritual, craft, or encounter.",
+        "weight": 5,
+        "brief": "A precise, lively observation about a habit, profession, interface, creator, or institution changing around AI.",
     },
     {
         "name": "Signal",
         "voice": "void",
         "mode": "signal",
-        "frequency": "HUMAN",
+        "frequency": "AI",
         "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-        "weight": 5,
-        "brief": "A short original VOID observation grounded in one concrete scene, object, action, or encounter.",
+        "weight": 6,
+        "brief": "An original VOID take on one concrete AI capability, product behavior, failure, or absurdity.",
     },
     {
         "name": "News Signal",
@@ -660,76 +864,19 @@ RUBRIC_SCHEDULE = [
         "mode": "news",
         "frequency": "AI",
         "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-        "weight": 4,
-        "brief": "Fresh real-world signal from sources, only when the feed has something worth catching.",
+        "weight": 8,
+        "brief": "Fresh verified signal from the whole AI segment, only when the source has a concrete fact worth catching.",
     },
 ]
 
 
+# Telegram and VK intentionally share one editorial rubric matrix. Platform
+# differences belong to the platform context and publisher, not to a second
+# copy of the subject/tone schedule that can silently drift back to sameness.
+# Copy every row (and its mutable hours list) so tests or administrative code
+# cannot mutate one platform's runtime schedule through the other.
 TELEGRAM_VOID_SCHEDULE = [
-    {
-        "name": "Midnight",
-        "voice": "void",
-        "mode": "midnight",
-        "frequency": "HUMAN",
-        "hours": [0, 1, 2],
-        "weight": 10,
-        "brief": "Night-only VOID signal grounded in a specific room, task, route, sound, memory, encounter, or physical detail.",
-    },
-    {
-        "name": "Frequency",
-        "voice": "void",
-        "mode": "frequency",
-        "frequency": "HUMAN",
-        "hours": [19, 20, 21, 22],
-        "weight": 7,
-        "brief": "Evening music/culture signal: headphones, mood, memory, sound, city rhythm.",
-    },
-    {
-        "name": "The Vault",
-        "voice": "void",
-        "mode": "vault",
-        "frequency": "HUMAN",
-        "hours": [22, 23],
-        "weight": 4,
-        "brief": "A deeper thought for VOID memory. Quiet, saved, worth returning to.",
-    },
-    {
-        "name": "Observation",
-        "voice": "void",
-        "mode": "observation",
-        "frequency": "ATTENTION",
-        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-        "weight": 6,
-        "brief": "A precise observation grounded in one habit, place, object, ritual, craft, or encounter.",
-    },
-    {
-        "name": "Future File",
-        "voice": "void",
-        "mode": "future",
-        "frequency": "FUTURE",
-        "hours": [12, 13, 14, 15, 16, 17, 18],
-        "weight": 5,
-        "brief": "Future shift without hype: tools, interfaces, work, cities, creators, behavior.",
-    },
-    {
-        "name": "Signal",
-        "voice": "void",
-        "mode": "signal",
-        "frequency": "HUMAN",
-        "hours": [8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18],
-        "weight": 5,
-        "brief": "Short original VOID observation grounded in one concrete scene, object, action, or encounter.",
-    },
-    {
-        "name": "News Signal",
-        "voice": "news",
-        "mode": "news",
-        "frequency": "AI",
-        "hours": [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-        "weight": 4,
-        "brief": "Fresh real-world signal from sources, only when there is something worth catching.",
-    },
+    {**row, "hours": list(row["hours"])} for row in RUBRIC_SCHEDULE
 ]
 
 

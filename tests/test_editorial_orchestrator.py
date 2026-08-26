@@ -86,6 +86,206 @@ class EditorialOrchestratorTests(unittest.TestCase):
         )
         self.assertEqual(chosen, "oldest-compatible")
 
+    def test_weighted_choice_changes_distribution_but_cooldown_still_wins(self):
+        choices = [
+            eo._choose(
+                plan_id=f"weighted-{index}",
+                axis="rubric",
+                values=("heavy", "light"),
+                history=(),
+                persona_wide_pool_size=2,
+                weights={"heavy": 8, "light": 1},
+            )
+            for index in range(400)
+        ]
+        self.assertGreater(choices.count("heavy"), choices.count("light") * 4)
+        self.assertEqual(
+            eo._choose(
+                plan_id="cooldown-over-weight",
+                axis="rubric",
+                values=("heavy", "light"),
+                history=({"rubric": "heavy"},),
+                persona_wide_pool_size=2,
+                weights={"heavy": 8, "light": 1},
+            ),
+            "light",
+        )
+
+    def test_source_epistemics_and_semantic_theme_are_compatible(self):
+        news = {
+            "key": "news",
+            "name": "News Signal",
+            "mode": "news",
+            "voice": "news",
+            "brief": "documented AI signal",
+            "weight": 8,
+        }
+        runtime = void_editorial_catalog.build_context(
+            platform="vk",
+            slot="12:00",
+            seed="audio-source",
+            rubric_rows=[news],
+            source_rows=[
+                {
+                    "source_ref": "https://example.test/voice",
+                    "topic": "A new voice model",
+                    "source_type": "documented_source",
+                    "rubric_keys": ("news",),
+                    "source_verified": True,
+                    "semantic_themes": ("ai_audio",),
+                    "weight": 9,
+                }
+            ],
+            published_history=(),
+            character=character_state.CharacterState(),
+        )
+        plan = eo.plan_release(runtime)
+        self.assertEqual(plan.epistemic_state, "documented source signal")
+        self.assertEqual(plan.semantic_theme, "ai_audio")
+        self.assertIn(plan.semantic_card, runtime.semantic_cards["ai_audio"])
+        self.assertEqual(
+            plan.thesis_direction,
+            runtime.semantic_card_theses[plan.semantic_card],
+        )
+
+        catalog_runtime = void_editorial_catalog.build_context(
+            platform="vk",
+            slot="13:00",
+            seed="catalog-source",
+            rubric_rows=[
+                {
+                    "key": "signal",
+                    "name": "Signal",
+                    "mode": "signal",
+                    "brief": "original observation",
+                }
+            ],
+            source_rows=[
+                {
+                    "source_ref": "void-catalog:signal",
+                    "topic": "original observation",
+                    "source_type": "catalog",
+                    "rubric_keys": ("signal",),
+                }
+            ],
+            published_history=(),
+            character=character_state.CharacterState(),
+        )
+        catalog_plan = eo.plan_release(catalog_runtime)
+        self.assertNotEqual(catalog_plan.epistemic_state, "documented source signal")
+
+    def test_night_axes_stay_human_and_day_direction_owns_the_ai_law(self):
+        row = dict(next(item for item in main.RUBRIC_SCHEDULE if item["mode"] == "midnight"))
+        row["key"] = "midnight"
+        runtime = void_editorial_catalog.build_context(
+            platform="vk",
+            slot="00:00",
+            seed="night-register",
+            rubric_rows=[row],
+            source_rows=[
+                {
+                    "source_ref": "void-catalog:midnight",
+                    "topic": row["brief"],
+                    "source_type": "catalog",
+                    "rubric_keys": ("midnight",),
+                }
+            ],
+            published_history=(),
+            character=character_state.CharacterState(),
+        )
+        plan = eo.plan_release(runtime)
+        self.assertNotIn(plan.semantic_theme, {
+            "ai_models", "ai_agents", "ai_video", "ai_audio", "ai_images",
+            "ai_devices", "ai_science", "ai_power",
+        })
+        self.assertIn(plan.tension, void_editorial_catalog.NIGHT_TENSIONS)
+        self.assertIn(plan.author_role, void_editorial_catalog.NIGHT_AUTHOR_ROLES)
+        self.assertIn(plan.structure, void_editorial_catalog.NIGHT_CONSTRAINTS["structure"])
+        self.assertEqual(
+            plan.thesis_direction,
+            runtime.semantic_card_theses[plan.semantic_card],
+        )
+        night_direction = void_editorial_catalog.persona_direction(
+            character_state.CharacterState(), "midnight"
+        )
+        day_direction = void_editorial_catalog.persona_direction(
+            character_state.CharacterState(), "signal"
+        )
+        self.assertIn("Do not force an AI subject", night_direction)
+        self.assertNotIn("whole AI field is the main editorial territory", night_direction)
+        self.assertIn("whole AI field is the main editorial territory", day_direction)
+
+    def test_day_tone_and_music_tags_use_diverse_canonical_values(self):
+        self.assertIn("none", void_editorial_catalog.DAY_HUMOR)
+        self.assertIn(
+            "warm curiosity with no punchline",
+            void_editorial_catalog.DAY_HUMOR,
+        )
+        self.assertIn(
+            "new capability versus an old creative limit",
+            void_editorial_catalog.DAY_TENSIONS,
+        )
+        canonical_vibes = set(main.VK_VIBE_KEYWORDS)
+        for value in void_editorial_catalog.MODE_TRACK_TAGS.values():
+            self.assertLessEqual(set(value.split(",")), canonical_vibes)
+        for axis in (
+            "emotional_arc", "reader_relation", "structure",
+            "hook", "ending", "imagery",
+        ):
+            with self.subTest(axis=axis):
+                self.assertTrue(void_editorial_catalog.DAY_CONSTRAINTS[axis])
+                self.assertTrue(void_editorial_catalog.NIGHT_CONSTRAINTS[axis])
+                self.assertFalse(
+                    set(void_editorial_catalog.DAY_CONSTRAINTS[axis])
+                    & set(void_editorial_catalog.NIGHT_CONSTRAINTS[axis])
+                )
+
+    def test_scheduled_length_range_counts_body_not_the_source_url(self):
+        plan = replace(eo.plan_release(context()), length="500-750 characters")
+
+        def package(text: str) -> eo.GenerationPackage:
+            return eo.GenerationPackage(
+                final_text=text,
+                concrete_scene="A narrow light reveals a concrete object.",
+                visual_subject="The same concrete object under narrow light.",
+                visual_relation_to_thesis="The object carries the selected thesis.",
+                image_prompt_seed="One concrete object in canonical darkness.",
+                track_tags=plan.track_tags,
+            )
+
+        with patch.object(main, "quality_check", return_value=(True, "ok")):
+            self.assertEqual(
+                main.scheduled_package_quality_check(plan, package("x" * 600)),
+                (True, "ok"),
+            )
+            self.assertEqual(
+                main.scheduled_package_quality_check(plan, package("x" * 300))[1],
+                "planned_length",
+            )
+            self.assertEqual(
+                main.scheduled_package_quality_check(plan, package("x" * 900))[1],
+                "planned_length",
+            )
+            long_source_plan = replace(
+                plan,
+                source_ref="https://example.test/" + "long-path/" * 40,
+            )
+            source_line = f"Источник: {long_source_plan.source_ref}"
+            self.assertEqual(
+                main.scheduled_package_quality_check(
+                    long_source_plan,
+                    package("x" * 600 + "\n\n" + source_line),
+                ),
+                (True, "ok"),
+            )
+            self.assertEqual(
+                main.scheduled_package_quality_check(
+                    long_source_plan,
+                    package("x" * 900 + "\n\n" + source_line),
+                )[1],
+                "planned_length",
+            )
+
     def test_one_eligible_rubric_and_source_keep_full_seven_item_depth(self):
         rubric_rows = [
             {
@@ -168,6 +368,43 @@ class EditorialOrchestratorTests(unittest.TestCase):
             self.assertEqual(plan.production_mode, "standard")
             history.append(plan.to_dict())
         self.assertEqual(len(history), 50)
+        day_plans = [
+            item
+            for item in history
+            if item["mode"] not in void_editorial_catalog.NIGHT_MODES
+        ]
+        night_plans = [
+            item
+            for item in history
+            if item["mode"] in void_editorial_catalog.NIGHT_MODES
+        ]
+        for axis in ("structure", "length", "humor", "energy", "tempo"):
+            with self.subTest(axis=axis):
+                self.assertEqual(
+                    {item[axis] for item in day_plans},
+                    set(void_editorial_catalog.DAY_CONSTRAINTS[axis]),
+                )
+        self.assertTrue(
+            {
+                "ai_models",
+                "ai_agents",
+                "ai_video",
+                "ai_audio",
+                "ai_images",
+                "ai_devices",
+                "ai_science",
+                "ai_power",
+            }.issubset({item["semantic_theme"] for item in day_plans})
+        )
+        self.assertTrue(night_plans)
+        self.assertLessEqual(
+            {item["energy"] for item in night_plans},
+            set(void_editorial_catalog.NIGHT_CONSTRAINTS["energy"]),
+        )
+        self.assertLessEqual(
+            {item["tempo"] for item in night_plans},
+            set(void_editorial_catalog.NIGHT_CONSTRAINTS["tempo"]),
+        )
 
     def test_diversity_exhaustion_and_crosspost_contract(self):
         first = eo.plan_release(context(seed="one"))
@@ -573,6 +810,60 @@ class GenerationRetryTests(unittest.IsolatedAsyncioTestCase):
             rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
             self.assertIn(rendered, first)
             self.assertIn(rendered, second)
+
+    async def test_content_reject_retries_same_plan_once_then_stops(self):
+        plan = eo.plan_release(context())
+        valid = json.dumps(
+            {
+                "final_text": "x" * 500,
+                "concrete_scene": "A narrow light reveals wear on one stone object.",
+                "visual_subject": "The exact same worn stone object.",
+                "visual_relation_to_thesis": "The wear demonstrates the selected thesis.",
+                "image_prompt_seed": "One worn stone in darkness under a narrow light.",
+                "track_tags": list(plan.track_tags),
+            }
+        )
+        model = MagicMock(return_value=valid)
+        with (
+            patch.object(main, "call_ai", model),
+            patch.object(
+                main,
+                "scheduled_package_quality_check",
+                side_effect=[(False, "planned_length"), (True, "ok")],
+            ),
+        ):
+            package = await main.generate_scheduled_package(
+                plan, character_state.CharacterState()
+            )
+        self.assertEqual(package.track_tags, plan.track_tags)
+        self.assertEqual(model.call_count, 2)
+        self.assertIn(
+            "content_validation:planned_length",
+            model.call_args_list[1].args[1],
+        )
+        for call in model.call_args_list:
+            for _, value in plan.to_dict().items():
+                self.assertIn(
+                    json.dumps(value, ensure_ascii=False, sort_keys=True),
+                    call.args[1],
+                )
+
+        model.reset_mock()
+        with (
+            patch.object(main, "call_ai", model),
+            patch.object(
+                main,
+                "scheduled_package_quality_check",
+                return_value=(False, "planned_length"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                main.ScheduledContentReject, "planned_length"
+            ):
+                await main.generate_scheduled_package(
+                    plan, character_state.CharacterState()
+                )
+        self.assertEqual(model.call_count, 2)
 
 
 if __name__ == "__main__":
